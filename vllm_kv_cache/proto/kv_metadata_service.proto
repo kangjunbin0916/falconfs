@@ -1,0 +1,139 @@
+syntax = "proto3";
+
+package falconfs.kv;
+import "kv_common.proto";
+
+service KVMetadataService {
+  rpc BatchLookupWithLease(BatchLookupRequest) returns (BatchLookupResponse);
+  rpc BatchAllocateWithLease(BatchAllocateRequest) returns (BatchAllocateResponse);
+  rpc BatchRenewLease(BatchRenewLeaseRequest) returns (BatchRenewLeaseResponse);
+  rpc BatchUpdateBlockStatus(BatchUpdateStatusRequest) returns (BatchUpdateStatusResponse);
+  rpc BatchFreeAllocated(BatchFreeAllocatedRequest) returns (BatchFreeAllocatedResponse);
+}
+
+message LookupItem {
+  bytes block_hash = 1;
+  bool renew_lease_on_hit = 2;
+}
+
+message LookupResult {
+  bytes block_hash = 1;
+  ItemResultMeta result = 2;
+  BlockStatus status = 3;
+  BlockLocation location = 4;
+  LeaseInfo lease = 5;
+  int64 version = 6;
+  bool cacheable = 7;
+}
+
+message BatchLookupRequest {
+  CommonRequestMeta meta = 1;
+  repeated LookupItem items = 2;
+  bool allow_partial_result = 3;
+}
+
+message BatchLookupResponse {
+  repeated LookupResult results = 1;
+  int64 server_time_ms = 2;
+}
+
+message AllocateItem {
+  bytes block_hash = 1;
+  int32 kv_group_idx = 2;
+  int32 layer_mask = 3;
+  int32 block_size = 4;
+  int32 preferred_store_id = 5;
+  bool allow_fallback_store = 6;
+}
+
+message AllocateResult {
+  bytes block_hash = 1;
+  ItemResultMeta result = 2;
+  BlockLocation location = 3;
+  LeaseInfo lease = 4;
+  int64 version = 5;
+  bool reused_existing_allocation = 6;
+}
+
+message BatchAllocateRequest {
+  CommonRequestMeta meta = 1;
+  repeated AllocateItem items = 2;
+  bool deduplicate_in_request = 3;
+}
+
+message BatchAllocateResponse {
+  repeated AllocateResult results = 1;
+  int64 server_time_ms = 2;
+}
+
+message RenewLeaseItem {
+  bytes block_hash = 1;
+  int64 lease_token = 2;
+  int64 expected_dn_epoch = 3;
+  int64 expected_store_epoch = 4;
+}
+
+message RenewLeaseResult {
+  bytes block_hash = 1;
+  ItemResultMeta result = 2;
+  LeaseInfo lease = 3;
+}
+
+message BatchRenewLeaseRequest {
+  CommonRequestMeta meta = 1;
+  repeated RenewLeaseItem items = 2;
+  int32 requested_ttl_ms = 3;
+}
+
+message BatchRenewLeaseResponse {
+  repeated RenewLeaseResult results = 1;
+  int64 server_time_ms = 2;
+}
+
+message StatusUpdateItem {
+  bytes block_hash = 1;
+  BlockStatus expected_from_status = 2;
+  BlockStatus to_status = 3;
+  int64 expected_version = 4;
+  string evicted_path = 5;
+  bool allow_noop_if_already_target = 6;
+}
+
+message StatusUpdateResult {
+  bytes block_hash = 1;
+  ItemResultMeta result = 2;
+  int64 new_version = 3;
+  BlockStatus current_status = 4;
+}
+
+message BatchUpdateStatusRequest {
+  CommonRequestMeta meta = 1;
+  repeated StatusUpdateItem items = 2;
+}
+
+message BatchUpdateStatusResponse {
+  repeated StatusUpdateResult results = 1;
+  int64 server_time_ms = 2;
+}
+
+message FreeAllocatedItem {
+  bytes block_hash = 1;
+  int64 expected_version = 2;
+  bool force = 3;
+}
+
+message FreeAllocatedResult {
+  bytes block_hash = 1;
+  ItemResultMeta result = 2;
+  int64 new_version = 3;
+}
+
+message BatchFreeAllocatedRequest {
+  CommonRequestMeta meta = 1;
+  repeated FreeAllocatedItem items = 2;
+}
+
+message BatchFreeAllocatedResponse {
+  repeated FreeAllocatedResult results = 1;
+  int64 server_time_ms = 2;
+}
