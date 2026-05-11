@@ -83,6 +83,22 @@ The §4.1.1 / §4.1.3 / §4.2 / §4.2.1 / §4.7 prose now matches the actual cod
 
 The remainder of this document is rewritten where the architecture changed; sections that were unaffected (proto contract, error model, vLLM integration) are unchanged.
 
+### Changelog (v6.5)
+
+Three design considerations that were under-specified in v6.4 are now made explicit:
+
+1. **Topology generality.** The cluster supports an arbitrary, configurable number of DN, Store, and Client instances, deployed in any colocation pattern. The 2-DN harness is a test convenience, not an architectural assumption. Each role is identified only by its `dn_id` / `store_node_id` / process identity, never by the count of peers; every configuration parameter that names a peer (DN endpoints on a Store, Store endpoints on a Client, etc.) is a list whose length is decided at deploy time. See §2.6 for the deployment matrix.
+
+2. **Colocation-aware data plane (Client↔Store ONLY, via POSIX shared memory).** The Store is **always a standalone daemon process** — never embedded in a Client (vLLM worker, FUSE process, future framework integrations). What "colocation" means in v6.5 is **same-host**, not same-process: the Store allocates its DRAM pool with `shm_open` + `mmap(MAP_SHARED)` and publishes a small discovery descriptor (segment name + region geometry + `store_epoch` + `brpc_address`) under a well-known runtime path. Any Client process running on the same host can mmap the same segment and access the Store's DRAM region directly as shared memory; Clients running off-host fall back to BRPC. Both reads and writes use the shared-memory path when available, exactly mirroring FalconFS's `StoreNode::IsLocal(nodeId)` shortcut for `ReadFile` / `WriteFile` in [`falcon_store/src/falcon_store/falcon_store.cpp`](../../falcon_store/src/falcon_store/falcon_store.cpp). The runtime selection between shared-memory and BRPC happens at exactly one place (`KVStoreFacadeRegistry`) and is identical for every Client caller — vLLM via the pybind11 API library, FUSE via `falcon_client`, or any future application. Detailed contract in §12.6 (`IKVStoreFacade` + `KVStoreFacadeRegistry` + the shared-memory discovery protocol).
+
+   **DN↔Store colocation is intentionally NOT optimized.** DN↔Store traffic is admin-only (`RegisterStoreRegion`, `Heartbeat`, `SpillBlockToSSD`) and never on the latency-critical path: registration runs once at startup, heartbeats are seconds-cadence, and spill runs at eviction-cycle frequency only. For simplicity the DN always reaches its registered Stores over BRPC, regardless of whether the Store happens to share a host. This keeps the DN code path topology-independent and reduces the surface area of `KVStoreFacadeRegistry` to one consumer (the Client).
+
+3. **Store admin RPCs are first-class.** A new BRPC service `KVStoreAdminService` hosted on the DN side carries `RegisterStoreRegion`, `Heartbeat`, and `SpillBlockToSSD`. v6.4 left `KVMetadataEngine::RegisterStoreRegion` as an in-process call only; v6.5 makes registration a network operation issued by every Store at startup, so the DN never assumes a hardcoded region geometry. `SpillBlockToSSD` is invoked by the DN's eviction worker against the Store that owns the eviction candidate; it is BRPC even if Store and DN happen to share a host (per the previous bullet). Detailed wire contract in §5.4.
+
+These additions do not change the hot-path metadata flow described in v6.4; they refine the deployment model and the data-plane affinity policy.
+
+The remainder of this document is rewritten where the architecture changed; sections that were unaffected (proto contract, error model, vLLM integration) are unchanged.
+
 ---
 
 ## 1. Goals, Non-Goals, and Core Decisions
@@ -246,6 +262,34 @@ Client -> Store: BatchWriteBlock(payloads)
 Store -> Client: per-key write result
 Client -> DN:    BatchUpdateBlockStatus(success_keys, ALLOCATED -> STORED)
 ```
+
+### 2.6 Deployment topology
+
+Each role can be replicated and colocated independently. The cluster has three counts (`N_DN`, `N_STORE`, `N_CLIENT`) and the operator picks any colocation pattern per host.
+
+A few invariants the runtime relies on:
+
+- The Store is **always a standalone daemon** (`falcon_kv_store`). It is never embedded in a Client process. This keeps the Store framework-agnostic so multiple Client applications on the same host (vLLM worker, FUSE client, batch tool, future integrations) can all share the same local Store DRAM pool.
+- The only colocation pattern the runtime **optimizes** for is **Client and Store running on the same host**, because Client↔Store is the byte-moving hot path. The optimization is **POSIX shared memory**, not same-process: the Store creates its DRAM pool with `shm_open` + `mmap(MAP_SHARED)`; same-host Clients mmap the same segment and read/write directly. Cross-host Clients use BRPC.
+- Every other pattern (DN-only, Store-only, Client-only, DN+Store, all-three) works correctly via BRPC. The DN never branches on whether a Store is on the same host.
+
+| Pattern | Notes |
+|---|---|
+| DN-only host | a host dedicated to PG + bgworker; no DRAM pool, no FUSE mount, no local fast path. |
+| Store-only host | a host that contributes only DRAM (and SSD) to the cluster, e.g. a dedicated CXL / large-RAM node. Off-host Clients reach it via BRPC. |
+| Client-only host | runs vLLM workers but has no local Store; every `BatchWriteBlock` / `BatchReadBlock` goes BRPC. |
+| **Client(s) + Store same host (recommended for vLLM workers)** | One standalone `falcon_kv_store` daemon owns a `mmap(MAP_SHARED)` DRAM segment sized to fit the host's KV cache budget. Each Client process on the same host (vLLM worker, FUSE client, ...) discovers that segment and mmaps it via `LocalKVStoreShmFacade` (§12.6). Both `BatchWriteBlock` and `BatchReadBlock` against the local `store_node_id` reduce to bounds-checked `memcpy` against the shared segment — zero serialization, zero brpc iobuf copy, zero socket round-trip. Reads/writes against any other Store stay BRPC. |
+| DN + Store same host | a valid topology, but DN↔Store traffic is **always BRPC** (admin-only, not perf-critical); see v6.5 changelog point 2. |
+| All three on one host | small-scale dev/test; the harness `falcon_distributed_test.sh` uses this mode at small scale. |
+
+Component counts come from configuration, never from constants:
+
+- DN list per Store: `--dn HOST:PORT` (repeated; one entry per DN this Store partitions its DRAM pool for).
+- Store list per Client: client config carries `store_table[store_node_id] -> brpc_endpoint`, populated either from a CN-maintained registry table (future) or a bootstrap config file.
+- A **Client process** that finds a local Store discovery descriptor (§12.6) calls `RegisterLocal(store_id, shm_facade)` on its own `KVStoreFacadeRegistry`; every peer (off-host) Store is registered via `RegisterRemote(store_id, endpoint)`.
+- The **DN process** does not participate in the local fast path: its eviction worker resolves Store endpoints via the admin map populated by `RegisterStoreRegion` (§5.4) and always issues `SpillBlockToSSD` over BRPC.
+
+The metadata DN's allocator already supports affinity via `preferred_store_id` + `allow_fallback_store` (§5.3): a same-host Client passes its own host's `store_node_id` as `preferred_store_id`, so freshly allocated blocks land on the local Store's DRAM region whenever capacity permits. This makes the Client-side shared-memory fast path the typical case rather than the exception.
 
 ---
 
@@ -881,6 +925,67 @@ If no Store can allocate:
 
 - return `THROTTLED` if transient pressure or all suitable regions are temporarily `SUSPECT`/`DRAINING`,
 - return non-retryable storage exhaustion code if cluster capacity exhausted.
+
+### 5.4 Store admin BRPC contract
+
+Hosted on the **DN** alongside `KVMetadataService` and the eviction worker. One DN handles registration calls from every Store that owns a region on that DN. The Store is the client of these RPCs.
+
+```protobuf
+service KVStoreAdminService {
+  rpc RegisterStoreRegion(RegisterStoreRegionRequest) returns (RegisterStoreRegionResponse);
+  rpc Heartbeat          (HeartbeatRequest)           returns (HeartbeatResponse);
+  rpc SpillBlockToSSD    (SpillBlockRequest)          returns (SpillBlockResponse);
+}
+
+message RegisterStoreRegionRequest {
+  CommonRequestMeta meta = 1;
+  int32  store_node_id = 2;
+  string store_brpc_address = 3;     // address the DN will use to call back
+  int64  store_epoch = 4;
+  int64  base_offset = 5;
+  int64  region_bytes = 6;
+  int32  block_size = 7;
+  int64  dram_pool_total_bytes = 8;  // for capacity book-keeping
+}
+
+message RegisterStoreRegionResponse {
+  ItemResultMeta result = 1;
+  int64 dn_epoch = 2;                // current DN epoch the Store should remember
+}
+
+message HeartbeatRequest {
+  CommonRequestMeta meta = 1;
+  int32 store_node_id = 2;
+  int64 store_epoch = 3;
+  int64 now_ms = 4;
+}
+
+message HeartbeatResponse {
+  ItemResultMeta result = 1;
+  int64 dn_epoch = 2;                // detect DN restart by comparing epochs
+}
+
+message SpillBlockRequest {
+  CommonRequestMeta meta = 1;
+  int32  store_node_id = 2;          // must match this Store
+  bytes  block_hash = 3;
+  int64  expected_version = 4;
+  int64  pool_offset = 5;
+}
+
+message SpillBlockResponse {
+  ItemResultMeta result = 1;
+  string evicted_path = 2;
+}
+```
+
+Lifecycle:
+
+1. **Store start.** Open KVDataService BRPC server. For each `--dn HOST:PORT` issue `RegisterStoreRegion`. The DN persists the geometry into its `StoreRegionRegistry`, allocates the `KVRegion` (zeroed bitmap + meta array), and returns the current `dn_epoch`. The Store stores the latest `dn_epoch` per DN so subsequent `BatchAllocate` responses can be reconciled with on-the-wire requests.
+2. **Steady state.** Every `falcon_kv.store_heartbeat_period_ms` the Store sends `Heartbeat` to every owning DN. Missing heartbeats drive the §5.2.1 state machine: HEALTHY -> SUSPECT (`falcon_kv.store_suspect_ms`) -> OFFLINE (`falcon_kv.store_offline_ms`). A `Heartbeat` response with a higher `dn_epoch` than what the Store remembers means the DN restarted; the Store re-registers and resumes heartbeats.
+3. **Eviction.** The DN's eviction worker calls `SpillBlockToSSD(store_node_id, block_hash, version, pool_offset)` whenever it picks an eviction candidate. The Store reads from its DRAM region, writes to `<ssd_root>/<store_node_id>/<hash_prefix>/<block_hash>.<version>.kv`, fsyncs, and returns the path. The DN always issues this call over BRPC — even when DN and Store share a host — because eviction is not on the latency-critical path and keeping the DN's spill code path topology-independent simplifies operations.
+
+DN restart fencing (§15.1) bumps `dn_epoch` and clears all leases; Stores observe the new epoch on the next heartbeat response and re-register.
 
 ---
 
@@ -1848,6 +1953,140 @@ Path format:
 1. The Store maintains a bounded inflight-request queue per BRPC service. When the queue is full, new requests are rejected with `THROTTLED` (retryable).
 2. Per-Store concurrency knob: `falcon_kv.store_max_inflight` (default e.g. 256).
 3. Per-DN connections to Store reuse `brpc::ChannelOptions { connection_type = "pooled", connect_timeout_ms = 5000, timeout_ms = 10000 }`, identical to `falcon_store/src/connection/node.cpp:CreateIOConnection`.
+
+### 12.6 Local fast-path facade (`IKVStoreFacade`) — Client↔Store, shared memory
+
+The byte-moving hot path is the Client's batch read/write of KV blocks. Every Client process holds one `KVStoreFacadeRegistry` that resolves `store_node_id -> IKVStoreFacade`. This is the v6.5 generalization of the existing FalconFS shortcut `StoreNode::IsLocal(nodeId)` (used by both `ReadFile` and `WriteFile` in [`falcon_store/src/falcon_store/falcon_store.cpp`](../../falcon_store/src/falcon_store/falcon_store.cpp)): a single pluggable callable whose two implementations are POSIX shared memory or BRPC, transparent to higher-level code.
+
+Crucially, the **Store is always a standalone daemon (`falcon_kv_store`)**. It is never embedded in a Client. The "local fast path" is achieved by having the Client mmap the Store daemon's DRAM segment from the same host. This keeps the Store framework-agnostic — multiple Client applications on the same host (vLLM, FUSE, batch tools, future integrations) can each open the same shared segment and share the cached blocks.
+
+The DN does **not** use this registry. DN↔Store traffic (`RegisterStoreRegion`, `Heartbeat`, `SpillBlockToSSD` — §5.4) is admin-only, not latency-critical, and always BRPC. Restricting the facade to Client callers keeps the registry's surface area small and removes a class of cross-process invariants from the DN bgworker.
+
+#### 12.6.1 Store-side: shared memory segment + discovery descriptor
+
+At Store startup, before issuing `RegisterStoreRegion` (§5.4):
+
+1. Allocate the DRAM pool as a POSIX shared-memory segment:
+
+   ```cpp
+   const std::string shm_name = "/falcon_kv_store_" + std::to_string(store_node_id);
+   int fd = shm_open(shm_name.c_str(), O_CREAT | O_RDWR, 0660);
+   ftruncate(fd, dram_pool_bytes);
+   void* base = mmap(nullptr, dram_pool_bytes,
+                     PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_HUGETLB /* fall back to MAP_SHARED on EINVAL */,
+                     fd, 0);
+   ```
+
+2. Write a JSON discovery descriptor under a well-known runtime path (`falcon_kv.store_runtime_dir`, default `/var/run/falcon_kv_store/`):
+
+   ```json
+   {
+     "store_node_id": 1,
+     "shm_name":      "/falcon_kv_store_1",
+     "shm_bytes":     1073741824,
+     "block_size":    65536,
+     "store_epoch":   1,
+     "brpc_address":  "10.0.0.42:55610",
+     "regions": [
+       { "owner_dn_id": 1, "base_offset": 0,         "region_bytes": 536870912 },
+       { "owner_dn_id": 2, "base_offset": 536870912, "region_bytes": 536870912 }
+     ],
+     "host_id":   "<machine-id>",
+     "owner_uid": 1000,
+     "owner_pid": 4711
+   }
+   ```
+
+   Filename convention: `<store_runtime_dir>/store_<store_node_id>.json`. Atomic write via tmp + rename. The descriptor is removed on clean shutdown; stale descriptors are GC'd by Clients on read (PID no longer alive).
+
+3. SSD spill files keep using their FS-path layout from §12.4 (`<ssd_root>/<store_node_id>/<hash_prefix>/<block_hash>.<version>.kv`). They are accessed by absolute path, so no extra discovery is needed; same-host Clients can `open()` them directly when `BatchReadFromSSD` is mapped to the local fast path.
+
+#### 12.6.2 Client-side: facade interface and discovery
+
+```cpp
+namespace falconfs::kv {
+
+class IKVStoreFacade {
+public:
+    virtual ~IKVStoreFacade() = default;
+    virtual int32_t StoreNodeId() const = 0;
+    virtual bool    IsLocal()      const = 0;
+
+    // Both reads and writes hit the Store's DRAM segment via shared memory
+    // when IsLocal() returns true; both go BRPC otherwise. Identical
+    // observable result modulo latency.
+    virtual void BatchWriteBlock (const BatchWriteBlockRequest&,
+                                  BatchWriteBlockResponse*)  = 0;
+    virtual void BatchReadBlock  (const BatchReadBlockRequest&,
+                                  BatchReadBlockResponse*)   = 0;
+    virtual void BatchReadFromSSD(const BatchReadFromSSDRequest&,
+                                  BatchReadFromSSDResponse*) = 0;
+};
+
+class LocalKVStoreShmFacade : public IKVStoreFacade {
+    // Holds: mmap base pointer + length, block_size, per-DN region map
+    // (base_offset, region_bytes), store_epoch, fd handle.
+};
+
+class RemoteKVStoreFacade : public IKVStoreFacade {
+    // Holds: pooled brpc::Channel + endpoint.
+};
+
+class KVStoreFacadeRegistry {
+public:
+    // Discovery: scan `store_runtime_dir`, mmap each segment whose
+    // descriptor's host_id matches the local machine-id (or whose owner_pid
+    // is reachable). Failed mmaps are demoted to remote.
+    void DiscoverLocalStores(const std::string& runtime_dir);
+
+    void RegisterLocalShm (int32_t store_id, LocalShmHandle handle);
+    void RegisterRemote   (int32_t store_id, const std::string& brpc_endpoint);
+    std::shared_ptr<IKVStoreFacade> Resolve(int32_t store_id);
+};
+
+}  // namespace falconfs::kv
+```
+
+#### 12.6.3 Fast-path semantics
+
+1. **Write.** `LocalKVStoreShmFacade::BatchWriteBlock` per item:
+   - bounds-check `pool_offset + payload.size() <= shm_bytes` and `pool_offset` falls inside one of the registered regions on this Client's DN;
+   - check `expected_store_epoch == cached_store_epoch` (refreshed from the descriptor on each `Heartbeat` cycle);
+   - `memcpy(shm_base + pool_offset, payload.data(), payload.size())` — direct bytes-into-DRAM, no serialization, no brpc iobuf, no socket;
+   - optionally compute crc32 and return it.
+
+2. **Read.** `LocalKVStoreShmFacade::BatchReadBlock` is symmetric: bounds-check + `memcpy(dst, shm_base + pool_offset, size)`.
+
+3. **SSD read.** `LocalKVStoreShmFacade::BatchReadFromSSD` opens `evicted_path` directly with `open(..., O_RDONLY)` (the path is on a shared filesystem, accessible to all same-host processes). It does not go through the Store daemon — that already matches §12.3.1 ("data-plane only, metadata-neutral").
+
+4. **Remote.** `RemoteKVStoreFacade::*` issues the matching `KVDataService_Stub::*` over a pooled `brpc::Channel`. Same observable surface modulo latency.
+
+5. **Resolve.** `KVStoreFacadeRegistry::Resolve(store_id)` returns the local facade if discovery found a same-host descriptor for that id and the mmap succeeded, else the remote facade. Discovery runs once at process startup and refreshes when `RegisterStoreRegion` advertises a new Store or when a `Heartbeat` reports a new `store_epoch` (which means the Store restarted and re-created its segment).
+
+#### 12.6.4 Coherence and isolation
+
+The shared-memory path is byte-level only. All metadata correctness still flows through the DN:
+
+- The Client trusts the `(pool_offset, expected_version, expected_store_epoch)` triple returned by `BatchAllocateWithLease` / `BatchLookupWithLease`. Version + status are validated by the metadata catalog (CAS in `BatchUpdateBlockStatus`); the Store does not track per-block versions in v6.
+- `expected_store_epoch` is checked client-side against the descriptor's `store_epoch`; a mismatch fails fast with `STALE_EPOCH (retryable)` and the Client refreshes the descriptor. This catches Store restart even if the descriptor was not yet rotated.
+- The Store daemon's BRPC service still enforces admission control / inflight limits / version checks for **remote** Clients; a same-host Client doing direct SHM access does not consume the Store's BRPC inflight budget (it is not BRPC traffic), so admission is purely a Client-side responsibility — sized by `falcon_kv.client_max_inflight_per_store` already declared in §27.
+- Permissions: the SHM segment is created `0660` and owned by the operator-configured group; all Client processes intended to share it must run under that group. The Store rejects (or warns) on a permission mismatch at startup.
+
+#### 12.6.5 Application integrations
+
+- **vLLM via the pybind11 KV API library**: the C++ extension owns the `KVStoreFacadeRegistry` and the discovery scan. The Python `OffloadingManager` calls into the extension with batch (`block_hash`, `pool_offset`, `payload`) tuples; the extension picks the local SHM facade for any local `store_node_id` and copies bytes between Python `bytes`/`memoryview` and the SHM segment in one `memcpy`. No Python↔C++ payload duplication for local Stores.
+- **FUSE / `falcon_client`**: same registry, no extra discovery. The existing `StoreNode::IsLocal` shortcut continues to work for file traffic; the KV cache uses its parallel `KVStoreFacadeRegistry`.
+- **Other applications**: any C/C++/Python process that wants to participate just needs to read the descriptor and `mmap` the segment. No framework lock-in.
+
+#### 12.6.6 Performance and affinity
+
+Savings on the fast path are roughly `payload_size × items × 2` (write + read) bytes of brpc iobuf copies plus one round-trip's latency. For 64 KiB blocks at typical batch sizes this is 4-8 MiB of memcpy and ~100 us round-trip per batch on the read leg alone. Affinity at allocation time (§5.3 `preferred_store_id`) makes the shared-memory fast path the typical case rather than the exception:
+
+- A same-host Client passes `preferred_store_id = my_host_local_store_id` to `BatchAllocateWithLease`; freshly allocated blocks land on the local Store's DRAM region whenever capacity permits.
+- For loads, the Client passes the `store_node_id` returned by `BatchLookupWithLease` to `Resolve()`; if the block happens to live on the same-host Store, the read is direct memory access; otherwise it's BRPC.
+- The promote-on-read worker (§13.4) uses the same registry: writes the buffer to the local Store if the DN's promote allocate response selected it, otherwise BRPC.
+- The DN's eviction worker is **outside** this registry; it always uses BRPC `KVStoreAdminService::SpillBlockToSSD` (§5.4) regardless of host colocation.
 
 ---
 
