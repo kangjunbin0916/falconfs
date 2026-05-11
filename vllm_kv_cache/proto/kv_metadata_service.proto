@@ -3,6 +3,10 @@ syntax = "proto3";
 package falconfs.kv;
 import "kv_common.proto";
 
+// Enable protobuf-generated abstract Service base class so we can derive a
+// brpc-compatible service adapter without depending on grpc/brpc plugins.
+option cc_generic_services = true;
+
 service KVMetadataService {
   rpc BatchLookupWithLease(BatchLookupRequest) returns (BatchLookupResponse);
   rpc BatchAllocateWithLease(BatchAllocateRequest) returns (BatchAllocateResponse);
@@ -24,6 +28,10 @@ message LookupResult {
   LeaseInfo lease = 5;
   int64 version = 6;
   bool cacheable = 7;
+  // v6.4: true when status is ALLOCATED and pool_offset is intentionally unset (-1) for load.
+  bool allocated_pending_store = 8;
+  // v6.4: true when this is a catalog EVICTED hit (evicted_path is authoritative).
+  bool evicted_catalog_hit = 9;
 }
 
 message BatchLookupRequest {
@@ -44,6 +52,9 @@ message AllocateItem {
   int32 block_size = 4;
   int32 preferred_store_id = 5;
   bool allow_fallback_store = 6;
+  // v6.4: pool-worker Pass-1 fills these after bitmap reservation; catalog INSERT persists them.
+  int32 worker_reserved_store_node_id = 7;
+  int64 worker_reserved_pool_offset = 8;
 }
 
 message AllocateResult {
@@ -77,6 +88,9 @@ message RenewLeaseResult {
   bytes block_hash = 1;
   ItemResultMeta result = 2;
   LeaseInfo lease = 3;
+  // v6.4: STORED row location from catalog for DRAM promote after cache-miss renew.
+  BlockLocation catalog_location = 4;
+  int64 catalog_row_version = 5;
 }
 
 message BatchRenewLeaseRequest {
@@ -136,4 +150,26 @@ message BatchFreeAllocatedRequest {
 message BatchFreeAllocatedResponse {
   repeated FreeAllocatedResult results = 1;
   int64 server_time_ms = 2;
+}
+
+// Internal catalog RPC (not exposed as BRPC): libpq-driven recovery scan (v6.4 §6.5).
+message ScanShardForRecoveryRequest {
+  CommonRequestMeta meta = 1;
+  int32 shard_id = 2;
+  repeated BlockStatus wanted_status = 3;
+}
+
+message RecoveryRow {
+  bytes block_hash = 1;
+  BlockStatus status = 2;
+  BlockLocation location = 3;
+  int64 version = 4;
+  int64 updated_at_ms = 5;
+}
+
+message ScanShardForRecoveryResponse {
+  ItemResultMeta result = 1;
+  repeated RecoveryRow rows = 2;
+  int64 dn_epoch_after_bump = 3;
+  int64 server_time_ms = 4;
 }

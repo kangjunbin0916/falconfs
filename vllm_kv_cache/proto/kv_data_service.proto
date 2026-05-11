@@ -3,6 +3,10 @@ syntax = "proto3";
 package falconfs.kv;
 import "kv_common.proto";
 
+// Enable protobuf-generated abstract Service base class so we can derive a
+// brpc-compatible service adapter without depending on grpc/brpc plugins.
+option cc_generic_services = true;
+
 service KVDataService {
   rpc BatchWriteBlock(BatchWriteBlockRequest) returns (BatchWriteBlockResponse);
   rpc BatchReadBlock(BatchReadBlockRequest) returns (BatchReadBlockResponse);

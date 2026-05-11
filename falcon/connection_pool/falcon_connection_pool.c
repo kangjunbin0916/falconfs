@@ -24,7 +24,11 @@
 #include "connection_pool/pg_connection_pool.h"
 #include "control/control_flag.h"
 
-int FalconPGPort = 0;
+/* libbrpcplugin.so is dlopen'd after falcon.so; LibpqKVMetaTableAccessor needs
+ * to read this value to open a libpq connection back to the local PG. falcon.so
+ * is built with -fvisibility=hidden so we have to mark this one global as
+ * default-visibility for the dlopen'd plugin to resolve it. */
+__attribute__((visibility("default"))) int FalconPGPort = 0;
 int FalconConnectionPoolPort = FALCON_CONNECTION_POOL_PORT_DEFAULT;
 int FalconConnectionPoolSize = FALCON_CONNECTION_POOL_SIZE_DEFAULT;
 int FalconConnectionPoolBatchSize = FALCON_CONNECTION_POOL_BATCH_SIZE_DEFAULT;

@@ -10,9 +10,9 @@ sys.path.insert(0, str(ROOT / "python"))
 from falconfs_kv.reference import (  # noqa: E402
     BlockStatus,
     ErrorCode,
-    IdempotencyStore,
     LRUManager,
     LeaseManager,
+    MetadataService,
     StoreRegion,
     StoreRegionRegistry,
     StoreRegionState,
@@ -100,7 +100,7 @@ class LeaseManagerTest(unittest.TestCase):
         self.assertTrue(manager.can_evict("k", 111))
 
 
-class LRUAndIdempotencyTest(unittest.TestCase):
+class LRUManagerTest(unittest.TestCase):
     def test_lru_ordering(self):
         lru = LRUManager()
         lru.add_stored("a")
@@ -110,11 +110,24 @@ class LRUAndIdempotencyTest(unittest.TestCase):
         lru.remove("b")
         self.assertEqual(lru.cold_candidates(2), ["a"])
 
-    def test_idempotency_replay_and_gc(self):
-        store = IdempotencyStore(ttl_ms=10)
-        store.put("api", "req", 1, {"ok": True}, now_ms=100)
-        self.assertEqual(store.get("api", "req", 1, now_ms=105), {"ok": True})
-        self.assertIsNone(store.get("api", "req", 1, now_ms=111))
+    def test_same_request_id_does_not_merge_distinct_block_hashes(self):
+        registry = StoreRegionRegistry()
+        region = StoreRegion(
+            store_node_id=1,
+            owner_dn_id=1,
+            base_offset=0,
+            region_bytes=3 * 64,
+            block_size=64,
+        )
+        registry.register(region)
+        meta = MetadataService(registry)
+        first = meta.allocate(["h1", "h2"], request_id="shared", client_id=9)
+        self.assertTrue(first["h1"][0].success)
+        self.assertTrue(first["h2"][0].success)
+        self.assertNotEqual(
+            first["h1"][1].location.pool_offset,
+            first["h2"][1].location.pool_offset,
+        )
 
 
 class StoreRegionStateTest(unittest.TestCase):

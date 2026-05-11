@@ -246,31 +246,6 @@ class LRUManager:
         return list(self._items.keys())[:limit]
 
 
-class IdempotencyStore:
-    def __init__(self, ttl_ms: int = 90000):
-        self.ttl_ms = ttl_ms
-        self._entries: Dict[Tuple[str, str, int], Tuple[object, int]] = {}
-
-    def get(self, api_name: str, request_id: str, client_id: int, now_ms: int) -> Optional[object]:
-        key = (api_name, request_id, client_id)
-        entry = self._entries.get(key)
-        if not entry:
-            return None
-        value, expire_ms = entry
-        if expire_ms <= now_ms:
-            del self._entries[key]
-            return None
-        return value
-
-    def put(self, api_name: str, request_id: str, client_id: int, value: object, now_ms: int) -> None:
-        self._entries[(api_name, request_id, client_id)] = (value, now_ms + self.ttl_ms)
-
-    def gc(self, now_ms: int) -> None:
-        expired = [k for k, (_, expire_ms) in self._entries.items() if expire_ms <= now_ms]
-        for key in expired:
-            del self._entries[key]
-
-
 class KVStore:
     def __init__(self, registry: StoreRegionRegistry):
         self.registry = registry
@@ -316,10 +291,15 @@ class MetadataService:
         self.dn_epoch = dn_epoch
         self.lease_manager = LeaseManager(dn_epoch=dn_epoch)
         self.lru = LRUManager()
-        self.idempotency = IdempotencyStore()
         self.rows: Dict[str, BlockMeta] = {}
 
-    def allocate(self, block_hashes: Iterable[str], now_ms: Optional[int] = None) -> Dict[str, Tuple[ItemResult, Optional[BlockMeta], Optional[LeaseInfo]]]:
+    def allocate(
+        self,
+        block_hashes: Iterable[str],
+        now_ms: Optional[int] = None,
+        request_id: Optional[str] = None,
+        client_id: int = 0,
+    ) -> Dict[str, Tuple[ItemResult, Optional[BlockMeta], Optional[LeaseInfo]]]:
         now = now_ms or now_ms_now()
         results: Dict[str, Tuple[ItemResult, Optional[BlockMeta], Optional[LeaseInfo]]] = {}
         for block_hash in block_hashes:
@@ -328,7 +308,10 @@ class MetadataService:
                 lease = self.lease_manager.grant(block_hash, row.location.store_epoch, now)
                 results[block_hash] = (ItemResult(True), row, lease)
                 continue
-            regions = sorted(self.registry.for_dn(self.dn_id), key=lambda r: (r.state != StoreRegionState.HEALTHY, r.free_blocks))
+            regions = sorted(
+                self.registry.for_dn(self.dn_id),
+                key=lambda r: (r.state != StoreRegionState.HEALTHY, r.free_blocks),
+            )
             allocation: Tuple[ItemResult, Optional[BlockLocation]] = (
                 ItemResult(False, ErrorCode.THROTTLED, True, "no healthy region"),
                 None,
@@ -354,7 +337,12 @@ class MetadataService:
             results[block_hash] = (ItemResult(True), row, lease)
         return results
 
-    def lookup(self, block_hashes: Iterable[str], renew_lease_on_hit: bool = True, now_ms: Optional[int] = None) -> Dict[str, Tuple[ItemResult, Optional[BlockMeta], Optional[LeaseInfo]]]:
+    def lookup(
+        self,
+        block_hashes: Iterable[str],
+        renew_lease_on_hit: bool = True,
+        now_ms: Optional[int] = None,
+    ) -> Dict[str, Tuple[ItemResult, Optional[BlockMeta], Optional[LeaseInfo]]]:
         now = now_ms or now_ms_now()
         results: Dict[str, Tuple[ItemResult, Optional[BlockMeta], Optional[LeaseInfo]]] = {}
         for block_hash in block_hashes:
@@ -380,20 +368,138 @@ class MetadataService:
         expected_from: BlockStatus,
         to_status: BlockStatus,
         expected_version: int,
+        evicted_path: str = "",
+        request_id: Optional[str] = None,
+        client_id: int = 0,
+        now_ms: Optional[int] = None,
     ) -> Tuple[ItemResult, Optional[BlockMeta]]:
+        now = now_ms or now_ms_now()
         row = self.rows.get(block_hash)
         if not row:
-            return ItemResult(False, ErrorCode.NOT_FOUND, False, "missing"), None
+            return (
+                ItemResult(False, ErrorCode.NOT_FOUND, False, "missing"),
+                None,
+            )
         if row.version != expected_version or row.status != expected_from:
-            return ItemResult(False, ErrorCode.CAS_CONFLICT, True, "version/status mismatch"), row
+            return (
+                ItemResult(False, ErrorCode.CAS_CONFLICT, True, "version/status mismatch"),
+                row,
+            )
         row.status = to_status
         row.version += 1
-        row.updated_at_ms = now_ms_now()
+        row.updated_at_ms = now
+        if evicted_path and to_status == BlockStatus.EVICTED:
+            row.location.evicted_path = evicted_path
         if to_status == BlockStatus.STORED:
             self.lru.add_stored(block_hash)
         elif to_status in (BlockStatus.EVICTING, BlockStatus.EVICTED, BlockStatus.FAILED):
             self.lru.remove(block_hash)
-        return ItemResult(True), row
+        if to_status == BlockStatus.EVICTED:
+            region = self.registry.find_by_offset(row.location.store_node_id, row.location.pool_offset)
+            if region:
+                region.free(row.location.pool_offset)
+        return (ItemResult(True), row)
+
+    def free_allocated(
+        self,
+        block_hash: str,
+        expected_version: int,
+        force: bool = False,
+        request_id: Optional[str] = None,
+        client_id: int = 0,
+        now_ms: Optional[int] = None,
+    ) -> Tuple[ItemResult, Optional[int]]:
+        """Free a previously ALLOCATED row and its bitmap slot.
+
+        Mirrors `BatchFreeAllocated` semantics: only ALLOCATED or FAILED rows are freed
+        unless `force=True`. The bitmap slot is released, lease entry removed, and the
+        metadata row deleted.
+        """
+        now = now_ms or now_ms_now()
+        row = self.rows.get(block_hash)
+        if not row:
+            return (
+                ItemResult(False, ErrorCode.NOT_FOUND, False, "missing"),
+                None,
+            )
+        if row.version != expected_version:
+            return (
+                ItemResult(False, ErrorCode.CAS_CONFLICT, True, "version mismatch"),
+                row.version,
+            )
+        if not force and row.status not in (BlockStatus.ALLOCATED, BlockStatus.FAILED):
+            return (
+                ItemResult(False, ErrorCode.INVALID_ARGUMENT, False, "row not freeable"),
+                row.version,
+            )
+        region = self.registry.find_by_offset(row.location.store_node_id, row.location.pool_offset)
+        if region:
+            region.free(row.location.pool_offset)
+        self.lease_manager._leases.pop(block_hash, None)
+        self.lru.remove(block_hash)
+        del self.rows[block_hash]
+        return (ItemResult(True), expected_version + 1)
+
+    def begin_eviction(
+        self,
+        block_hash: str,
+        expected_version: int,
+        request_id: Optional[str] = None,
+        client_id: int = 0,
+        now_ms: Optional[int] = None,
+    ) -> Tuple[ItemResult, Optional[BlockMeta]]:
+        """Phase 1 of two-phase eviction: CAS STORED -> EVICTING."""
+        return self.update_status(
+            block_hash,
+            BlockStatus.STORED,
+            BlockStatus.EVICTING,
+            expected_version,
+            request_id=request_id,
+            client_id=client_id,
+            now_ms=now_ms,
+        )
+
+    def commit_eviction(
+        self,
+        block_hash: str,
+        expected_version: int,
+        evicted_path: str,
+        request_id: Optional[str] = None,
+        client_id: int = 0,
+        now_ms: Optional[int] = None,
+    ) -> Tuple[ItemResult, Optional[BlockMeta]]:
+        """Phase 2 success: CAS EVICTING -> EVICTED, set evicted_path, free bitmap."""
+        if not evicted_path:
+            return ItemResult(False, ErrorCode.INVALID_ARGUMENT, False, "evicted_path required"), None
+        return self.update_status(
+            block_hash,
+            BlockStatus.EVICTING,
+            BlockStatus.EVICTED,
+            expected_version,
+            evicted_path=evicted_path,
+            request_id=request_id,
+            client_id=client_id,
+            now_ms=now_ms,
+        )
+
+    def rollback_eviction(
+        self,
+        block_hash: str,
+        expected_version: int,
+        request_id: Optional[str] = None,
+        client_id: int = 0,
+        now_ms: Optional[int] = None,
+    ) -> Tuple[ItemResult, Optional[BlockMeta]]:
+        """Phase 2 failure: CAS EVICTING -> STORED."""
+        return self.update_status(
+            block_hash,
+            BlockStatus.EVICTING,
+            BlockStatus.STORED,
+            expected_version,
+            request_id=request_id,
+            client_id=client_id,
+            now_ms=now_ms,
+        )
 
 
 class ReferenceCluster:

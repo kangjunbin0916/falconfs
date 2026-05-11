@@ -307,6 +307,29 @@ COMMENT ON FUNCTION pg_catalog.falcon_meta_call_by_serialized_data(type int, cou
 
 
 ----------------------------------------------------------------
+-- v6.4 KV cache catalog: one libpq round-trip per sub-batch (\u00a74.1.1).
+-- Method enum + POD-array payload defined in connection_pool/kv_catalog_wire.h.
+----------------------------------------------------------------
+CREATE FUNCTION pg_catalog.falcon_kv_metadata_catalog_call(method int, payload bytea)
+    RETURNS bytea
+    LANGUAGE C STRICT
+    AS 'MODULE_PATHNAME', $$falcon_kv_metadata_catalog_call$$;
+COMMENT ON FUNCTION pg_catalog.falcon_kv_metadata_catalog_call(method int, payload bytea)
+    IS 'v6.4 KV cache catalog batch op: one round-trip per sub-batch';
+
+
+----------------------------------------------------------------
+-- falcon_create_kvblock_table (v6.4 \u00a73.1: one row table per DN).
+----------------------------------------------------------------
+CREATE FUNCTION pg_catalog.falcon_create_kvblock_table()
+    RETURNS INTEGER
+    LANGUAGE C STRICT
+    AS 'MODULE_PATHNAME', $$falcon_create_kvblock_table$$;
+COMMENT ON FUNCTION pg_catalog.falcon_create_kvblock_table()
+    IS 'v6.4 KV cache catalog: create per-DN falcon_kvblock_table';
+
+
+----------------------------------------------------------------
 -- falcon_create_slice_table
 ----------------------------------------------------------------
 CREATE FUNCTION pg_catalog.falcon_create_slice_table()
