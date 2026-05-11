@@ -120,3 +120,65 @@ target_link_libraries(FalconKVBrpcServiceAdapters
     PUBLIC FalconKVDataService
     PUBLIC FalconKVProto
 )
+
+# ==================== Python protobuf bindings (v6 §16 / M3) ====================
+# Generate `kv_*_pb2.py` modules into the in-tree falconfs_kv package so the
+# Python OffloadingManager (mode="cluster") can build/parse the proto messages
+# without a separate install step. Tests use `PYTHONPATH=vllm_kv_cache/python`.
+set(FALCON_KV_PYTHON_PKG_DIR ${PROJECT_SOURCE_DIR}/vllm_kv_cache/python/falconfs_kv)
+set(FALCON_KV_PYTHON_PROTO_OUTPUTS
+    ${FALCON_KV_PYTHON_PKG_DIR}/kv_common_pb2.py
+    ${FALCON_KV_PYTHON_PKG_DIR}/kv_metadata_service_pb2.py
+    ${FALCON_KV_PYTHON_PKG_DIR}/kv_data_service_pb2.py
+)
+add_custom_command(
+    OUTPUT ${FALCON_KV_PYTHON_PROTO_OUTPUTS}
+    COMMAND ${Protobuf_PROTOC_EXECUTABLE}
+            --python_out=${FALCON_KV_PYTHON_PKG_DIR}
+            --proto_path=${FALCON_KV_PROTO_DIR}
+            ${FALCON_KV_PROTO_FILES}
+    # protoc generates `import kv_common_pb2` (top-level) but we drop the
+    # files into the `falconfs_kv` package, where the import has to be
+    # relative. Post-process to use `from . import ...`.
+    COMMAND sed -i -E "s/^import (kv_[a-z_]+_pb2)/from . import \\1/g"
+            ${FALCON_KV_PYTHON_PROTO_OUTPUTS}
+    DEPENDS ${FALCON_KV_PROTO_FILES}
+    COMMENT "Generating Falcon KV Python protobuf bindings"
+    VERBATIM
+)
+add_custom_target(FalconKVPythonProto ALL
+    DEPENDS ${FALCON_KV_PYTHON_PROTO_OUTPUTS}
+)
+
+# ==================== Python BRPC bridge extension (v6 §16 / M3) ====================
+# Single-file CPython extension wrapping `brpc::Channel` + the KV stubs. The
+# Python OffloadingManager and dn_client/store_client wrappers import it as
+# `from falconfs_kv import falconfs_kv_brpc`.
+add_library(falconfs_kv_brpc MODULE
+    ${PROJECT_SOURCE_DIR}/vllm_kv_cache/python_ext/falconfs_kv_brpc.cpp
+)
+add_dependencies(falconfs_kv_brpc FalconKVProto)
+set_target_properties(falconfs_kv_brpc PROPERTIES
+    PREFIX ""
+    SUFFIX ".so"
+)
+target_include_directories(falconfs_kv_brpc PRIVATE
+    ${Python3_INCLUDE_DIRS}
+    ${FALCON_KV_INCLUDES}
+    ${FALCON_KV_PROTO_GEN_DIR}
+)
+target_link_libraries(falconfs_kv_brpc PRIVATE
+    ${Python3_LIBRARIES}
+    FalconKVProto
+    ${BRPC_LIBRARIES}
+    ${Protobuf_LIBRARIES}
+    ${DYNAMIC_LIB}
+    pthread
+    dl
+)
+# Drop the shared object directly into the in-tree falconfs_kv package so
+# `import falconfs_kv.falconfs_kv_brpc` resolves once tests put
+# `vllm_kv_cache/python` on PYTHONPATH.
+set_target_properties(falconfs_kv_brpc PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${FALCON_KV_PYTHON_PKG_DIR}
+)

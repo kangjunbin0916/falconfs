@@ -60,4 +60,18 @@ void FalconKVBlockBatchCASStatusUpdate(const char *req_buf, uint64_t req_size,
 void FalconKVBlockBatchDelete(const char *req_buf, uint64_t req_size,
                               char *resp_buf, uint64_t resp_size);
 
+/* v6 \u00a715.1 recovery scan: streams every row in `falcon_kvblock_table` into
+ * `out_rows` (caller-allocated, capacity `out_rows_capacity`). Returns the
+ * number of rows actually written. The returned set is not paged: callers
+ * should size capacity to a worst-case based on engine block count.
+ * `KVCatalogRecoveryRow` is defined in connection_pool/kv_catalog_wire.h. */
+uint32_t FalconKVBlockScanForRecovery(KVCatalogRecoveryRow *out_rows,
+                                      uint32_t out_rows_capacity);
+
+/* v6 \u00a715.4 dn_epoch fencing. The `falcon_kvblock_dn_epoch` table holds one
+ * (shard_id, dn_epoch) row; absent rows are treated as `dn_epoch = 1` and
+ * inserted lazily on first bump. */
+int64_t FalconKVBlockLoadDnEpoch(int32_t shard_id);
+int64_t FalconKVBlockBumpDnEpoch(int32_t shard_id);
+
 #endif  /* FALCON_KVBLOCK_TABLE_H */

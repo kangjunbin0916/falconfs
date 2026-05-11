@@ -16,9 +16,12 @@ MetadataRecoveryStats RecoverMetadataFromAccessor(IKVMetaTableAccessor* accessor
     }
 
     // Persisted fencing epoch bumps first so any stale lease renew is rejected.
-    (void) accessor->LoadDnEpoch(shard_id);
-    (void) engine->BumpDnEpoch();
-    stats.bumped_dn_epoch = accessor->BumpDnEpoch(shard_id);
+    // v6 §15.1 step 3: the catalog row is the source of truth — bump it
+    // atomically and mirror the new value into the engine so any in-flight
+    // lease token (carrying the pre-restart dn_epoch) is rejected immediately.
+    const int64_t new_epoch = accessor->BumpDnEpoch(shard_id);
+    engine->SetDnEpochFromCatalog(new_epoch);
+    stats.bumped_dn_epoch = new_epoch;
 
     const std::vector<int32_t> wanted = {
         static_cast<int32_t>(BlockStatus::ALLOCATED),

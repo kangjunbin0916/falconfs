@@ -58,6 +58,11 @@ public:
         spill_manager_ = std::move(spill_manager);
     }
 
+    bool HasSpillManager() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return spill_manager_ != nullptr;
+    }
+
     void SetRegionRegistry(std::shared_ptr<StoreRegionRegistry> registry, int32_t owner_dn_id) {
         std::lock_guard<std::mutex> lock(mu_);
         registry_ = std::move(registry);
@@ -421,6 +426,9 @@ KVStoreEngine& KVStoreEngine::operator=(KVStoreEngine&&) noexcept = default;
 
 void KVStoreEngine::SetSSDSpillManager(std::shared_ptr<SSDSpillManager> spill_manager) {
     impl_->SetSSDSpillManager(std::move(spill_manager));
+}
+bool KVStoreEngine::HasSpillManager() const {
+    return impl_->HasSpillManager();
 }
 
 void KVStoreEngine::SetRegionRegistry(std::shared_ptr<StoreRegionRegistry> registry, int32_t owner_dn_id) {

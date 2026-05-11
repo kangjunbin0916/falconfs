@@ -91,3 +91,40 @@ target_link_libraries(FalconKVMetadataStressE2E
     ${DYNAMIC_LIB}
     pthread
 )
+
+# ==================== FalconKVClusterFaultE2E =================
+# v6 §19.4 cluster fault drill harness. Single binary, multiple --scenario
+# subcommands; a shell wrapper coordinates DN restart phases.
+add_executable(FalconKVClusterFaultE2E
+    ${PROJECT_SOURCE_DIR}/tests/falcon_kv/kv_cluster_fault_e2e.cpp
+)
+
+target_include_directories(FalconKVClusterFaultE2E PRIVATE
+    ${FALCON_KV_INCLUDE_DIRS}
+)
+
+target_link_libraries(FalconKVClusterFaultE2E
+    FalconKVProto
+    ${BRPC_LIBRARIES}
+    ${DYNAMIC_LIB}
+    pthread
+)
+
+# ==================== FalconKVClusterE2E =================
+# v6 §19.4 / M4 distributed multi-DN sweep. Hashes keys across one or more
+# DN BRPC endpoints, drives alloc -> update -> lookup -> renew -> free
+# end-to-end on every endpoint, and asserts both DNs see traffic.
+add_executable(FalconKVClusterE2E
+    ${PROJECT_SOURCE_DIR}/tests/falcon_kv/kv_cluster_e2e.cpp
+)
+
+target_include_directories(FalconKVClusterE2E PRIVATE
+    ${FALCON_KV_INCLUDE_DIRS}
+)
+
+target_link_libraries(FalconKVClusterE2E
+    FalconKVProto
+    ${BRPC_LIBRARIES}
+    ${DYNAMIC_LIB}
+    pthread
+)

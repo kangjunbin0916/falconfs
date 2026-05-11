@@ -250,6 +250,12 @@ public:
     std::vector<std::string> ColdCandidates(std::size_t limit, int64_t now_ms = 0) const;
     bool CanEvict(const std::string& block_hash, int64_t now_ms) const;
 
+    // v6 §14.1: minimum free-blocks ratio across all registered regions, in
+    // [0.0, 1.0]. The eviction worker uses this to decide whether the cluster
+    // is below `falcon_kv.eviction_low_watermark` and an aggressive cycle is
+    // warranted. Returns 1.0 when no regions are registered (no pressure).
+    double MinRegionFreeRatio() const;
+
 private:
     class Impl;
     std::unique_ptr<Impl> impl_;

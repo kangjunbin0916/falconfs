@@ -766,11 +766,154 @@ run_kv_meta_stress_test() {
 }
 
 # ============================================================================
+# KV Cluster Fault Drill (v6 §19.4 #3/#4/#5/#7)
+# ============================================================================
+# Drives FalconKVClusterFaultE2E through every fault scenario. The DN-restart
+# drill (#3) is split across two test invocations with a real
+# `pg_ctl restart -m immediate` for DN1 in between.
+
+# Wait for a port to accept TCP connections, with a configurable timeout.
+wait_for_port() {
+    local port=$1
+    local timeout_s=${2:-30}
+    local i=0
+    while [ "$i" -lt "$timeout_s" ]; do
+        if psql -d postgres -h 127.0.0.1 -p "$port" -tAXc 'SELECT 1;' >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+run_kv_cluster_fault_test() {
+    log_step "Running FalconFS KV cluster fault drill (§19.4 #3/#4/#5/#7)..."
+
+    local fault_bin="$PROJECT_DIR/build/tests/falcon_kv/FalconKVClusterFaultE2E"
+    if [ ! -x "$fault_bin" ]; then
+        log_step "Fault binary missing; building it now..."
+        (cd "$PROJECT_DIR/build" && ninja FalconKVClusterFaultE2E)
+    fi
+
+    local rc=0
+
+    # T7 large batch (§19.4 #7).
+    log_step "  [T7] large batch chunking"
+    if ! "$fault_bin" --scenario=large-batch --endpoint "127.0.0.1:$DN1_POOLER_PORT"; then
+        log_step "  [T7] FAILED"; rc=1
+    fi
+
+    # T4 stale store_epoch (§19.4 #4).
+    log_step "  [T4] stale store_epoch on RenewLease"
+    if ! "$fault_bin" --scenario=stale-store-epoch --endpoint "127.0.0.1:$DN1_POOLER_PORT"; then
+        log_step "  [T4] FAILED"; rc=1
+    fi
+
+    # T5 eviction rollback (§19.4 #5). Spill always fails (no SSD root
+    # configured); the eviction worker must roll the row back to STORED.
+    log_step "  [T5] eviction rollback"
+    if ! "$fault_bin" --scenario=eviction-rollback --endpoint "127.0.0.1:$DN1_POOLER_PORT" \
+         --wait-ms 2000; then
+        log_step "  [T5] FAILED"; rc=1
+    fi
+
+    # T3 DN restart drill (§19.4 #3).
+    log_step "  [T3] DN1 restart drill — phase 1 (alloc + dump state)"
+    local state_file="/tmp/falcon_kv_cluster_fault_state.$$.txt"
+    if ! "$fault_bin" --scenario=dn-restart-phase1 --endpoint "127.0.0.1:$DN1_POOLER_PORT" \
+         --state-file "$state_file"; then
+        log_step "  [T3] FAILED at phase 1"; rc=1; rm -f "$state_file"
+    else
+        log_step "  [T3] restarting DN1 PG (immediate mode, then poll)"
+        # `pg_ctl -m immediate -w` can hang waiting on Unix-socket
+        # readiness probe in TCP-only setups; use -W and poll the TCP port.
+        pg_ctl restart -D "$META_DB_DIR/worker0" -m immediate -W >/dev/null 2>&1 || true
+        if ! wait_for_port "$DN1_PORT" 60; then
+            log_step "  [T3] DN1 did not come back up within 60s"; rc=1
+        else
+            log_step "  [T3] DN1 restarted; phase 2 (verify recovery + epoch fence)"
+            # Give the in-plugin recovery runner a moment to bump dn_epoch
+            # and rehydrate the engine before BRPC clients hit it.
+            sleep 3
+            if ! "$fault_bin" --scenario=dn-restart-phase2 --endpoint "127.0.0.1:$DN1_POOLER_PORT" \
+                 --state-file "$state_file"; then
+                log_step "  [T3] FAILED at phase 2"; rc=1
+            fi
+        fi
+        rm -f "$state_file"
+    fi
+
+    # Best-effort post-drill catalog cleanup (some tests intentionally leak
+    # rows that they then force-free; eviction-rollback's cleanup may also
+    # have raced an eviction cycle on the same row).
+    for port in "$DN1_PORT" "$DN2_PORT"; do
+        psql -d postgres -h 127.0.0.1 -p "$port" \
+            -c "DELETE FROM pg_catalog.falcon_kvblock_table WHERE block_hash::text LIKE '\\\\x6661756c745f%';" \
+            >/dev/null 2>&1 || true
+    done
+
+    if [ "$rc" -ne 0 ]; then
+        log_step "KV cluster fault tests FAILED"
+        return 1
+    fi
+    log_info "KV cluster fault tests passed"
+}
+
+# ============================================================================
+# KV Distributed Cluster Test (v6 §19.4 / M4)
+# ============================================================================
+# Drives FalconKVClusterE2E against both DN BRPC endpoints (and optionally CN)
+# to validate routing + per-DN traffic + alloc/update/lookup/renew/free
+# end-to-end. Ensures both DNs receive a non-zero share of work.
+
+run_kv_cluster_test() {
+    log_step "Running FalconFS KV distributed cluster test (§19.4 / M4)..."
+
+    local cluster_bin="$PROJECT_DIR/build/tests/falcon_kv/FalconKVClusterE2E"
+    if [ ! -x "$cluster_bin" ]; then
+        log_step "Cluster E2E binary missing; building it now..."
+        (cd "$PROJECT_DIR/build" && ninja FalconKVClusterE2E)
+    fi
+
+    local rc=0
+
+    log_step "  multi-DN sweep across DN1+DN2 (keys=64, iterations=2)"
+    if ! "$cluster_bin" \
+            --dn "127.0.0.1:$DN1_POOLER_PORT" \
+            --dn "127.0.0.1:$DN2_POOLER_PORT" \
+            --keys 64 --iterations 2; then
+        log_step "  multi-DN sweep FAILED"; rc=1
+    fi
+
+    # Verify per-DN catalog cleanup: every test row has the prefix `cluster_`.
+    local cleanup_rc=0
+    for port in "$DN1_PORT" "$DN2_PORT"; do
+        local rows
+        rows=$(psql -d postgres -h 127.0.0.1 -p "$port" -tAXc \
+            "SELECT count(*) FROM pg_catalog.falcon_kvblock_table WHERE encode(block_hash, 'escape') LIKE 'cluster_%';" \
+            2>/dev/null || echo "ERR")
+        if [ "$rows" != "0" ]; then
+            log_step "  catalog cleanup FAILED on DN port=$port (residual cluster_* rows=$rows)"
+            cleanup_rc=1
+        else
+            log_info "  catalog clean on DN port=$port"
+        fi
+    done
+
+    if [ "$rc" -ne 0 ] || [ "$cleanup_rc" -ne 0 ]; then
+        log_step "KV distributed cluster test FAILED"
+        return 1
+    fi
+    log_info "KV distributed cluster test passed"
+}
+
+# ============================================================================
 # Main Entry
 # ============================================================================
 
 usage() {
-    echo "Usage: $0 {build|start|stop|restart|status|test|kv-test|kv-fault-test|kv-meta-stress-test}"
+    echo "Usage: $0 {build|start|stop|restart|status|test|kv-test|kv-fault-test|kv-meta-stress-test|kv-cluster-test|kv-cluster-fault-test}"
     echo ""
     echo "Commands:"
     echo "  build   - Build and install FalconFS"
@@ -782,6 +925,8 @@ usage() {
     echo "  kv-test - Run KV cache standalone tests (no vLLM required)"
     echo "  kv-fault-test - Run KV cache fault tests (no vLLM required)"
     echo "  kv-meta-stress-test - Run KV metadata end-to-end stress tests against the running cluster"
+    echo "  kv-cluster-test - Run KV multi-DN distributed test (allocate/write/update/lookup/free across DN1+DN2)"
+    echo "  kv-cluster-fault-test - Run KV cluster fault drill (DN restart, eviction rollback, large batch, stale store_epoch)"
     exit 1
 }
 
@@ -811,6 +956,12 @@ case "${1:-}" in
         ;;
     kv-meta-stress-test)
         run_kv_meta_stress_test
+        ;;
+    kv-cluster-test)
+        run_kv_cluster_test
+        ;;
+    kv-cluster-fault-test)
+        run_kv_cluster_fault_test
         ;;
     kv-fault-test)
         run_kv_fault_test

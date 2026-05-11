@@ -21,6 +21,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_namespace.h"
 #include "executor/spi.h"
+#include "utils/lsyscache.h"
 #include "miscadmin.h"
 #include "nodes/pg_list.h"
 #include "storage/lockdefs.h"
@@ -57,7 +58,14 @@ void ConstructCreateKvblockTableCommand(StringInfo command, const char *name)
                      "CREATE INDEX %s ON falcon.%s USING btree(status, updated_at_ms);"
                      "ALTER TABLE falcon.%s SET SCHEMA pg_catalog;"
                      "GRANT SELECT ON pg_catalog.%s TO public;"
-                     "ALTER EXTENSION falcon ADD TABLE %s;",
+                     "ALTER EXTENSION falcon ADD TABLE %s;"
+                     /* v6 \u00a715.1 persisted dn_epoch row used for restart fencing. */
+                     "CREATE TABLE falcon.falcon_kvblock_dn_epoch("
+                     "shard_id INT PRIMARY KEY,"
+                     "dn_epoch BIGINT NOT NULL);"
+                     "ALTER TABLE falcon.falcon_kvblock_dn_epoch SET SCHEMA pg_catalog;"
+                     "GRANT SELECT ON pg_catalog.falcon_kvblock_dn_epoch TO public;"
+                     "ALTER EXTENSION falcon ADD TABLE falcon_kvblock_dn_epoch;",
                      name,
                      KvblockTableStatusIndexName, name,
                      name,
@@ -395,4 +403,166 @@ void FalconKVBlockBatchDelete(const char *req_buf, uint64_t req_size,
     }
     CommandCounterIncrement();
     table_close(rel, RowExclusiveLock);
+}
+
+/* ------------------------------------------------------------------------ */
+/*  Recovery scan + dn_epoch (v6 \u00a715.1, \u00a715.4)                                */
+/* ------------------------------------------------------------------------ */
+
+uint32_t FalconKVBlockScanForRecovery(KVCatalogRecoveryRow *out_rows,
+                                      uint32_t out_rows_capacity)
+{
+    if (out_rows == NULL || out_rows_capacity == 0)
+        return 0;
+
+    Relation rel = table_open(KvblockRelationId(), AccessShareLock);
+    SysScanDesc scan = systable_beginscan(rel, InvalidOid, false /*indexOK*/,
+                                          GetActiveSnapshot(), 0, NULL);
+    TupleDesc tupdesc = RelationGetDescr(rel);
+    uint32_t produced = 0;
+    HeapTuple t;
+    while ((t = systable_getnext(scan)) != NULL) {
+        if (produced >= out_rows_capacity)
+            break;
+        Datum datums[Natts_falcon_kvblock_table];
+        bool  isnulls[Natts_falcon_kvblock_table];
+        heap_deform_tuple(t, tupdesc, datums, isnulls);
+
+        KVCatalogRecoveryRow *row = &out_rows[produced];
+        memset(row, 0, sizeof(*row));
+
+        if (!isnulls[Anum_falcon_kvblock_table_block_hash - 1]) {
+            bytea *bh = DatumGetByteaP(datums[Anum_falcon_kvblock_table_block_hash - 1]);
+            int sz = VARSIZE_ANY_EXHDR(bh);
+            if (sz < 0) sz = 0;
+            if (sz > KV_CATALOG_BLOCK_HASH_MAX_LEN) sz = KV_CATALOG_BLOCK_HASH_MAX_LEN;
+            memcpy(row->block_hash, VARDATA_ANY(bh), sz);
+            row->block_hash_len = (uint16_t) sz;
+        }
+        row->status = (uint8_t) DatumGetInt16(datums[Anum_falcon_kvblock_table_status - 1]);
+        row->store_node_id = DatumGetInt32(datums[Anum_falcon_kvblock_table_store_node_id - 1]);
+        row->pool_offset = DatumGetInt64(datums[Anum_falcon_kvblock_table_pool_offset - 1]);
+        row->version = DatumGetInt64(datums[Anum_falcon_kvblock_table_version - 1]);
+        row->updated_at_ms = DatumGetInt64(datums[Anum_falcon_kvblock_table_updated_at_ms - 1]);
+        CopyEvictedPathField(datums, isnulls, row->evicted_path, &row->evicted_path_len);
+
+        ++produced;
+    }
+    systable_endscan(scan);
+    table_close(rel, AccessShareLock);
+    return produced;
+}
+
+/* The dn_epoch row is keyed by shard_id. Scan sequentially since the table is
+ * tiny (one row per shard). Returns false if the table is missing
+ * (pre-migration deployments). */
+static bool DnEpochTableExists(void)
+{
+    /* The schema creator places the table in pg_catalog. */
+    Oid nsp = get_namespace_oid("pg_catalog", true);
+    if (nsp == InvalidOid) return false;
+    return get_relname_relid("falcon_kvblock_dn_epoch", nsp) != InvalidOid;
+}
+
+static Oid DnEpochRelOid(void)
+{
+    Oid nsp = get_namespace_oid("pg_catalog", true);
+    if (nsp == InvalidOid) return InvalidOid;
+    return get_relname_relid("falcon_kvblock_dn_epoch", nsp);
+}
+
+#define DN_EPOCH_NATTS 2
+#define DN_EPOCH_ANUM_SHARD 1
+#define DN_EPOCH_ANUM_EPOCH 2
+
+static HeapTuple DnEpochFetchRow(Relation rel, int32 shard_id, Datum *datums, bool *isnulls)
+{
+    SysScanDesc scan = systable_beginscan(rel, InvalidOid, false /*indexOK*/,
+                                          GetActiveSnapshot(), 0, NULL);
+    HeapTuple t;
+    HeapTuple match = NULL;
+    TupleDesc tupdesc = RelationGetDescr(rel);
+    while ((t = systable_getnext(scan)) != NULL) {
+        Datum cur_datums[DN_EPOCH_NATTS];
+        bool  cur_nulls[DN_EPOCH_NATTS];
+        heap_deform_tuple(t, tupdesc, cur_datums, cur_nulls);
+        if (!cur_nulls[DN_EPOCH_ANUM_SHARD - 1] &&
+            DatumGetInt32(cur_datums[DN_EPOCH_ANUM_SHARD - 1]) == shard_id) {
+            match = heap_copytuple(t);
+            if (datums != NULL && isnulls != NULL) {
+                memcpy(datums, cur_datums, sizeof(cur_datums));
+                memcpy(isnulls, cur_nulls, sizeof(cur_nulls));
+            }
+            break;
+        }
+    }
+    systable_endscan(scan);
+    return match;
+}
+
+int64_t FalconKVBlockLoadDnEpoch(int32_t shard_id)
+{
+    if (!DnEpochTableExists())
+        return 1;
+    Oid relid = DnEpochRelOid();
+    if (relid == InvalidOid) return 1;
+
+    int64_t epoch = 1;
+    Relation rel = table_open(relid, AccessShareLock);
+    Datum datums[DN_EPOCH_NATTS];
+    bool  isnulls[DN_EPOCH_NATTS];
+    HeapTuple t = DnEpochFetchRow(rel, shard_id, datums, isnulls);
+    if (t != NULL) {
+        if (!isnulls[DN_EPOCH_ANUM_EPOCH - 1])
+            epoch = DatumGetInt64(datums[DN_EPOCH_ANUM_EPOCH - 1]);
+        heap_freetuple(t);
+    }
+    table_close(rel, AccessShareLock);
+    return epoch;
+}
+
+int64_t FalconKVBlockBumpDnEpoch(int32_t shard_id)
+{
+    if (!DnEpochTableExists())
+        return 1;
+    Oid relid = DnEpochRelOid();
+    if (relid == InvalidOid) return 1;
+
+    int64_t new_epoch = 1;
+    Relation rel = table_open(relid, RowExclusiveLock);
+    CatalogIndexState istate = CatalogOpenIndexes(rel);
+    TupleDesc tupdesc = RelationGetDescr(rel);
+    Datum datums[DN_EPOCH_NATTS];
+    bool  isnulls[DN_EPOCH_NATTS];
+    HeapTuple cur = DnEpochFetchRow(rel, shard_id, datums, isnulls);
+
+    if (cur == NULL) {
+        /* First bump: insert (shard_id, 2). LoadDnEpoch returns 1 when absent,
+         * so the first bump must produce 2 to remain monotonically increasing. */
+        new_epoch = 2;
+        Datum new_d[DN_EPOCH_NATTS];
+        bool  new_n[DN_EPOCH_NATTS] = {false, false};
+        new_d[DN_EPOCH_ANUM_SHARD - 1] = Int32GetDatum(shard_id);
+        new_d[DN_EPOCH_ANUM_EPOCH - 1] = Int64GetDatum(new_epoch);
+        HeapTuple t = heap_form_tuple(tupdesc, new_d, new_n);
+        CatalogTupleInsertWithInfo(rel, t, istate);
+        heap_freetuple(t);
+    } else {
+        int64_t cur_epoch = isnulls[DN_EPOCH_ANUM_EPOCH - 1]
+                                ? 1
+                                : DatumGetInt64(datums[DN_EPOCH_ANUM_EPOCH - 1]);
+        new_epoch = cur_epoch + 1;
+        Datum new_d[DN_EPOCH_NATTS];
+        bool  new_n[DN_EPOCH_NATTS] = {false, false};
+        bool  rep[DN_EPOCH_NATTS] = {false, true};
+        new_d[DN_EPOCH_ANUM_EPOCH - 1] = Int64GetDatum(new_epoch);
+        HeapTuple updated = heap_modify_tuple(cur, tupdesc, new_d, new_n, rep);
+        CatalogTupleUpdateWithInfo(rel, &cur->t_self, updated, istate);
+        heap_freetuple(updated);
+        heap_freetuple(cur);
+    }
+    CommandCounterIncrement();
+    CatalogCloseIndexes(istate);
+    table_close(rel, RowExclusiveLock);
+    return new_epoch;
 }

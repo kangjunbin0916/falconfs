@@ -326,14 +326,19 @@ public:
             if (slot_idx < 0 || slot_idx >= re.total_blocks)
                 return ToEngineResult(ItemResult::Ok());
             TryMarkBitOccupied(re, slot_idx);
-            // Initialise meta slot.
+            // Initialise meta slot. v6 §15.4: a grace lease prevents the
+            // CLOCK eviction worker from immediately consuming the entire
+            // reseeded working set on the first pass after recovery, and
+            // also blocks spurious STORED -> EVICTING -> STORED CAS cycles
+            // that would bump the version unnecessarily before any client
+            // ever talks to this DN.
             DramMetaSlot& slot = re.meta[slot_idx];
             slot.state         = static_cast<uint8_t>(bs);
             slot.ref_bit       = 0;
             slot.shard_id      = static_cast<uint16_t>(shard_id_);
             slot.store_node_id = location.store_node_id;
-            slot.lease_token   = 0;
-            slot.lease_expire_ms = 0;
+            slot.lease_token   = NewLeaseToken();
+            slot.lease_expire_ms = now_ms + kDefaultLeaseTtlMs;
             slot.version       = version;
             slot.store_epoch   = location.store_epoch;
             slot.block_hash    = block_hash;
@@ -1277,6 +1282,26 @@ public:
         return slot.lease_expire_ms <= now_ms;
     }
 
+    // v6 §14.1 low-watermark probe. Returns 1.0 (no pressure) when no regions
+    // are registered.
+    double MinRegionFreeRatio() const {
+        std::shared_lock<std::shared_mutex> rl(regions_mu_);
+        double min_ratio = 1.0;
+        bool any = false;
+        for (const auto& kv : regions_) {
+            const KVRegion& re = *kv.second;
+            if (re.total_blocks <= 0) continue;
+            const int64_t free_blocks = re.free_blocks.load(std::memory_order_relaxed);
+            const double ratio = static_cast<double>(free_blocks) /
+                                 static_cast<double>(re.total_blocks);
+            if (!any || ratio < min_ratio) {
+                min_ratio = ratio;
+                any = true;
+            }
+        }
+        return any ? min_ratio : 1.0;
+    }
+
 private:
     // ── Internal row type ────────────────────────────────────────────────────
 
@@ -1656,6 +1681,9 @@ std::vector<std::string> KVMetadataEngine::ColdCandidates(std::size_t limit,
 }
 bool KVMetadataEngine::CanEvict(const std::string& block_hash, int64_t now_ms) const {
     return impl_->CanEvict(block_hash, now_ms);
+}
+double KVMetadataEngine::MinRegionFreeRatio() const {
+    return impl_->MinRegionFreeRatio();
 }
 
 void KVMetadataEngine::SetAllowInlineMetaTableLookup(bool allow) {

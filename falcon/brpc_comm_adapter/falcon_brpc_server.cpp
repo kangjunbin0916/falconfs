@@ -16,6 +16,8 @@
 #include "base_comm_adapter/base_meta_service_job.h"
 #include "brpc_comm_adapter/brpc_kv_service_imp.h"
 #include "brpc_comm_adapter/brpc_meta_service_imp.h"
+#include "brpc_comm_adapter/kv_eviction_worker.h"
+#include "brpc_comm_adapter/kv_recovery_runner.h"
 #include "brpc_comm_adapter/kv_runtime_register.h"
 #include "vllm_kv_cache/src/metadata/kv_metadata_engine.h"
 #include "vllm_kv_cache/src/metadata/kv_metadata_service_impl.h"
@@ -99,12 +101,27 @@ class FalconBrpcServer {
         /* Make sure the kvblock catalog table exists before serving requests. */
         EnsureKvblockTableOnce(FalconPGPort);
 
+        /* v6 \u00a715.1 DN-restart recovery: bump dn_epoch (rejects stale leases)
+         * and rehydrate the in-memory bitmap + meta arrays from persisted
+         * `pg_catalog.falcon_kvblock_table` rows BEFORE we register the runtime
+         * bridge or start BRPC. By the time clients can reach this DN, every
+         * persisted row already has a DRAM mirror with a fresh grace lease. */
+        falcon::kv_proto::KVRecoveryRunner recoveryRunner(m_kvMetadataEngine, FalconPGPort,
+                                                          kKvShardId);
+        (void) recoveryRunner.Run();
+
         /* Register the engine with the falcon.so runtime bridge so connection
          * pool workers can route KV jobs through it. */
         falcon::kv_proto::KVRuntimeRegister::Install(m_kvMetadataImpl);
 
         m_kvStoreEngine = std::make_shared<falconfs::kv::KVStoreEngine>();
         m_kvDataImpl = std::make_shared<falconfs::kv::KVDataServiceImpl>(m_kvStoreEngine);
+
+        /* v6 \u00a714 background eviction. Owns its own libpq connection so it does
+         * not contend with pool-worker traffic for catalog round-trips. */
+        m_kvEvictionWorker = std::make_unique<falcon::kv_proto::KVEvictionWorker>(
+            m_kvMetadataEngine, m_kvMetadataImpl, m_kvStoreEngine, FalconPGPort);
+        m_kvEvictionWorker->Start();
 
         falcon::kv_proto::BrpcKVMetadataServiceImpl kvMetadataBrpcService(m_jobDispatchFunc);
         falcon::kv_proto::BrpcKVDataServiceImpl kvDataBrpcService(m_kvDataImpl);
@@ -138,6 +155,10 @@ class FalconBrpcServer {
 
     void Shutdown()
     {
+        if (m_kvEvictionWorker) {
+            m_kvEvictionWorker->Stop();
+            m_kvEvictionWorker.reset();
+        }
         m_server.Stop(0);
         m_server.Join();
         falcon::kv_proto::KVRuntimeRegister::Uninstall();
@@ -153,6 +174,7 @@ class FalconBrpcServer {
     std::shared_ptr<falconfs::kv::KVMetadataServiceImpl> m_kvMetadataImpl;
     std::shared_ptr<falconfs::kv::KVStoreEngine> m_kvStoreEngine;
     std::shared_ptr<falconfs::kv::KVDataServiceImpl> m_kvDataImpl;
+    std::unique_ptr<falcon::kv_proto::KVEvictionWorker> m_kvEvictionWorker;
 };
 
 static std::unique_ptr<FalconBrpcServer> g_falconBrpcServerInstance = NULL;

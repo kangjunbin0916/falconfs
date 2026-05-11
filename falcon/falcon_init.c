@@ -354,4 +354,46 @@ static void RegisterFalconConfigVariables(void)
                              NULL,
                              falcon_perf_enabled_assign,
                              NULL);
+
+    /* v6 §14 KV eviction worker tuning. Read from libbrpcplugin.so by the
+     * in-plugin eviction thread. */
+    DefineCustomIntVariable("falcon_kv.eviction_period_ms",
+                            "KV eviction worker scan period (ms).",
+                            NULL,
+                            &FalconKvEvictionPeriodMs,
+                            FALCON_KV_EVICTION_PERIOD_MS_DEFAULT,
+                            50,
+                            60000,
+                            PGC_SIGHUP,
+                            0,
+                            NULL,
+                            NULL,
+                            NULL);
+
+    DefineCustomIntVariable("falcon_kv.eviction_low_watermark_pct",
+                            "Per-region free-blocks ratio (percent, 0..100) below which "
+                            "the KV eviction worker switches to aggressive mode.",
+                            NULL,
+                            &FalconKvEvictionLowWatermarkPct,
+                            FALCON_KV_EVICTION_LOW_WATERMARK_PCT_DEFAULT,
+                            0,
+                            100,
+                            PGC_SIGHUP,
+                            0,
+                            NULL,
+                            NULL,
+                            NULL);
+
+    DefineCustomIntVariable("falcon_kv.eviction_chunk",
+                            "Maximum cold candidates handled per KV eviction cycle.",
+                            NULL,
+                            &FalconKvEvictionChunk,
+                            FALCON_KV_EVICTION_CHUNK_DEFAULT,
+                            1,
+                            1024,
+                            PGC_SIGHUP,
+                            0,
+                            NULL,
+                            NULL,
+                            NULL);
 }

@@ -451,4 +451,11 @@ bool KVRuntimeRegister::EnsureKvblockTableOnConn(void *pg_conn_opaque)
     return ok;
 }
 
+std::string KVRuntimeRegister::CatalogCASStatusUpdateOnConn(void *pg_conn_opaque,
+                                                            const std::string &serialized_sub_payload)
+{
+    PGconn *conn = static_cast<PGconn *>(pg_conn_opaque);
+    return CatalogCASStatusUpdate(conn, serialized_sub_payload);
+}
+
 }  // namespace falcon::kv_proto

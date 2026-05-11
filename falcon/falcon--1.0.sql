@@ -317,6 +317,19 @@ CREATE FUNCTION pg_catalog.falcon_kv_metadata_catalog_call(method int, payload b
 COMMENT ON FUNCTION pg_catalog.falcon_kv_metadata_catalog_call(method int, payload bytea)
     IS 'v6.4 KV cache catalog batch op: one round-trip per sub-batch';
 
+-----------------------------------------------------------------
+-- falcon_kv_metadata_recovery_call (v6 §15.1 / §15.4):
+--   - SCAN_FOR_RECOVERY scans falcon_kvblock_table and returns all rows.
+--   - LOAD_DN_EPOCH / BUMP_DN_EPOCH manage falcon_kvblock_dn_epoch.
+-- Method enum + payload format defined in connection_pool/kv_catalog_wire.h.
+-----------------------------------------------------------------
+CREATE FUNCTION pg_catalog.falcon_kv_metadata_recovery_call(method int, payload bytea)
+    RETURNS bytea
+    LANGUAGE C STRICT
+    AS 'MODULE_PATHNAME', $$falcon_kv_metadata_recovery_call$$;
+COMMENT ON FUNCTION pg_catalog.falcon_kv_metadata_recovery_call(method int, payload bytea)
+    IS 'v6 §15.1 KV cache DN-restart recovery: scan rows + dn_epoch fencing';
+
 
 ----------------------------------------------------------------
 -- falcon_create_kvblock_table (v6.4 \u00a73.1: one row table per DN).

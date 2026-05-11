@@ -25,6 +25,16 @@ public:
     /* Ensures `falcon_kvblock_table` exists by calling
      * `pg_catalog.falcon_create_kvblock_table()` on the supplied connection. */
     static bool EnsureKvblockTableOnConn(void *pg_conn_opaque);
+
+    /* Catalog CAS round-trip helper exposed for the in-plugin eviction worker
+     * (v6 §14): given a serialized `BatchUpdateStatusRequest`, runs the
+     * catalog sub-batch through `pg_catalog.falcon_kv_metadata_catalog_call`
+     * over the supplied libpq connection and returns a serialized
+     * `BatchUpdateStatusResponse`. Uses the same wire format as the BRPC
+     * handler path so the engine's `Batch*SplitForPoolWorker` callbacks are
+     * interchangeable. */
+    static std::string CatalogCASStatusUpdateOnConn(void *pg_conn_opaque,
+                                                    const std::string &serialized_sub_payload);
 };
 
 }  // namespace falcon::kv_proto

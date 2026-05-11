@@ -38,6 +38,11 @@ typedef enum KVCatalogMethod {
     KV_CATALOG_METHOD_INSERT_ALLOCATED  = 2,
     KV_CATALOG_METHOD_CAS_STATUS_UPDATE = 3,
     KV_CATALOG_METHOD_DELETE            = 4,
+    /* v6 \u00a715.1 / \u00a715.4 recovery methods, served by
+     * `falcon_kv_metadata_recovery_call(method, payload)`. */
+    KV_CATALOG_METHOD_SCAN_FOR_RECOVERY = 5,
+    KV_CATALOG_METHOD_LOAD_DN_EPOCH     = 6,
+    KV_CATALOG_METHOD_BUMP_DN_EPOCH     = 7,
 } KVCatalogMethod;
 
 /* BlockStatus mirror (v6.4 \u00a73.2). 0 must never be persisted. */
@@ -116,6 +121,36 @@ typedef struct __attribute__((packed)) KVCatalogDeleteResult {
     uint8_t  success;
     uint8_t  conflict;
 } KVCatalogDeleteResult;
+
+/* ---- Recovery: ScanForRecovery row layout ------------------------------ */
+/*
+ * Recovery scan returns ALL rows in `falcon_kvblock_table` (regardless of
+ * status). The response is a count-prefixed POD array, identical layout
+ * across the wire so the libpq client in libbrpcplugin.so can iterate it
+ * without parsing protobuf. Per-row evicted_path is inline (zero-padded to
+ * KV_CATALOG_EVICTED_PATH_MAX_LEN) so each row is fixed-size.
+ */
+typedef struct __attribute__((packed)) KVCatalogRecoveryRow {
+    uint16_t block_hash_len;
+    uint8_t  block_hash[KV_CATALOG_BLOCK_HASH_MAX_LEN];
+    uint8_t  status;            /* KV_CATALOG_STATUS_* */
+    int32_t  store_node_id;
+    int64_t  pool_offset;
+    int64_t  version;
+    int64_t  updated_at_ms;
+    uint16_t evicted_path_len;
+    char     evicted_path[KV_CATALOG_EVICTED_PATH_MAX_LEN];
+} KVCatalogRecoveryRow;
+
+/* ---- Recovery: dn_epoch payloads --------------------------------------- */
+
+typedef struct __attribute__((packed)) KVCatalogDnEpochRequest {
+    int32_t shard_id;
+} KVCatalogDnEpochRequest;
+
+typedef struct __attribute__((packed)) KVCatalogDnEpochResponse {
+    int64_t dn_epoch;
+} KVCatalogDnEpochResponse;
 
 /* Helper: compute response buffer size for a given method and item count. */
 static inline uint64_t KVCatalogResponseSize(int method, uint32_t count)

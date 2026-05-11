@@ -37,6 +37,16 @@ int FalconConnectionPoolWaitMin = FALCON_CONNECTION_POOL_WAIT_MIN_DEFAULT;
 int FalconConnectionPoolWaitMax = FALCON_CONNECTION_POOL_WAIT_MAX_DEFAULT;
 uint64_t FalconConnectionPoolShmemSize = FALCON_CONNECTION_POOL_SHMEM_SIZE_DEFAULT;
 
+/* v6 \u00a714 KV eviction worker GUCs (read from libbrpcplugin.so via dlopen
+ * symbol resolution; default visibility for the plugin's extern int
+ * declarations to resolve). */
+__attribute__((visibility("default"))) int FalconKvEvictionPeriodMs =
+    FALCON_KV_EVICTION_PERIOD_MS_DEFAULT;
+__attribute__((visibility("default"))) int FalconKvEvictionLowWatermarkPct =
+    FALCON_KV_EVICTION_LOW_WATERMARK_PCT_DEFAULT;
+__attribute__((visibility("default"))) int FalconKvEvictionChunk =
+    FALCON_KV_EVICTION_CHUNK_DEFAULT;
+
 // communication plugin path, using global variable for shared to worker process
 char *FalconCommunicationPluginPath;
 // communication server IP, using global variable for shared to worker process

@@ -63,6 +63,12 @@ public:
     void SetRegionRegistry(std::shared_ptr<StoreRegionRegistry> registry, int32_t owner_dn_id);
     void SetHeartbeatSender(HeartbeatSender sender);
 
+    // True when SetSSDSpillManager has been called with a non-null manager.
+    // Used by the in-plugin eviction worker to skip cycles that would
+    // otherwise always fail (and roll back via catalog CAS, churning
+    // versions for no good reason).
+    bool HasSpillManager() const;
+
     int32_t StoreNodeId() const;
     int32_t BlockSize() const;
 

@@ -42,13 +42,42 @@ public:
     };
     using SpillFn = std::function<SpillOutcome(const std::string& block_hash, int64_t version)>;
 
+    // Status-update callback contract (v6 §14.3): performs a CAS state
+    // transition on the row identified by `block_hash` (e.g. STORED ->
+    // EVICTING -> EVICTED -> STORED-rollback). The callback owns the
+    // catalog round-trip semantics; tests pass `engine_->UpdateStatus`
+    // directly (LOCAL_FALLBACK), production wires libpq through the
+    // BRPC service `Batch*SplitForPoolWorker` form (REMOTE_LIBPQ).
+    // Default-constructed coordinators fall back to `engine_->UpdateStatus`
+    // so the existing unit-test surface keeps working.
+    using StatusUpdateFn = std::function<EngineUpdateStatusResult(
+        const std::string& block_hash,
+        int32_t expected_from_status,
+        int32_t to_status,
+        int64_t expected_version,
+        const std::string& evicted_path,
+        bool allow_noop_if_already_target,
+        int64_t now_ms)>;
+
     EvictionCoordinator(std::shared_ptr<KVMetadataEngine> engine, SpillFn spill_fn);
+    EvictionCoordinator(std::shared_ptr<KVMetadataEngine> engine,
+                        SpillFn spill_fn,
+                        StatusUpdateFn status_update_fn);
 
     EvictionCycleResult RunOneCycle(const EvictionConfig& cfg);
 
 private:
+    EngineUpdateStatusResult DoUpdateStatus(const std::string& block_hash,
+                                            int32_t expected_from_status,
+                                            int32_t to_status,
+                                            int64_t expected_version,
+                                            const std::string& evicted_path,
+                                            bool allow_noop_if_already_target,
+                                            int64_t now_ms);
+
     std::shared_ptr<KVMetadataEngine> engine_;
     SpillFn spill_fn_;
+    StatusUpdateFn status_update_fn_;
 };
 
 }  // namespace falconfs::kv

@@ -13,7 +13,30 @@ constexpr int32_t kEvicted = static_cast<int32_t>(BlockStatus::BLOCK_STATUS_EVIC
 }  // namespace
 
 EvictionCoordinator::EvictionCoordinator(std::shared_ptr<KVMetadataEngine> engine, SpillFn spill_fn)
-    : engine_(std::move(engine)), spill_fn_(std::move(spill_fn)) {}
+    : engine_(std::move(engine)), spill_fn_(std::move(spill_fn)), status_update_fn_(nullptr) {}
+
+EvictionCoordinator::EvictionCoordinator(std::shared_ptr<KVMetadataEngine> engine,
+                                         SpillFn spill_fn,
+                                         StatusUpdateFn status_update_fn)
+    : engine_(std::move(engine)),
+      spill_fn_(std::move(spill_fn)),
+      status_update_fn_(std::move(status_update_fn)) {}
+
+EngineUpdateStatusResult EvictionCoordinator::DoUpdateStatus(
+    const std::string& block_hash,
+    int32_t expected_from_status,
+    int32_t to_status,
+    int64_t expected_version,
+    const std::string& evicted_path,
+    bool allow_noop_if_already_target,
+    int64_t now_ms) {
+    if (status_update_fn_) {
+        return status_update_fn_(block_hash, expected_from_status, to_status, expected_version,
+                                 evicted_path, allow_noop_if_already_target, now_ms);
+    }
+    return engine_->UpdateStatus(block_hash, expected_from_status, to_status, expected_version,
+                                 evicted_path, allow_noop_if_already_target, now_ms);
+}
 
 EvictionCycleResult EvictionCoordinator::RunOneCycle(const EvictionConfig& cfg) {
     EvictionCycleResult result;
@@ -35,7 +58,7 @@ EvictionCycleResult EvictionCoordinator::RunOneCycle(const EvictionConfig& cfg) 
             continue;
         }
 
-        EngineUpdateStatusResult to_evicting = engine_->UpdateStatus(
+        EngineUpdateStatusResult to_evicting = DoUpdateStatus(
             block_hash, kStored, kEvicting, lookup.row->version,
             /*evicted_path=*/"", /*allow_noop_if_already_target=*/false, cfg.now_ms);
         if (!to_evicting.result.success) {
@@ -46,14 +69,14 @@ EvictionCycleResult EvictionCoordinator::RunOneCycle(const EvictionConfig& cfg) 
 
         SpillOutcome spill = spill_fn_(block_hash, to_evicting.new_version);
         if (spill.ok) {
-            EngineUpdateStatusResult to_evicted = engine_->UpdateStatus(
+            EngineUpdateStatusResult to_evicted = DoUpdateStatus(
                 block_hash, kEvicting, kEvicted, to_evicting.new_version,
                 spill.evicted_path, /*allow_noop_if_already_target=*/false, cfg.now_ms);
             if (to_evicted.result.success) {
                 ++result.evicted;
             } else {
                 // Could not finalize; roll back to STORED.
-                EngineUpdateStatusResult rollback = engine_->UpdateStatus(
+                EngineUpdateStatusResult rollback = DoUpdateStatus(
                     block_hash, kEvicting, kStored, to_evicting.new_version,
                     /*evicted_path=*/"", /*allow_noop_if_already_target=*/false, cfg.now_ms);
                 if (rollback.result.success) {
@@ -63,7 +86,7 @@ EvictionCycleResult EvictionCoordinator::RunOneCycle(const EvictionConfig& cfg) 
                 }
             }
         } else {
-            EngineUpdateStatusResult rollback = engine_->UpdateStatus(
+            EngineUpdateStatusResult rollback = DoUpdateStatus(
                 block_hash, kEvicting, kStored, to_evicting.new_version,
                 /*evicted_path=*/"", /*allow_noop_if_already_target=*/false, cfg.now_ms);
             if (rollback.result.success) {

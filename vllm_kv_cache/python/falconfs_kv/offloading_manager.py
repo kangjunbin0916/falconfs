@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
 from .reference import BlockStatus, ErrorCode, ReferenceCluster
+from .router import Router
 
 
 LEASE_DURATION_MS = 5000
@@ -71,12 +72,15 @@ class FalconFSOffloadingManager:
         clusters: Optional[Dict[int, ReferenceCluster]] = None,
         cluster_factory: Optional[Callable[[int, str], ReferenceCluster]] = None,
         block_size: int = BLOCK_SIZE,
+        mode: str = "reference",
+        timeout_ms: int = 30000,
     ):
         self.shard_table = shard_table
         self.client_id = client_id
         self.client_hostname = client_hostname
         self.local_cache: Dict[str, KVBlockLocation] = {}
         self.block_size = block_size
+        self.mode = mode
         if clusters:
             self._clusters: Dict[int, ReferenceCluster] = clusters
         elif cluster_factory is not None:
@@ -87,10 +91,21 @@ class FalconFSOffloadingManager:
         elif cluster is not None:
             keys = sorted(shard_table.keys()) or [0]
             self._clusters = {dn_id: cluster for dn_id in keys}
+        elif mode == "cluster":
+            # v6 §16: BRPC client per DN. Each DN endpoint is addressed by a
+            # single `BrpcCluster` that exposes `metadata` + `store` shims so
+            # the rest of this manager stays mode-agnostic.
+            from .store_client import BrpcCluster
+            self._clusters = {
+                dn_id: BrpcCluster(endpoint, dn_id=dn_id, client_id=client_id,
+                                   timeout_ms=timeout_ms, block_size=block_size)
+                for dn_id, endpoint in sorted(shard_table.items())
+            }
         else:
             keys = sorted(shard_table.keys()) or [0]
             self._clusters = {dn_id: ReferenceCluster(block_size=block_size) for dn_id in keys}
-        # Per-block routing cache (hash -> dn_id) so subsequent calls reuse the same DN.
+        # Stable per-DN routing.
+        self._router = Router(shard_table) if shard_table else None
         self._routing: Dict[str, int] = {}
 
     def lookup(self, key: str, req_context=None) -> bool | None:
