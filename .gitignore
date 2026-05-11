@@ -12,6 +12,9 @@ tmp/
 .cache
 compile_commands.json
 build
+# Match any build output directory (build/, build_user/, build_release/, ...).
+# Trailing slash keeps build.sh out of the ignore set.
+build*/
 log/falcon.*
 stats.out
 
