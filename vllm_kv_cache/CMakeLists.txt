@@ -21,13 +21,15 @@ target_include_directories(FalconKVCommon PUBLIC
     ${FALCON_KV_INCLUDES}
 )
 
-# Propagate include path so dependents pick it up.
-set(FALCON_KV_INCLUDE_DIRS ${FALCON_KV_INCLUDES} CACHE INTERNAL "FalconKV include dirs")
-
 # ==================== Proto codegen (v6 KV contracts) ====================
 set(FALCON_KV_PROTO_DIR ${PROJECT_SOURCE_DIR}/vllm_kv_cache/proto)
 set(FALCON_KV_PROTO_GEN_DIR ${CMAKE_BINARY_DIR}/vllm_kv_cache/generated)
 file(MAKE_DIRECTORY ${FALCON_KV_PROTO_GEN_DIR})
+
+# Propagate include paths so dependents (e.g. tests/falcon_kv) pick up both the
+# source-tree headers AND the proto-generated headers (kv_common.pb.h ...).
+set(FALCON_KV_INCLUDE_DIRS ${FALCON_KV_INCLUDES} ${FALCON_KV_PROTO_GEN_DIR}
+    CACHE INTERNAL "FalconKV include dirs")
 
 set(FALCON_KV_PROTO_FILES
     ${FALCON_KV_PROTO_DIR}/kv_common.proto

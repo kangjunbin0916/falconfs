@@ -714,11 +714,63 @@ run_kv_fault_test() {
 }
 
 # ============================================================================
+# KV Metadata End-to-End Stress Test
+# ============================================================================
+# Drives the FalconFS BRPC metadata service against the running cluster with
+# varying concurrent clients and batch sizes to validate system correctness
+# (allocation uniqueness, CAS version correctness, lookup/renew/free flow,
+# concurrent dedup, and bitmap+catalog cleanup between sweeps).
+
+run_kv_meta_stress_test() {
+    log_step "Running FalconFS KV metadata end-to-end stress tests..."
+
+    local stress_bin="$PROJECT_DIR/build/tests/falcon_kv/FalconKVMetadataStressE2E"
+    if [ ! -x "$stress_bin" ]; then
+        log_step "Stress binary missing; building it now..."
+        (cd "$PROJECT_DIR/build" && ninja FalconKVMetadataStressE2E)
+    fi
+
+    local endpoints=("127.0.0.1:$DN1_POOLER_PORT" "127.0.0.1:$DN2_POOLER_PORT" "127.0.0.1:$CN_POOLER_PORT")
+    local rc=0
+    for ep in "${endpoints[@]}"; do
+        log_step "  KV stress sweep on $ep"
+        if ! "$stress_bin" --endpoint "$ep" --iterations 1 --dedup-clients 8; then
+            log_step "  KV stress sweep FAILED on $ep"
+            rc=1
+        fi
+    done
+
+    # Verify catalog cleanup on every DN: every kvblock_table row created by
+    # the sweep must have been DELETEd by the test's force-free phase. The
+    # stress test uses block hashes prefixed with "stress_" so we only count
+    # those.
+    local cleanup_rc=0
+    for port in "$DN1_PORT" "$DN2_PORT"; do
+        local rows
+        rows=$(psql -d postgres -h 127.0.0.1 -p "$port" -tAXc \
+            "SELECT count(*) FROM pg_catalog.falcon_kvblock_table WHERE block_hash LIKE 'stress_%';" 2>/dev/null \
+            || echo "ERR")
+        if [ "$rows" != "0" ]; then
+            log_step "  Catalog cleanup FAILED on DN port=$port (residual rows=$rows)"
+            cleanup_rc=1
+        else
+            log_info "  Catalog clean on DN port=$port"
+        fi
+    done
+
+    if [ $rc -ne 0 ] || [ $cleanup_rc -ne 0 ]; then
+        log_step "KV metadata stress tests FAILED"
+        return 1
+    fi
+    log_info "KV metadata stress tests passed"
+}
+
+# ============================================================================
 # Main Entry
 # ============================================================================
 
 usage() {
-    echo "Usage: $0 {build|start|stop|restart|status|test|kv-test|kv-fault-test}"
+    echo "Usage: $0 {build|start|stop|restart|status|test|kv-test|kv-fault-test|kv-meta-stress-test}"
     echo ""
     echo "Commands:"
     echo "  build   - Build and install FalconFS"
@@ -729,6 +781,7 @@ usage() {
     echo "  test    - Run distributed tests"
     echo "  kv-test - Run KV cache standalone tests (no vLLM required)"
     echo "  kv-fault-test - Run KV cache fault tests (no vLLM required)"
+    echo "  kv-meta-stress-test - Run KV metadata end-to-end stress tests against the running cluster"
     exit 1
 }
 
@@ -755,6 +808,9 @@ case "${1:-}" in
         ;;
     kv-test)
         run_kv_test
+        ;;
+    kv-meta-stress-test)
+        run_kv_meta_stress_test
         ;;
     kv-fault-test)
         run_kv_fault_test

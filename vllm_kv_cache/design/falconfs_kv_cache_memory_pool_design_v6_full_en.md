@@ -366,6 +366,40 @@ Lifecycle of one KV metadata request (matches implementation):
 10. **Write-style handlers** (`BatchAllocateWithLease`, `BatchUpdateBlockStatus`, `BatchFreeAllocated`) always need the catalog tier per item. They still build a single sub-batch of all items, run the cache pre-step per item (bitmap reservation in `AllocatePass1ReserveBitmap`, slot lookup in shard index), dispatch one libpq query, and then commit/rollback the cache mutation per item depending on the catalog answer (see §7.4–§7.6).
 11. `KVCacheWorkerTask::DoWork` writes the serialized response back into the job (`SetSerializedResponse`) and calls `job->Done()`. `BrpcKVCacheServiceJob::Done` parses the bytes into the BRPC response message and runs the BRPC closure, releasing the connection back to the pool.
 
+Architecture (process layout, matches v6.4 + inherits FalconFS metadata pattern):
+
+```mermaid
+flowchart TB
+    subgraph bgworker [bgworker process - one per DN]
+        subgraph plugin [libbrpcplugin.so &lpar;dlopened&rpar;]
+            BRPC["BRPC worker bthread<br/>BrpcKVMetadataServiceImpl::Batch*<br/>builds BrpcKVCacheServiceJob<br/><i>does NOT touch cache</i>"]
+            ENG["KVMetadataServiceImpl + KVMetadataEngine<br/>in-process DRAM cache<br/>&lpar;KVRegion bitmap+meta + ShardHashIndex&rpar;<br/>engine in REMOTE_LIBPQ tier"]
+            REG["FalconKVProcessJobImpl<br/>installed via FalconKVSetProcessJob<br/>at FalconBrpcServer::Run start"]
+        end
+        subgraph falconso [falcon.so &lpar;PG extension&rpar;]
+            DISP["FalconDispatchMetaJob2PGConnectionPool<br/>IsKVCacheServiceJob? branch"]
+            QUEUE[("PGConnectionPool::kvTaskList")]
+            BPM["BackgroundPoolManager<br/>KVDequeueExec"]
+            POOL["PGConnection x N<br/>each: own libpq conn + own worker thread<br/>KVCacheWorkerTask::DoWork(PGconn,...)"]
+        end
+
+        BRPC -->|"dispatchFunc(job)"| DISP
+        DISP -->|EnqueueKVCacheJob| QUEUE
+        QUEUE --> BPM
+        BPM -->|"conn->Exec(KVCacheWorkerTask)"| POOL
+        POOL -->|"FalconKVGetProcessJob<br/>fn(method, req_buf, conn)"| REG
+        REG -->|"engine->Batch*SplitForPoolWorker(req, resp, callback)"| ENG
+        ENG -.->|"all cache hits<br/>no catalog call"| REG
+    end
+
+    PGB["PG backend<br/>(one per PGConnection worker;<br/> many in parallel)"]
+
+    REG -->|"PQexecParams<br/>$1=method, $2=bytea payload<br/>ONE libpq round-trip per sub-batch"| PGB
+    PGB -->|"falcon_kv_metadata_catalog_call<br/>BeginInternalSubTransaction +<br/>FalconKVBlockBatch* (PG internal APIs)"| PGB
+    PGB -->|"bytea response<br/>(POD KVCatalog*Result array)"| REG
+    REG -->|done->Run with parsed response| BRPC
+```
+
 Per-thread sequence (v6.4):
 
 ```mermaid
@@ -733,6 +767,24 @@ For reviewers, the v6.4 KV cache code is split between `falcon.so` (PG extension
 | Catalog accessor | `falcon/metadb/kvblock_table.{c,h}` (`FalconKVBlockBatch*`) | falcon.so |
 | Schema DDL helper | `falcon/distributed_backend/distributed_backend_falcon.c` (`FalconCreateKvblockTable`) | falcon.so |
 | SQL declarations | `falcon/falcon--1.0.sql` | falcon.so |
+
+Concrete v6.4 mapping — every numbered step in §4.1.1's lifecycle to the exact code that implements it:
+
+| §4.1.1 step | What runs | Implementation symbol | File |
+|---|---|---|---|
+| 1. BRPC worker builds job (no cache touch) | parses BRPC request, packs `(method, serialized_request)` into `BrpcKVCacheServiceJob`, calls `dispatchFunc(job)` | `BrpcKVMetadataServiceImpl::Batch*`, `BrpcKVCacheServiceJob` | `falcon/brpc_comm_adapter/brpc_kv_service_imp.cpp`, `falcon/include/brpc_comm_adapter/brpc_kv_cache_service_job.h` |
+| 2. dispatcher routes KV jobs onto kvTaskList | `IsKVCacheServiceJob()` virtual, branches into KV path | `FalconDispatchMetaJob2PGConnectionPool`, `BaseMetaServiceJob::IsKVCacheServiceJob`, `BaseKVCacheServiceJob` | `falcon/connection_pool/pg_connection_pool.cpp`, `falcon/include/base_comm_adapter/base_meta_service_job.h`, `falcon/include/base_comm_adapter/base_kv_cache_service_job.h` |
+| 3. pool manager picks each KV job, hands to a distinct PGConnection | `kvTaskList`, `BackgroundPoolManager` loop drains it, `KVDequeueExec` builds `KVCacheWorkerTask` | `PGConnectionPool::kvTaskList`, `KVDequeueExec`, `EnqueueKVCacheJob` | `falcon/connection_pool/pg_connection_pool.cpp` |
+| 4. pool worker invokes engine entry point | `FalconKVGetProcessJob` returns the registered impl; pool worker passes its own `PGconn` | `KVCacheWorkerTask::DoWork`, `FalconKVProcessJobFn`, `FalconKVSetProcessJob`/`FalconKVGetProcessJob` | `falcon/connection_pool/falcon_worker_task.cpp`, `falcon/include/connection_pool/falcon_kv_runtime_bridge.h`, `falcon/connection_pool/falcon_kv_runtime_bridge.c` |
+| 5. plugin-side engine impl runs | parses protobuf request, calls `Batch*SplitForPoolWorker` on shared engine | `FalconKVProcessJobImpl`, `KVRuntimeRegister::Install` | `falcon/brpc_comm_adapter/kv_runtime_register.cpp` |
+| 6. per-item DRAM walk + miss collection | per-shard hash + per-region meta array; cache hits resolved in place | `KVMetadataServiceImpl::Batch*SplitForPoolWorker`, `KVMetadataEngine::LookupDramCacheOnly`, `AllocatePass1ReserveBitmap`, `RenewLeasePass1`, `UpdateStatusPass1OrCatalog`, `FreeAllocatedPass1OrCatalog` | `vllm_kv_cache/src/metadata/kv_metadata_service_impl.cpp`, `vllm_kv_cache/src/metadata/kv_metadata_engine.cpp` |
+| 7. ONE libpq round-trip per sub-batch | packs items into `kv_catalog_wire.h` POD format, `PQexecParams` binary `bytea` to the SQL function | `CatalogLookup`/`CatalogInsertAllocated`/`CatalogCASStatusUpdate`/`CatalogDelete` (closures inside `FalconKVProcessJobImpl`) | `falcon/brpc_comm_adapter/kv_runtime_register.cpp`, `falcon/include/connection_pool/kv_catalog_wire.h` |
+| 8. PG backend dispatch through C API | reads `(method int, payload bytea)`, opens `BeginInternalSubTransaction`, dispatches by method | `falcon_kv_metadata_catalog_call` | `falcon/connection_pool/kv_backend_rpc.c` |
+| 9. catalog ops via PG internal APIs (no raw SQL) | `table_open` + `systable_beginscan` (`F_BYTEAEQ`) + `heap_modify_tuple` + `CatalogTupleUpdateWithInfo` + `CatalogTupleInsertWithInfo` + `simple_heap_delete` | `FalconKVBlockBatchLookup`, `FalconKVBlockBatchInsertAllocated`, `FalconKVBlockBatchCASStatusUpdate`, `FalconKVBlockBatchDelete` | `falcon/metadb/kvblock_table.c`, `falcon/include/metadb/kvblock_table.h` |
+| 10. cache mirror commit on catalog success | publish slot in shard hash index for allocate; mirror status/version for update; DropSlot on free/finalize-evict | `KVMetadataEngine::CommitAllocatePass1AfterCatalogInsert`, `RollbackAllocatePass1Reservation`, `ApplyUpdateStatusAfterCatalogSuccess`, `ApplyFreeAfterCatalogDeleteSuccess` | `vllm_kv_cache/src/metadata/kv_metadata_engine.cpp` |
+| 11. `done->Run()` from worker | parses response bytes back into BRPC response message, runs BRPC closure, returns `PGConnection` to the pool | `BrpcKVCacheServiceJob::Done` | `falcon/include/brpc_comm_adapter/brpc_kv_cache_service_job.h` |
+| Schema bootstrap (one-shot, idempotent) | `pg_catalog.falcon_create_kvblock_table()` SQL function; `ConstructCreateKvblockTableCommand` builds v6.4 §3.1 schema | `falcon_create_kvblock_table` (Datum), `FalconCreateKvblockTable`, `ConstructCreateKvblockTableCommand` | `falcon/distributed_backend/distributed_backend_falcon.c`, `falcon/metadb/kvblock_table.c`, `falcon/falcon--1.0.sql` |
+| KV `falcon_kv*` GUCs | port, pool size, batch size, lease TTL, store inflight, etc. | `FalconKVPoolPort`, `FalconKVPoolSize`, `FalconKVPoolBatchSize`, `FalconKVLeaseDefaultTtlMs`, `FalconKVStoreMaxInflight`, ... | `falcon/include/connection_pool/connection_pool_config.h`, `falcon/connection_pool/falcon_connection_pool.c` |
 
 ---
 

@@ -23,12 +23,12 @@ TEST(KVMetadataEngine, AllocateLookupAndRenewLeaseFlow) {
         "b1",
         static_cast<int32_t>(BlockStatus::BLOCK_STATUS_ALLOCATED),
         static_cast<int32_t>(BlockStatus::BLOCK_STATUS_STORED),
-        /*expected_version=*/0,
+        /*expected_version=*/1,
         "",
         false,
         1010);
     ASSERT_TRUE(to_stored.result.success);
-    EXPECT_EQ(to_stored.new_version, 1);
+    EXPECT_EQ(to_stored.new_version, 2);
 
     EngineLookupResult lookup = engine.Lookup("b1", true, 1020);
     ASSERT_TRUE(lookup.result.success);
@@ -57,7 +57,7 @@ TEST(KVMetadataEngine, CasConflictAndEvictedRequiresPath) {
         "b2",
         static_cast<int32_t>(BlockStatus::BLOCK_STATUS_STORED),
         static_cast<int32_t>(BlockStatus::BLOCK_STATUS_EVICTING),
-        /*expected_version=*/0,
+        /*expected_version=*/1,
         "",
         false,
         1010);
@@ -67,7 +67,7 @@ TEST(KVMetadataEngine, CasConflictAndEvictedRequiresPath) {
     ASSERT_TRUE(engine.UpdateStatus("b2",
                                     static_cast<int32_t>(BlockStatus::BLOCK_STATUS_ALLOCATED),
                                     static_cast<int32_t>(BlockStatus::BLOCK_STATUS_STORED),
-                                    /*expected_version=*/0,
+                                    /*expected_version=*/1,
                                     "",
                                     false,
                                     1020)
@@ -76,7 +76,7 @@ TEST(KVMetadataEngine, CasConflictAndEvictedRequiresPath) {
     ASSERT_TRUE(engine.UpdateStatus("b2",
                                     static_cast<int32_t>(BlockStatus::BLOCK_STATUS_STORED),
                                     static_cast<int32_t>(BlockStatus::BLOCK_STATUS_EVICTING),
-                                    /*expected_version=*/1,
+                                    /*expected_version=*/2,
                                     "",
                                     false,
                                     1030)
@@ -86,7 +86,7 @@ TEST(KVMetadataEngine, CasConflictAndEvictedRequiresPath) {
         "b2",
         static_cast<int32_t>(BlockStatus::BLOCK_STATUS_EVICTING),
         static_cast<int32_t>(BlockStatus::BLOCK_STATUS_EVICTED),
-        /*expected_version=*/2,
+        /*expected_version=*/3,
         "",
         false,
         1040);
@@ -201,19 +201,19 @@ TEST(KVMetadataEngine, FreeAllocatedEnforcesStatusUnlessForced) {
     ASSERT_TRUE(engine.UpdateStatus("b3",
                                     static_cast<int32_t>(BlockStatus::BLOCK_STATUS_ALLOCATED),
                                     static_cast<int32_t>(BlockStatus::BLOCK_STATUS_STORED),
-                                    /*expected_version=*/0,
+                                    /*expected_version=*/1,
                                     "",
                                     false,
                                     1010)
                     .result.success);
 
-    EngineFreeAllocatedResult no_force = engine.FreeAllocated("b3", 1, false, 1020);
+    EngineFreeAllocatedResult no_force = engine.FreeAllocated("b3", 2, false, 1020);
     EXPECT_FALSE(no_force.result.success);
     EXPECT_EQ(no_force.result.error_code, static_cast<int32_t>(ErrorCode::INVALID_ARGUMENT));
 
-    EngineFreeAllocatedResult forced = engine.FreeAllocated("b3", 1, true, 1030);
+    EngineFreeAllocatedResult forced = engine.FreeAllocated("b3", 2, true, 1030);
     EXPECT_TRUE(forced.result.success);
-    EXPECT_EQ(forced.new_version, 2);
+    EXPECT_EQ(forced.new_version, 3);
 
     EngineLookupResult after_free = engine.Lookup("b3", false, 1040);
     EXPECT_FALSE(after_free.result.success);
@@ -250,9 +250,9 @@ TEST(KVMetadataEngine, SharedCatalogWorksWithoutDramMetaShmemOps) {
         "v64-block",
         static_cast<int32_t>(BlockStatus::BLOCK_STATUS_ALLOCATED),
         static_cast<int32_t>(BlockStatus::BLOCK_STATUS_STORED),
-        /*expected_version=*/0, "", false, 1010);
+        /*expected_version=*/1, "", false, 1010);
     EXPECT_TRUE(upd.result.success);
-    EXPECT_EQ(upd.new_version, 1);
+    EXPECT_EQ(upd.new_version, 2);
 
     // Lookup now succeeds (STORED in cache, no catalog needed).
     EngineLookupResult lookup_stored = engine.Lookup("v64-block", true, 1020);
@@ -263,9 +263,9 @@ TEST(KVMetadataEngine, SharedCatalogWorksWithoutDramMetaShmemOps) {
     EXPECT_TRUE(lookup_stored.cacheable);
 
     // FreeAllocated (force) works through in-process slot + catalog delete stub.
-    EngineFreeAllocatedResult freed = engine.FreeAllocated("v64-block", 1, true, 1030);
+    EngineFreeAllocatedResult freed = engine.FreeAllocated("v64-block", 2, true, 1030);
     EXPECT_TRUE(freed.result.success);
-    EXPECT_EQ(freed.new_version, 2);
+    EXPECT_EQ(freed.new_version, 3);
 
     // After free: block is gone from hash index; catalog stub returns nullopt.
     EngineLookupResult after_free = engine.Lookup("v64-block", false, 1040);
@@ -321,7 +321,7 @@ TEST(KVMetadataEngine, LookupEvictedCatalogHitAfterDropSlot) {
     ASSERT_TRUE(engine.UpdateStatus("ev",
                                     static_cast<int32_t>(BlockStatus::BLOCK_STATUS_ALLOCATED),
                                     static_cast<int32_t>(BlockStatus::BLOCK_STATUS_STORED),
-                                    /*expected_version=*/0,
+                                    /*expected_version=*/1,
                                     "",
                                     false,
                                     1010)
@@ -329,7 +329,7 @@ TEST(KVMetadataEngine, LookupEvictedCatalogHitAfterDropSlot) {
     ASSERT_TRUE(engine.UpdateStatus("ev",
                                     static_cast<int32_t>(BlockStatus::BLOCK_STATUS_STORED),
                                     static_cast<int32_t>(BlockStatus::BLOCK_STATUS_EVICTING),
-                                    /*expected_version=*/1,
+                                    /*expected_version=*/2,
                                     "",
                                     false,
                                     1020)
@@ -337,7 +337,7 @@ TEST(KVMetadataEngine, LookupEvictedCatalogHitAfterDropSlot) {
     ASSERT_TRUE(engine.UpdateStatus("ev",
                                     static_cast<int32_t>(BlockStatus::BLOCK_STATUS_EVICTING),
                                     static_cast<int32_t>(BlockStatus::BLOCK_STATUS_EVICTED),
-                                    /*expected_version=*/2,
+                                    /*expected_version=*/3,
                                     "/ssd/evicted/ev",
                                     false,
                                     1030)

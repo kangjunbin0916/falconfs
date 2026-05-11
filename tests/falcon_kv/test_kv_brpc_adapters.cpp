@@ -57,7 +57,7 @@ TEST(KVMetadataBrpcServiceAdapter, AllocateThenLookupSucceedsThroughServiceAbi) 
     su->set_block_hash("brpc-k1");
     su->set_expected_from_status(BlockStatus::BLOCK_STATUS_ALLOCATED);
     su->set_to_status(BlockStatus::BLOCK_STATUS_STORED);
-    su->set_expected_version(0);
+    su->set_expected_version(1);
     BatchUpdateStatusResponse stored_rsp;
     FlagClosure stored_done;
     adapter.BatchUpdateBlockStatus(nullptr, &stored_req, &stored_rsp, &stored_done);

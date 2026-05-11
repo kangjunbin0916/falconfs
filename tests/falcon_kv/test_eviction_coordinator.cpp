@@ -21,7 +21,7 @@ void PreloadStored(KVMetadataEngine& engine, const std::string& block_hash, int6
     EngineAllocateResult alloc = engine.Allocate(block_hash, /*block_size=*/65536, now_ms);
     ASSERT_TRUE(alloc.result.success);
     EngineUpdateStatusResult to_stored = engine.UpdateStatus(
-        block_hash, kAllocated, kStored, /*expected_version=*/0,
+        block_hash, kAllocated, kStored, /*expected_version=*/1,
         /*evicted_path=*/"", /*allow_noop_if_already_target=*/false, now_ms);
     ASSERT_TRUE(to_stored.result.success);
 }

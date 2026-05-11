@@ -31,7 +31,7 @@ bool InMemoryKVMetaTableAccessor::InsertAllocated(int32_t shard_id,
     row.status = 1;  // ALLOCATED
     row.store_node_id = spec.store_node_id;
     row.pool_offset = spec.pool_offset;
-    row.version = 0;
+    row.version = 1;  // v6.4 §3.1 / §7.4 step 5: new-allocate row.version = 1
     row.updated_at_ms = now_ms;
     shard.emplace(block_hash, std::move(row));
     return true;

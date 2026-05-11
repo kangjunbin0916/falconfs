@@ -25,13 +25,13 @@ TEST(KVMetadataRecovery, RestoresRowsAndReconcilesEvicting) {
     spec.pool_offset = 131072;
     ASSERT_TRUE(acc.InsertAllocated(/*shard=*/1, "c", spec, /*now_ms=*/10));
 
-    ASSERT_TRUE(acc.CASStatusUpdate(1, "b", kAllocated, kStored, 0, "", 20).success);
-    ASSERT_TRUE(acc.CASStatusUpdate(1, "c", kAllocated, kEvicting, 0, "", 20).success);
+    ASSERT_TRUE(acc.CASStatusUpdate(1, "b", kAllocated, kStored, 1, "", 20).success);
+    ASSERT_TRUE(acc.CASStatusUpdate(1, "c", kAllocated, kEvicting, 1, "", 20).success);
 
     // Seed an evicted row too.
     spec.pool_offset = 196608;
     ASSERT_TRUE(acc.InsertAllocated(/*shard=*/1, "d", spec, /*now_ms=*/10));
-    ASSERT_TRUE(acc.CASStatusUpdate(1, "d", kAllocated, kEvicted, 0, "/tmp/evicted/d", 20).success);
+    ASSERT_TRUE(acc.CASStatusUpdate(1, "d", kAllocated, kEvicted, 1, "/tmp/evicted/d", 20).success);
 
     KVMetadataEngine engine(/*store_node_id=*/1,
                             /*dn_id=*/1,

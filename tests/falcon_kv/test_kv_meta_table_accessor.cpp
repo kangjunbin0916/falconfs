@@ -25,27 +25,27 @@ TEST(InMemoryKVMetaTableAccessor, InsertLookupCASUpdateAndDelete) {
     AccessorRow row;
     ASSERT_TRUE(acc.Lookup(1, "k1", &row));
     EXPECT_EQ(row.status, kAllocated);
-    EXPECT_EQ(row.version, 0);
+    EXPECT_EQ(row.version, 1);
     EXPECT_EQ(row.store_node_id, 4);
 
     AccessorCASResult cas =
-        acc.CASStatusUpdate(1, "k1", kAllocated, kStored, /*expected_version=*/0,
+        acc.CASStatusUpdate(1, "k1", kAllocated, kStored, /*expected_version=*/1,
                             /*evicted_path=*/"", /*now_ms=*/120);
     EXPECT_TRUE(cas.success);
-    EXPECT_EQ(cas.current_version, 1);
+    EXPECT_EQ(cas.current_version, 2);
     EXPECT_EQ(cas.current_status, kStored);
 
     AccessorCASResult conflict =
-        acc.CASStatusUpdate(1, "k1", kAllocated, kStored, /*expected_version=*/0,
+        acc.CASStatusUpdate(1, "k1", kAllocated, kStored, /*expected_version=*/1,
                             /*evicted_path=*/"", /*now_ms=*/130);
     EXPECT_FALSE(conflict.success);
     EXPECT_TRUE(conflict.conflict);
     EXPECT_TRUE(conflict.retryable);
 
     bool del_conflict = false;
-    EXPECT_FALSE(acc.Delete(1, "k1", /*expected_version=*/0, &del_conflict));
+    EXPECT_FALSE(acc.Delete(1, "k1", /*expected_version=*/1, &del_conflict));
     EXPECT_TRUE(del_conflict);
-    EXPECT_TRUE(acc.Delete(1, "k1", /*expected_version=*/1, &del_conflict));
+    EXPECT_TRUE(acc.Delete(1, "k1", /*expected_version=*/2, &del_conflict));
     EXPECT_FALSE(acc.Lookup(1, "k1", &row));
 }
 
@@ -54,7 +54,7 @@ TEST(InMemoryKVMetaTableAccessor, ScanForRecoveryFiltersByStatus) {
     AccessorInsertSpec spec;
     ASSERT_TRUE(acc.InsertAllocated(2, "a", spec, 100));
     ASSERT_TRUE(acc.InsertAllocated(2, "b", spec, 100));
-    ASSERT_TRUE(acc.CASStatusUpdate(2, "a", kAllocated, kStored, 0, "", 110).success);
+    ASSERT_TRUE(acc.CASStatusUpdate(2, "a", kAllocated, kStored, 1, "", 110).success);
 
     std::vector<std::string> stored_hashes;
     acc.ScanForRecovery(2, /*wanted=*/{kStored},

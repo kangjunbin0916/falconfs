@@ -581,12 +581,16 @@ public:
             }
 
             // ── Commit cache: initialise meta slot and publish to hash index ──
+            // v6.4 §3.1 / §7.4: newly allocated rows start at version=1 on both
+            // tiers. The DRAM mirror MUST match the catalog INSERT version so
+            // the immediate CAS UpdateStatus(ALLOCATED→STORED) reads the same
+            // expected_version on either tier.
             DramMetaSlot& slot = re->meta[slot_idx];
             slot.state         = static_cast<uint8_t>(BlockStatus::ALLOCATED);
             slot.ref_bit       = 1;
             slot.shard_id      = static_cast<uint16_t>(shard_id_);
             slot.store_node_id = re->store_node_id;
-            slot.version       = 0;
+            slot.version       = 1;
             slot.store_epoch   = re->store_epoch;
             slot.block_hash    = block_hash;
             // Grant initial lease.
@@ -640,7 +644,7 @@ public:
             EngineBlockMeta meta;
             meta.status   = static_cast<int32_t>(BlockStatus::ALLOCATED);
             meta.location = ToEngineLocation(loc);
-            meta.version  = 0;
+            meta.version  = 1;
             LeaseInfo li;
             li.lease_token    = slot.lease_token;
             li.lease_expire_ms = slot.lease_expire_ms;
@@ -777,7 +781,9 @@ public:
         slot.ref_bit       = 1;
         slot.shard_id      = static_cast<uint16_t>(shard_id_);
         slot.store_node_id = re.store_node_id;
-        slot.version       = 0;
+        // v6.4 §3.1 / §7.4: catalog INSERT writes version=1, DRAM mirror MUST
+        // match so the immediate ALLOCATED→STORED CAS succeeds on either tier.
+        slot.version       = 1;
         slot.store_epoch   = re.store_epoch;
         slot.block_hash    = block_hash;
         slot.lease_token   = NewLeaseToken();
@@ -826,7 +832,7 @@ public:
         EngineBlockMeta meta;
         meta.status   = static_cast<int32_t>(BlockStatus::ALLOCATED);
         meta.location = ToEngineLocation(loc);
-        meta.version  = 0;
+        meta.version  = 1;
         LeaseInfo li;
         li.lease_token     = slot.lease_token;
         li.lease_expire_ms = slot.lease_expire_ms;

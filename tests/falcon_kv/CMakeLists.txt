@@ -70,3 +70,24 @@ target_link_libraries(FalconKVMetaEngineConcurrencyE2E
     ${DYNAMIC_LIB}
     pthread
 )
+
+# ==================== FalconKVMetadataStressE2E =================
+# End-to-end KV metadata stress test that sweeps a (threads, batch_size, waves)
+# matrix to exercise BatchAllocate / BatchUpdate / BatchLookup / BatchRenew /
+# BatchFreeAllocated under varying concurrent BRPC clients, validates
+# correctness on every surface, and verifies that the engine bitmap and the
+# persistent catalog return to a clean state between sweeps.
+add_executable(FalconKVMetadataStressE2E
+    ${PROJECT_SOURCE_DIR}/tests/falcon_kv/kv_metadata_stress_e2e.cpp
+)
+
+target_include_directories(FalconKVMetadataStressE2E PRIVATE
+    ${FALCON_KV_INCLUDE_DIRS}
+)
+
+target_link_libraries(FalconKVMetadataStressE2E
+    FalconKVProto
+    ${BRPC_LIBRARIES}
+    ${DYNAMIC_LIB}
+    pthread
+)

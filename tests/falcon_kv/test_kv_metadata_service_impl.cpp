@@ -23,7 +23,7 @@ TEST(KVMetadataServiceImpl, LookupStubReturnsPerItemInternalError) {
     s->set_block_hash("k1");
     s->set_expected_from_status(BlockStatus::BLOCK_STATUS_ALLOCATED);
     s->set_to_status(BlockStatus::BLOCK_STATUS_STORED);
-    s->set_expected_version(0);
+    s->set_expected_version(1);
     BatchUpdateStatusResponse stored_rsp;
     svc.BatchUpdateBlockStatus(stored_req, &stored_rsp);
     ASSERT_EQ(stored_rsp.results_size(), 1);
@@ -42,7 +42,7 @@ TEST(KVMetadataServiceImpl, LookupStubReturnsPerItemInternalError) {
     EXPECT_TRUE(result.result().success());
     EXPECT_EQ(result.status(), BlockStatus::BLOCK_STATUS_STORED);
     EXPECT_EQ(result.location().store_node_id(), 1);
-    EXPECT_EQ(result.version(), 1);
+    EXPECT_EQ(result.version(), 2);
     EXPECT_TRUE(result.cacheable());
     EXPECT_GT(result.lease().lease_token(), 0);
     EXPECT_GT(lookup_rsp.server_time_ms(), 0);
@@ -136,17 +136,17 @@ TEST(KVMetadataServiceImpl, UpdateAndFreeStubsPreserveExpectedVersionEcho) {
     u->set_block_hash("k-update");
     u->set_expected_from_status(BlockStatus::BLOCK_STATUS_ALLOCATED);
     u->set_to_status(BlockStatus::BLOCK_STATUS_STORED);
-    u->set_expected_version(0);
+    u->set_expected_version(1);
     BatchUpdateStatusResponse update_rsp;
     svc.BatchUpdateBlockStatus(update_req, &update_rsp);
     ASSERT_EQ(update_rsp.results_size(), 1);
     EXPECT_TRUE(update_rsp.results(0).result().success());
-    EXPECT_EQ(update_rsp.results(0).new_version(), 1);
+    EXPECT_EQ(update_rsp.results(0).new_version(), 2);
 
     BatchFreeAllocatedRequest free_req;
     auto* f = free_req.add_items();
     f->set_block_hash("k-update");
-    f->set_expected_version(1);
+    f->set_expected_version(2);
     BatchFreeAllocatedResponse free_rsp;
     svc.BatchFreeAllocated(free_req, &free_rsp);
     ASSERT_EQ(free_rsp.results_size(), 1);
@@ -158,7 +158,7 @@ TEST(KVMetadataServiceImpl, UpdateAndFreeStubsPreserveExpectedVersionEcho) {
     svc.BatchFreeAllocated(free_req, &forced_free_rsp);
     ASSERT_EQ(forced_free_rsp.results_size(), 1);
     EXPECT_TRUE(forced_free_rsp.results(0).result().success());
-    EXPECT_EQ(forced_free_rsp.results(0).new_version(), 2);
+    EXPECT_EQ(forced_free_rsp.results(0).new_version(), 3);
 }
 
 TEST(KVMetadataServiceImpl, MutationsKeyedByBlockHashNotRequestIdReplay) {
@@ -179,11 +179,11 @@ TEST(KVMetadataServiceImpl, MutationsKeyedByBlockHashNotRequestIdReplay) {
     u1->set_block_hash("k-idem-update");
     u1->set_expected_from_status(BlockStatus::BLOCK_STATUS_ALLOCATED);
     u1->set_to_status(BlockStatus::BLOCK_STATUS_STORED);
-    u1->set_expected_version(0);
+    u1->set_expected_version(1);
     BatchUpdateStatusResponse update_rsp1;
     svc.BatchUpdateBlockStatus(update_req1, &update_rsp1);
     ASSERT_TRUE(update_rsp1.results(0).result().success());
-    EXPECT_EQ(update_rsp1.results(0).new_version(), 1);
+    EXPECT_EQ(update_rsp1.results(0).new_version(), 2);
 
     BatchUpdateStatusRequest update_req2;
     update_req2.mutable_meta()->set_request_id("req-idem-update");
@@ -192,24 +192,24 @@ TEST(KVMetadataServiceImpl, MutationsKeyedByBlockHashNotRequestIdReplay) {
     u2->set_block_hash("k-idem-update");
     u2->set_expected_from_status(BlockStatus::BLOCK_STATUS_STORED);
     u2->set_to_status(BlockStatus::BLOCK_STATUS_EVICTING);
-    u2->set_expected_version(1);
+    u2->set_expected_version(2);
     BatchUpdateStatusResponse update_rsp2;
     svc.BatchUpdateBlockStatus(update_req2, &update_rsp2);
     ASSERT_EQ(update_rsp2.results_size(), 1);
     EXPECT_TRUE(update_rsp2.results(0).result().success());
-    EXPECT_EQ(update_rsp2.results(0).new_version(), 2);
+    EXPECT_EQ(update_rsp2.results(0).new_version(), 3);
 
     BatchFreeAllocatedRequest free_req1;
     free_req1.mutable_meta()->set_request_id("req-idem-free");
     free_req1.mutable_meta()->set_client_id(77);
     auto* f1 = free_req1.add_items();
     f1->set_block_hash("k-idem-update");
-    f1->set_expected_version(2);
+    f1->set_expected_version(3);
     f1->set_force(true);
     BatchFreeAllocatedResponse free_rsp1;
     svc.BatchFreeAllocated(free_req1, &free_rsp1);
     ASSERT_TRUE(free_rsp1.results(0).result().success());
-    EXPECT_EQ(free_rsp1.results(0).new_version(), 3);
+    EXPECT_EQ(free_rsp1.results(0).new_version(), 4);
 
     BatchFreeAllocatedRequest free_req2;
     free_req2.mutable_meta()->set_request_id("req-idem-free");
@@ -429,7 +429,7 @@ TEST(KVMetadataServiceImpl, SplitForPoolWorker_AllMethods) {
         it->set_block_hash("sw-all-block");
         it->set_expected_from_status(BlockStatus::BLOCK_STATUS_ALLOCATED);
         it->set_to_status(BlockStatus::BLOCK_STATUS_STORED);
-        it->set_expected_version(0);
+        it->set_expected_version(1);
         BatchUpdateStatusResponse rsp;
         svc.BatchUpdateBlockStatusSplitForPoolWorker(req, &rsp, run_catalog_sub_batch);
         ASSERT_EQ(rsp.results_size(), 1);
