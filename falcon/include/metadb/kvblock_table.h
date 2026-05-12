@@ -59,6 +59,8 @@ void FalconKVBlockBatchCASStatusUpdate(const char *req_buf, uint64_t req_size,
                                        char *resp_buf, uint64_t resp_size);
 void FalconKVBlockBatchDelete(const char *req_buf, uint64_t req_size,
                               char *resp_buf, uint64_t resp_size);
+void FalconKVBlockBatchPromoteFromEvicted(const char *req_buf, uint64_t req_size,
+                                          char *resp_buf, uint64_t resp_size);
 
 /* v6 \u00a715.1 recovery scan: streams every row in `falcon_kvblock_table` into
  * `out_rows` (caller-allocated, capacity `out_rows_capacity`). Returns the

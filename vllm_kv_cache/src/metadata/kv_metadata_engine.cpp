@@ -222,13 +222,15 @@ public:
           next_lease_token_(1),
           lease_manager_(dn_epoch) {
         shmem_ops_ = GetKVShmemRuntimeOps();
-        EngineStoreRegion r;
-        r.store_node_id = store_node_id;
-        r.base_offset   = 0;
-        r.region_bytes  = region_bytes;
-        r.block_size    = block_size;
-        r.store_epoch   = store_epoch;
-        RegisterStoreRegionInternal(r);
+        if (region_bytes > 0 && block_size > 0) {
+            EngineStoreRegion r;
+            r.store_node_id = store_node_id;
+            r.base_offset   = 0;
+            r.region_bytes  = region_bytes;
+            r.block_size    = block_size;
+            r.store_epoch   = store_epoch;
+            RegisterStoreRegionInternal(r);
+        }
     }
 
     int32_t DnId()      const { return dn_id_; }

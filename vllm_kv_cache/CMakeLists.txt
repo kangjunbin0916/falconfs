@@ -7,6 +7,7 @@
 
 set(FALCON_KV_INCLUDES
     ${PROJECT_SOURCE_DIR}
+    ${PROJECT_SOURCE_DIR}/falcon/include
 )
 
 set(FALCON_KV_SOURCES
@@ -35,17 +36,20 @@ set(FALCON_KV_PROTO_FILES
     ${FALCON_KV_PROTO_DIR}/kv_common.proto
     ${FALCON_KV_PROTO_DIR}/kv_metadata_service.proto
     ${FALCON_KV_PROTO_DIR}/kv_data_service.proto
+    ${FALCON_KV_PROTO_DIR}/kv_store_admin_service.proto
 )
 
 set(FALCON_KV_PROTO_SRCS
     ${FALCON_KV_PROTO_GEN_DIR}/kv_common.pb.cc
     ${FALCON_KV_PROTO_GEN_DIR}/kv_metadata_service.pb.cc
     ${FALCON_KV_PROTO_GEN_DIR}/kv_data_service.pb.cc
+    ${FALCON_KV_PROTO_GEN_DIR}/kv_store_admin_service.pb.cc
 )
 set(FALCON_KV_PROTO_HDRS
     ${FALCON_KV_PROTO_GEN_DIR}/kv_common.pb.h
     ${FALCON_KV_PROTO_GEN_DIR}/kv_metadata_service.pb.h
     ${FALCON_KV_PROTO_GEN_DIR}/kv_data_service.pb.h
+    ${FALCON_KV_PROTO_GEN_DIR}/kv_store_admin_service.pb.h
 )
 
 add_custom_command(
@@ -65,6 +69,23 @@ target_include_directories(FalconKVProto PUBLIC
     ${FALCON_KV_INCLUDES}
 )
 target_link_libraries(FalconKVProto PUBLIC ${Protobuf_LIBRARIES})
+
+execute_process(
+    COMMAND pg_config --libdir
+    OUTPUT_VARIABLE FALCON_KV_PG_LIBDIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(NOT FALCON_KV_PG_LIBDIR)
+    set(FALCON_KV_PG_LIBDIR "")
+endif()
+execute_process(
+    COMMAND pg_config --includedir
+    OUTPUT_VARIABLE FALCON_KV_PG_INCLUDEDIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(NOT FALCON_KV_PG_INCLUDEDIR)
+    set(FALCON_KV_PG_INCLUDEDIR "")
+endif()
 
 # ==================== Metadata service skeleton ====================
 add_library(FalconKVMetadataService STATIC
@@ -110,15 +131,24 @@ target_link_libraries(FalconKVDataService
 add_library(FalconKVBrpcServiceAdapters STATIC
     ${PROJECT_SOURCE_DIR}/vllm_kv_cache/src/service/kv_metadata_brpc_service.cpp
     ${PROJECT_SOURCE_DIR}/vllm_kv_cache/src/service/kv_data_brpc_service.cpp
+    ${PROJECT_SOURCE_DIR}/vllm_kv_cache/src/service/kv_store_admin_brpc_service.cpp
+    ${PROJECT_SOURCE_DIR}/vllm_kv_cache/src/store/kv_store_facade.cpp
 )
 target_include_directories(FalconKVBrpcServiceAdapters PUBLIC
     ${FALCON_KV_INCLUDES}
     ${FALCON_KV_PROTO_GEN_DIR}
 )
+if(FALCON_KV_PG_INCLUDEDIR)
+    target_include_directories(FalconKVBrpcServiceAdapters PRIVATE "${FALCON_KV_PG_INCLUDEDIR}")
+endif()
+if(FALCON_KV_PG_LIBDIR)
+    target_link_directories(FalconKVBrpcServiceAdapters PRIVATE "${FALCON_KV_PG_LIBDIR}")
+endif()
 target_link_libraries(FalconKVBrpcServiceAdapters
     PUBLIC FalconKVMetadataService
     PUBLIC FalconKVDataService
     PUBLIC FalconKVProto
+    PRIVATE pq
 )
 
 # ==================== Python protobuf bindings (v6 §16 / M3) ====================
@@ -130,6 +160,7 @@ set(FALCON_KV_PYTHON_PROTO_OUTPUTS
     ${FALCON_KV_PYTHON_PKG_DIR}/kv_common_pb2.py
     ${FALCON_KV_PYTHON_PKG_DIR}/kv_metadata_service_pb2.py
     ${FALCON_KV_PYTHON_PKG_DIR}/kv_data_service_pb2.py
+    ${FALCON_KV_PYTHON_PKG_DIR}/kv_store_admin_service_pb2.py
 )
 add_custom_command(
     OUTPUT ${FALCON_KV_PYTHON_PROTO_OUTPUTS}
@@ -167,11 +198,16 @@ target_include_directories(falconfs_kv_brpc PRIVATE
     ${FALCON_KV_INCLUDES}
     ${FALCON_KV_PROTO_GEN_DIR}
 )
+if(FALCON_KV_PG_LIBDIR)
+    target_link_directories(falconfs_kv_brpc PRIVATE "${FALCON_KV_PG_LIBDIR}")
+endif()
 target_link_libraries(falconfs_kv_brpc PRIVATE
     ${Python3_LIBRARIES}
+    FalconKVBrpcServiceAdapters
     FalconKVProto
     ${BRPC_LIBRARIES}
     ${Protobuf_LIBRARIES}
+    pq
     ${DYNAMIC_LIB}
     pthread
     dl
@@ -181,4 +217,24 @@ target_link_libraries(falconfs_kv_brpc PRIVATE
 # `vllm_kv_cache/python` on PYTHONPATH.
 set_target_properties(falconfs_kv_brpc PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${FALCON_KV_PYTHON_PKG_DIR}
+)
+
+# ==================== falcon_kv_store daemon (v6.5 P2) ====================
+add_executable(falcon_kv_store ${PROJECT_SOURCE_DIR}/falcon_kv_store/main.cpp)
+target_include_directories(falcon_kv_store PRIVATE ${FALCON_KV_INCLUDE_DIRS})
+if(FALCON_KV_PG_INCLUDEDIR)
+    target_include_directories(falcon_kv_store PRIVATE "${FALCON_KV_PG_INCLUDEDIR}")
+endif()
+if(FALCON_KV_PG_LIBDIR)
+    target_link_directories(falcon_kv_store PRIVATE "${FALCON_KV_PG_LIBDIR}")
+endif()
+target_link_libraries(falcon_kv_store PRIVATE
+    FalconKVBrpcServiceAdapters
+    FalconKVProto
+    ${BRPC_LIBRARIES}
+    ${Protobuf_LIBRARIES}
+    ${DYNAMIC_LIB}
+    pq
+    pthread
+    dl
 )

@@ -46,6 +46,17 @@ __attribute__((visibility("default"))) int FalconKvEvictionLowWatermarkPct =
     FALCON_KV_EVICTION_LOW_WATERMARK_PCT_DEFAULT;
 __attribute__((visibility("default"))) int FalconKvEvictionChunk =
     FALCON_KV_EVICTION_CHUNK_DEFAULT;
+__attribute__((visibility("default"))) char* FalconKvStoreSpillEndpoint = NULL;
+__attribute__((visibility("default"))) int FalconKvWatchdogPeriodMs =
+    FALCON_KV_WATCHDOG_PERIOD_MS_DEFAULT;
+__attribute__((visibility("default"))) int FalconKvWatchdogSkewMs =
+    FALCON_KV_WATCHDOG_SKEW_MS_DEFAULT;
+__attribute__((visibility("default"))) int FalconKvPromoteEnabled =
+    FALCON_KV_PROMOTE_ENABLED_DEFAULT;
+__attribute__((visibility("default"))) int FalconKvPromoteQueueCapacity =
+    FALCON_KV_PROMOTE_QUEUE_CAPACITY_DEFAULT;
+__attribute__((visibility("default"))) int FalconKvPromoteMaxInflight =
+    FALCON_KV_PROMOTE_MAX_INFLIGHT_DEFAULT;
 
 // communication plugin path, using global variable for shared to worker process
 char *FalconCommunicationPluginPath;

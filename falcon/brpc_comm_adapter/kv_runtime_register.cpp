@@ -136,7 +136,7 @@ std::string CatalogLookup(PGconn *conn, const std::string &sub_payload)
         std::memset(&items[i], 0, sizeof(KVCatalogLookupItem));
         CopyBlockHashIn(req.items(i).block_hash(), items[i].block_hash, &items[i].block_hash_len);
     }
-    std::string resp_bytes = CallCatalog(conn, KV_CATALOG_METHOD_LOOKUP, buf);
+    std::string resp_bytes = CallCatalog(conn, ::KV_CATALOG_METHOD_LOOKUP, buf);
 
     BatchLookupResponse rsp;
     if (resp_bytes.size() < sizeof(uint32_t)) return {};
@@ -181,37 +181,71 @@ std::string CatalogInsertAllocated(PGconn *conn, const std::string &sub_payload)
     BatchAllocateRequest req;
     if (!req.ParseFromString(sub_payload)) return {};
     const uint32_t count = static_cast<uint32_t>(req.items_size());
+    const bool promote_mode = (count > 0 &&
+        req.items(0).allocate_hint() == AllocateHint::ALLOCATE_HINT_PROMOTE_FROM_EVICTED);
+    int32_t method = ::KV_CATALOG_METHOD_INSERT_ALLOCATED;
     std::string buf;
-    buf.resize(sizeof(uint32_t) + count * sizeof(KVCatalogInsertItem));
-    std::memcpy(buf.data(), &count, sizeof(uint32_t));
-    KVCatalogInsertItem *items =
-        reinterpret_cast<KVCatalogInsertItem *>(buf.data() + sizeof(uint32_t));
-    int64_t now_ms = 0; /* now_ms is a server-side timestamp; falcon.so writes one. */
-    for (uint32_t i = 0; i < count; ++i) {
-        std::memset(&items[i], 0, sizeof(KVCatalogInsertItem));
-        CopyBlockHashIn(req.items(i).block_hash(), items[i].block_hash, &items[i].block_hash_len);
-        items[i].kv_group_idx = req.items(i).kv_group_idx();
-        items[i].layer_mask = req.items(i).layer_mask();
-        items[i].store_node_id = req.items(i).worker_reserved_store_node_id();
-        items[i].pool_offset = req.items(i).worker_reserved_pool_offset();
-        items[i].now_ms = now_ms;
+    if (promote_mode) {
+        method = ::KV_CATALOG_METHOD_PROMOTE_FROM_EVICTED;
+        buf.resize(sizeof(uint32_t) + count * sizeof(KVCatalogPromoteItem));
+        std::memcpy(buf.data(), &count, sizeof(uint32_t));
+        KVCatalogPromoteItem *items =
+            reinterpret_cast<KVCatalogPromoteItem *>(buf.data() + sizeof(uint32_t));
+        for (uint32_t i = 0; i < count; ++i) {
+            std::memset(&items[i], 0, sizeof(KVCatalogPromoteItem));
+            CopyBlockHashIn(req.items(i).block_hash(), items[i].block_hash, &items[i].block_hash_len);
+            items[i].kv_group_idx = req.items(i).kv_group_idx();
+            items[i].layer_mask = req.items(i).layer_mask();
+            items[i].store_node_id = req.items(i).worker_reserved_store_node_id();
+            items[i].pool_offset = req.items(i).worker_reserved_pool_offset();
+            items[i].expected_version = 0;
+            items[i].now_ms = 0;
+        }
+    } else {
+        buf.resize(sizeof(uint32_t) + count * sizeof(KVCatalogInsertItem));
+        std::memcpy(buf.data(), &count, sizeof(uint32_t));
+        KVCatalogInsertItem *items =
+            reinterpret_cast<KVCatalogInsertItem *>(buf.data() + sizeof(uint32_t));
+        int64_t now_ms = 0; /* now_ms is a server-side timestamp; falcon.so writes one. */
+        for (uint32_t i = 0; i < count; ++i) {
+            std::memset(&items[i], 0, sizeof(KVCatalogInsertItem));
+            CopyBlockHashIn(req.items(i).block_hash(), items[i].block_hash, &items[i].block_hash_len);
+            items[i].kv_group_idx = req.items(i).kv_group_idx();
+            items[i].layer_mask = req.items(i).layer_mask();
+            items[i].store_node_id = req.items(i).worker_reserved_store_node_id();
+            items[i].pool_offset = req.items(i).worker_reserved_pool_offset();
+            items[i].now_ms = now_ms;
+        }
     }
-    std::string resp_bytes = CallCatalog(conn, KV_CATALOG_METHOD_INSERT_ALLOCATED, buf);
+    std::string resp_bytes = CallCatalog(conn, method, buf);
 
     BatchAllocateResponse rsp;
     if (resp_bytes.size() < sizeof(uint32_t)) return {};
     uint32_t resp_count = 0;
     std::memcpy(&resp_count, resp_bytes.data(), sizeof(uint32_t));
-    if (resp_count != count ||
-        resp_bytes.size() < sizeof(uint32_t) + count * sizeof(KVCatalogInsertResult)) {
+    if (resp_count != count) {
         return {};
     }
-    const KVCatalogInsertResult *results = reinterpret_cast<const KVCatalogInsertResult *>(
-        resp_bytes.data() + sizeof(uint32_t));
+    const KVCatalogInsertResult *results = nullptr;
+    const KVCatalogPromoteResult *promote_results = nullptr;
+    if (promote_mode) {
+        if (resp_bytes.size() < sizeof(uint32_t) + count * sizeof(KVCatalogPromoteResult)) {
+            return {};
+        }
+        promote_results = reinterpret_cast<const KVCatalogPromoteResult *>(
+            resp_bytes.data() + sizeof(uint32_t));
+    } else {
+        if (resp_bytes.size() < sizeof(uint32_t) + count * sizeof(KVCatalogInsertResult)) {
+            return {};
+        }
+        results = reinterpret_cast<const KVCatalogInsertResult *>(
+            resp_bytes.data() + sizeof(uint32_t));
+    }
     for (uint32_t i = 0; i < count; ++i) {
         auto *r = rsp.add_results();
         r->set_block_hash(req.items(i).block_hash());
-        if (!results[i].inserted) {
+        const bool ok = promote_mode ? (promote_results[i].promoted != 0) : (results[i].inserted != 0);
+        if (!ok) {
             FillErr(r->mutable_result(), ErrorCode::CAS_CONFLICT, true,
                     "catalog insert lost (duplicate or conflict)");
             r->set_reused_existing_allocation(false);
@@ -223,7 +257,7 @@ std::string CatalogInsertAllocated(PGconn *conn, const std::string &sub_payload)
         loc->set_pool_offset(req.items(i).worker_reserved_pool_offset());
         loc->set_evicted_path("");
         loc->set_store_epoch(0);
-        r->set_version(1);
+        r->set_version(promote_mode ? promote_results[i].new_version : 1);
         r->set_reused_existing_allocation(false);
     }
     return rsp.SerializeAsString();
@@ -253,7 +287,7 @@ std::string CatalogCASStatusUpdate(PGconn *conn, const std::string &sub_payload)
             CopyEvictedPathIn(ep, items[i].evicted_path, &items[i].evicted_path_len);
         }
     }
-    std::string resp_bytes = CallCatalog(conn, KV_CATALOG_METHOD_CAS_STATUS_UPDATE, buf);
+    std::string resp_bytes = CallCatalog(conn, ::KV_CATALOG_METHOD_CAS_STATUS_UPDATE, buf);
 
     BatchUpdateStatusResponse rsp;
     if (resp_bytes.size() < sizeof(uint32_t)) return {};
@@ -304,7 +338,7 @@ std::string CatalogDelete(PGconn *conn, const std::string &sub_payload)
         CopyBlockHashIn(req.items(i).block_hash(), items[i].block_hash, &items[i].block_hash_len);
         items[i].expected_version = req.items(i).expected_version();
     }
-    std::string resp_bytes = CallCatalog(conn, KV_CATALOG_METHOD_DELETE, buf);
+    std::string resp_bytes = CallCatalog(conn, ::KV_CATALOG_METHOD_DELETE, buf);
 
     BatchFreeAllocatedResponse rsp;
     if (resp_bytes.size() < sizeof(uint32_t)) return {};

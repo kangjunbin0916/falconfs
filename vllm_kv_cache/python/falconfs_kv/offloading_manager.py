@@ -7,6 +7,12 @@ from typing import Callable, Dict, List, Optional
 
 from .reference import BlockStatus, ErrorCode, ReferenceCluster
 from .router import Router
+from .promote_worker import PromoteWorker
+
+try:
+    from . import falconfs_kv_brpc
+except ImportError:  # pragma: no cover - only in no-extension unit envs
+    falconfs_kv_brpc = None
 
 
 LEASE_DURATION_MS = 5000
@@ -65,31 +71,47 @@ class FalconFSOffloadingManager:
 
     def __init__(
         self,
-        shard_table: Dict[int, str],
         client_id: int,
         client_hostname: str,
+        shard_table: Optional[Dict[int, str]] = None,
         cluster=None,
         clusters: Optional[Dict[int, ReferenceCluster]] = None,
         cluster_factory: Optional[Callable[[int, str], ReferenceCluster]] = None,
         block_size: int = BLOCK_SIZE,
         mode: str = "reference",
         timeout_ms: int = 30000,
+        cn_conninfo: Optional[str] = None,
     ):
-        self.shard_table = shard_table
+        if mode == "cluster" and (not shard_table):
+            if not cn_conninfo:
+                raise RuntimeError("mode=cluster requires shard_table or cn_conninfo")
+            if falconfs_kv_brpc is None:
+                raise RuntimeError("falconfs_kv_brpc extension is required for cluster mode")
+            falconfs_kv_brpc.membership_start(cn_conninfo)
+            # Prime registry + DN endpoint view.
+            falconfs_kv_brpc.membership_refresh(timeout_ms)
+            shard_table = falconfs_kv_brpc.discover_dn_endpoints()
+        self.shard_table = dict(shard_table or {})
+        if mode == "cluster" and not self.shard_table:
+            raise RuntimeError("cluster mode discovered no DN endpoints")
         self.client_id = client_id
         self.client_hostname = client_hostname
         self.local_cache: Dict[str, KVBlockLocation] = {}
         self.block_size = block_size
         self.mode = mode
+        self._cn_conninfo = cn_conninfo
+        self.timeout_ms = timeout_ms
+        self._cluster_factory = cluster_factory
+        self._cluster_singleton = cluster
         if clusters:
             self._clusters: Dict[int, ReferenceCluster] = clusters
         elif cluster_factory is not None:
             self._clusters = {
                 dn_id: cluster_factory(dn_id, endpoint)
-                for dn_id, endpoint in sorted(shard_table.items())
+                for dn_id, endpoint in sorted(self.shard_table.items())
             }
         elif cluster is not None:
-            keys = sorted(shard_table.keys()) or [0]
+            keys = sorted(self.shard_table.keys()) or [0]
             self._clusters = {dn_id: cluster for dn_id in keys}
         elif mode == "cluster":
             # v6 §16: BRPC client per DN. Each DN endpoint is addressed by a
@@ -98,15 +120,17 @@ class FalconFSOffloadingManager:
             from .store_client import BrpcCluster
             self._clusters = {
                 dn_id: BrpcCluster(endpoint, dn_id=dn_id, client_id=client_id,
-                                   timeout_ms=timeout_ms, block_size=block_size)
-                for dn_id, endpoint in sorted(shard_table.items())
+                                   timeout_ms=timeout_ms, block_size=block_size,
+                                   use_facade_registry=bool(cn_conninfo))
+                for dn_id, endpoint in sorted(self.shard_table.items())
             }
         else:
-            keys = sorted(shard_table.keys()) or [0]
+            keys = sorted(self.shard_table.keys()) or [0]
             self._clusters = {dn_id: ReferenceCluster(block_size=block_size) for dn_id in keys}
         # Stable per-DN routing.
-        self._router = Router(shard_table) if shard_table else None
+        self._router = Router(self.shard_table) if self.shard_table else None
         self._routing: Dict[str, int] = {}
+        self._promote_worker = PromoteWorker(self) if mode == "cluster" else None
 
     def lookup(self, key: str, req_context=None) -> bool | None:
         result = self._batch_lookup_impl([key], req_context, renew_lease_on_hit=False)
@@ -146,6 +170,34 @@ class FalconFSOffloadingManager:
 
     def touch(self, keys: List[str], req_context=None):
         self._batch_renew_impl(keys)
+
+    def refresh_membership(self, timeout_ms: int = 2000):
+        if self.mode != "cluster":
+            return (0, 0, 0)
+        if falconfs_kv_brpc is None:
+            raise RuntimeError("falconfs_kv_brpc extension is required for cluster mode")
+        stats = falconfs_kv_brpc.membership_refresh(timeout_ms)
+        discovered = dict(falconfs_kv_brpc.discover_dn_endpoints())
+        if discovered and discovered != self.shard_table:
+            self.shard_table = discovered
+            if self._cluster_factory is not None:
+                self._clusters = {
+                    dn_id: self._cluster_factory(dn_id, endpoint)
+                    for dn_id, endpoint in sorted(self.shard_table.items())
+                }
+            elif self._cluster_singleton is not None:
+                self._clusters = {dn_id: self._cluster_singleton for dn_id in self.shard_table.keys()}
+            else:
+                from .store_client import BrpcCluster
+                self._clusters = {
+                    dn_id: BrpcCluster(endpoint, dn_id=dn_id, client_id=self.client_id,
+                                       timeout_ms=self.timeout_ms, block_size=self.block_size,
+                                       use_facade_registry=bool(self._cn_conninfo))
+                    for dn_id, endpoint in sorted(self.shard_table.items())
+                }
+            self._router = Router(self.shard_table)
+            self._routing.clear()
+        return stats
 
     def batch_lookup(self, keys: List[str], req_context) -> Dict[str, bool]:
         return self._batch_lookup_impl(keys, req_context, renew_lease_on_hit=True)
@@ -195,6 +247,20 @@ class FalconFSOffloadingManager:
                 if result.success and row:
                     if lease:
                         self._cache_location(key, row, lease, dn_id)
+                    elif int(row.status) == STATUS_EVICTED:
+                        self.local_cache[key] = KVBlockLocation(
+                            block_hash=key,
+                            status=int(row.status),
+                            store_id=row.location.store_node_id,
+                            pool_offset=row.location.pool_offset,
+                            lease_expire_ms=self._now_ms(),
+                            evicted_path=row.location.evicted_path,
+                            lease_token=0,
+                            version=row.version,
+                            dn_epoch=1,
+                            store_epoch=row.location.store_epoch,
+                            dn_id=dn_id,
+                        )
                     results[key] = True
                 elif result.error_code in (ErrorCode.CAS_CONFLICT, ErrorCode.THROTTLED):
                     results[key] = None  # type: ignore[assignment]
@@ -287,7 +353,33 @@ class FalconFSOffloadingManager:
             if not loc:
                 raise RuntimeError(f"Block {key} not found in local cache")
             cluster = self._clusters.get(loc.dn_id) or self._cluster_for(key)
-            result, payload = cluster.store.read(loc.store_id, loc.pool_offset, loc.store_epoch)
+            if loc.status == STATUS_EVICTED and loc.evicted_path:
+                result, payload = cluster.store.read_from_ssd(
+                    loc.evicted_path, loc.store_epoch, expected_version=loc.version, block_size=self.block_size
+                )
+                if result.success and self._promote_worker is not None:
+                    self._promote_worker.enqueue(
+                        key,
+                        payload,
+                        loc.store_id,
+                        loc.pool_offset,
+                        loc.version,
+                        loc.store_epoch,
+                        loc.dn_id,
+                    )
+            else:
+                try:
+                    result, payload = cluster.store.read(
+                        loc.store_id,
+                        loc.pool_offset,
+                        loc.store_epoch,
+                        expected_version=loc.version,
+                        block_size=self.block_size,
+                    )
+                except TypeError:
+                    result, payload = cluster.store.read(
+                        loc.store_id, loc.pool_offset, loc.store_epoch
+                    )
             if not result.success:
                 raise RuntimeError(f"Failed to read {key}: {result.error_code}")
             loaded[key] = payload
@@ -298,6 +390,8 @@ class FalconFSOffloadingManager:
         for key in keys:
             loc = self.local_cache.get(key)
             if not loc:
+                continue
+            if loc.lease_token <= 0:
                 continue
             cluster = self._clusters.get(loc.dn_id) or self._cluster_for(key)
             result, lease = cluster.metadata.lease_manager.renew(

@@ -72,6 +72,9 @@ Datum falcon_kv_metadata_catalog_call(PG_FUNCTION_ARGS)
         case KV_CATALOG_METHOD_DELETE:
             FalconKVBlockBatchDelete(req_buf, req_size, resp_buf, resp_size);
             break;
+        case KV_CATALOG_METHOD_PROMOTE_FROM_EVICTED:
+            FalconKVBlockBatchPromoteFromEvicted(req_buf, req_size, resp_buf, resp_size);
+            break;
         default:
             FALCON_ELOG_ERROR(ARGUMENT_ERROR, "kv catalog call: unsupported method");
         }

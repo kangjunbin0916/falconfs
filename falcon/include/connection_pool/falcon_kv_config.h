@@ -27,6 +27,25 @@ extern int FalconKvEvictionLowWatermarkPct;
 #define FALCON_KV_EVICTION_CHUNK_DEFAULT 64
 extern int FalconKvEvictionChunk;
 
+/* v6.5 P3: `host:port` of falcon_kv_store for DN eviction spill over BRPC.
+ * Empty disables remote spill (default). */
+extern char* FalconKvStoreSpillEndpoint;
+
+/* v6.5 P3: membership watchdog cadence (ms) and heartbeat skew threshold (ms)
+ * for flipping falcon_dn_node / falcon_store_node healthy=false. */
+#define FALCON_KV_WATCHDOG_PERIOD_MS_DEFAULT 1000
+#define FALCON_KV_WATCHDOG_SKEW_MS_DEFAULT 30000
+extern int FalconKvWatchdogPeriodMs;
+extern int FalconKvWatchdogSkewMs;
+
+/* v6.5 P7: promote-on-read worker tuning knobs. */
+#define FALCON_KV_PROMOTE_ENABLED_DEFAULT 1
+#define FALCON_KV_PROMOTE_QUEUE_CAPACITY_DEFAULT 1024
+#define FALCON_KV_PROMOTE_MAX_INFLIGHT_DEFAULT 64
+extern int FalconKvPromoteEnabled;
+extern int FalconKvPromoteQueueCapacity;
+extern int FalconKvPromoteMaxInflight;
+
 #ifdef __cplusplus
 }
 #endif

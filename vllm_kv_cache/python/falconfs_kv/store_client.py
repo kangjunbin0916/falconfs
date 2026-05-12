@@ -8,6 +8,7 @@ fallback path).
 
 from __future__ import annotations
 
+import os
 from typing import Tuple
 
 from . import falconfs_kv_brpc
@@ -17,10 +18,11 @@ from .reference import ErrorCode, ItemResult
 
 
 class BrpcKVStore:
-    def __init__(self, endpoint: str, *, timeout_ms: int = 30000):
+    def __init__(self, endpoint: str, *, timeout_ms: int = 30000, use_facade_registry: bool = False):
         self.endpoint = endpoint
         self.timeout_ms = timeout_ms
         self._req_seq = 0
+        self._use_facade_registry = use_facade_registry
 
     def _mk_request_id(self, tag: str) -> str:
         self._req_seq += 1
@@ -45,11 +47,19 @@ class BrpcKVStore:
         it.expected_store_epoch = expected_store_epoch
         it.expected_version = expected_version
         rsp = _kvdata.BatchWriteBlockResponse()
-        rsp.ParseFromString(
-            falconfs_kv_brpc.batch_write_block(
+        wire = b""
+        if self._use_facade_registry:
+            try:
+                wire = falconfs_kv_brpc.facade_batch_write_block(
+                    int(store_node_id), req.SerializeToString(), self.timeout_ms
+                )
+            except Exception:
+                wire = b""
+        if not wire:
+            wire = falconfs_kv_brpc.batch_write_block(
                 self.endpoint, req.SerializeToString(), self.timeout_ms
             )
-        )
+        rsp.ParseFromString(wire)
         if not rsp.results:
             return ItemResult(False, ErrorCode.INTERNAL_ERROR, True, "empty response")
         return _result_meta_to_item_result(rsp.results[0].result)
@@ -71,11 +81,19 @@ class BrpcKVStore:
         it.expected_store_epoch = expected_store_epoch
         it.expected_version = expected_version
         rsp = _kvdata.BatchReadBlockResponse()
-        rsp.ParseFromString(
-            falconfs_kv_brpc.batch_read_block(
+        wire = b""
+        if self._use_facade_registry:
+            try:
+                wire = falconfs_kv_brpc.facade_batch_read_block(
+                    int(store_node_id), req.SerializeToString(), self.timeout_ms
+                )
+            except Exception:
+                wire = b""
+        if not wire:
+            wire = falconfs_kv_brpc.batch_read_block(
                 self.endpoint, req.SerializeToString(), self.timeout_ms
             )
-        )
+        rsp.ParseFromString(wire)
         if not rsp.results:
             return ItemResult(False, ErrorCode.INTERNAL_ERROR, True, "empty response"), b""
         r = rsp.results[0]
@@ -97,11 +115,10 @@ class BrpcKVStore:
         it.expected_store_epoch = expected_store_epoch
         it.expected_version = expected_version
         rsp = _kvdata.BatchReadFromSSDResponse()
-        rsp.ParseFromString(
-            falconfs_kv_brpc.batch_read_from_ssd(
-                self.endpoint, req.SerializeToString(), self.timeout_ms
-            )
+        wire = falconfs_kv_brpc.batch_read_from_ssd(
+            self.endpoint, req.SerializeToString(), self.timeout_ms
         )
+        rsp.ParseFromString(wire)
         if not rsp.results:
             return ItemResult(False, ErrorCode.INTERNAL_ERROR, True, "empty response"), b""
         r = rsp.results[0]
@@ -114,11 +131,17 @@ class BrpcCluster:
     """
 
     def __init__(self, endpoint: str, *, dn_id: int = 1, client_id: int = 0,
-                 timeout_ms: int = 30000, block_size: int = 65536):
+                 timeout_ms: int = 30000, block_size: int = 65536,
+                 store_endpoint: str | None = None, use_facade_registry: bool = False):
         from .dn_client import BrpcMetadataService
         self.endpoint = endpoint
+        store_ep = store_endpoint or os.environ.get("FALCON_KV_STORE_BRPC_ENDPOINT") or endpoint
         self.metadata = BrpcMetadataService(
             endpoint, dn_id=dn_id, client_id=client_id,
             timeout_ms=timeout_ms, block_size=block_size,
         )
-        self.store = BrpcKVStore(endpoint, timeout_ms=timeout_ms)
+        self.store = BrpcKVStore(
+            store_ep,
+            timeout_ms=timeout_ms,
+            use_facade_registry=use_facade_registry,
+        )

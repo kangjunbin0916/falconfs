@@ -205,6 +205,7 @@ class BrpcMetadataService:
         now_ms: Optional[int] = None,
         request_id: Optional[str] = None,
         client_id: Optional[int] = None,
+        allocate_hint: Optional[int] = None,
     ) -> Dict[str, Tuple[ItemResult, Optional[BlockMeta], Optional[LeaseInfo]]]:
         del now_ms  # server-authoritative
         items: List[str] = list(block_hashes)
@@ -222,6 +223,8 @@ class BrpcMetadataService:
             it.block_size = self.block_size
             it.preferred_store_id = 1
             it.allow_fallback_store = True
+            if allocate_hint is not None:
+                it.allocate_hint = allocate_hint
         rsp = _kvmeta.BatchAllocateResponse()
         rsp.ParseFromString(
             falconfs_kv_brpc.batch_allocate_with_lease(

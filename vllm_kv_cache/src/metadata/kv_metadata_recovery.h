@@ -28,6 +28,13 @@ MetadataRecoveryStats RecoverMetadataFromAccessor(IKVMetaTableAccessor* accessor
                                                   int32_t shard_id,
                                                   int64_t now_ms);
 
+// Second-pass recovery after a Store region is registered on the DN: replays
+// the persisted scan without bumping dn_epoch again (v6.5 P1).
+MetadataRecoveryStats ReplayRecoverMetadataFromAccessor(IKVMetaTableAccessor* accessor,
+                                                       KVMetadataEngine* engine,
+                                                       int32_t shard_id,
+                                                       int64_t now_ms);
+
 // v6.4 libpq recovery: apply one `ScanShardForRecoveryResponse` protobuf blob to the engine.
 struct ScanShardRecoveryApplyStats {
     int64_t shards_scanned = 0;

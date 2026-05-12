@@ -35,7 +35,25 @@ DN1_PORT=55520
 DN1_POOLER_PORT=55530
 DN2_PORT=55540
 DN2_POOLER_PORT=55550
+# Optional third DN (v6.5 mixed-colocation / 3-shard routing). Enabled when KV_THREE_DNS=1.
+DN3_PORT=55560
+DN3_POOLER_PORT=55570
 META_DB_DIR="$HOME/falcon_metadata"
+
+kv_three_dns_enabled() { [ "${KV_THREE_DNS:-0}" = "1" ]; }
+
+# CSV of DN pooler TCP ports passed to falcon_kv_store for multi-region DRAM.
+kv_store_poolers_csv() {
+    if kv_three_dns_enabled; then
+        echo "${DN1_POOLER_PORT},${DN2_POOLER_PORT},${DN3_POOLER_PORT}"
+    else
+        echo "${DN1_POOLER_PORT},${DN2_POOLER_PORT}"
+    fi
+}
+
+# v6.5: default KV store BRPC port (DN falcon_kv.store_spill_endpoint must match first store).
+KV_STORE_BRPC_PORT="${KV_STORE_BRPC_PORT:-18765}"
+export KV_STORE_BRPC_PORT
 
 # Client nodes (FUSE mounts)
 CLIENT1_RPC_PORT=56039
@@ -69,12 +87,16 @@ cleanup() {
     stop_pg_node "CN" "$META_DB_DIR/coordinator0" || true
     stop_pg_node "DN1" "$META_DB_DIR/worker0" || true
     stop_pg_node "DN2" "$META_DB_DIR/worker1" || true
+    stop_pg_node "DN3" "$META_DB_DIR/worker2" || true
     kill_listener_on_port "$CN_PORT" "CN SQL" || true
     kill_listener_on_port "$CN_POOLER_PORT" "CN pooler" || true
     kill_listener_on_port "$DN1_PORT" "DN1 SQL" || true
     kill_listener_on_port "$DN1_POOLER_PORT" "DN1 pooler" || true
     kill_listener_on_port "$DN2_PORT" "DN2 SQL" || true
     kill_listener_on_port "$DN2_POOLER_PORT" "DN2 pooler" || true
+    kill_listener_on_port "$DN3_PORT" "DN3 SQL" || true
+    kill_listener_on_port "$DN3_POOLER_PORT" "DN3 pooler" || true
+    kill_listener_on_port "${KV_STORE_BRPC_PORT:-18765}" "KV store BRPC" || true
     
     # Clean temporary files
     rm -rf "$META_DB_DIR" 2>/dev/null || true
@@ -92,6 +114,119 @@ check_port() {
         return 1
     fi
     return 0
+}
+
+# Wait until something is listening on TCP `port` (BRPC / arbitrary), not Postgres.
+wait_for_listen_tcp() {
+    local port=$1
+    local timeout_s=${2:-30}
+    local i=0
+    while [ "$i" -lt "$timeout_s" ]; do
+        if ss -tln 2>/dev/null | grep -q ":${port} " || netstat -tln 2>/dev/null | grep -q ":${port} "; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# Wait until nothing is listening on TCP `port` (used after SIGTERM so the next
+# bind does not fail with EADDRINUSE while the old brpc server drains).
+wait_for_tcp_port_free() {
+    local port=$1
+    local timeout_s=${2:-45}
+    local i=0
+    while [ "$i" -lt "$timeout_s" ]; do
+        if ! ss -tln 2>/dev/null | grep -q ":${port} " &&
+            ! netstat -tln 2>/dev/null | grep -q ":${port} "; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# Wait until a FUSE client has mounted `mnt` (used after falcon_client starts).
+wait_for_fuse_mount() {
+    local mnt=$1
+    local timeout_s=${2:-90}
+    local i=0
+    while [ "$i" -lt "$timeout_s" ]; do
+        if command -v findmnt >/dev/null 2>&1; then
+            if findmnt "$mnt" >/dev/null 2>&1; then
+                return 0
+            fi
+        else
+            if mount 2>/dev/null | grep -q " on ${mnt} "; then
+                return 0
+            fi
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# Copy each DN's `falcon_dn_node` row onto the CN catalog. DN BRPC startup
+# registers membership only in that DN's local database; Python
+# `membership_refresh` / `KVStoreFacadeRegistry` read membership over libpq from
+# the CN by default (`FALCON_KV_CN_CONNINFO` → port $CN_PORT), so the harness
+# mirrors rows here for discovery to see both DNs.
+mirror_kv_dn_membership_rows_to_cn() {
+    log_step "Seeding CN pg_catalog.falcon_dn_node (harness topology for libpq discovery)..."
+    # DN self-registration runs in the pooler BRPC worker; rows may not be visible
+    # from every psql target. Always upsert onto CN using the same ports the pooler
+    # uses (PostPortNumber == falcon_connection_pool.port), and align dn_epoch when
+    # the local DN catalogs already have a row.
+    local e1=1
+    local e2=1
+    local e3=1
+    local te1 te2 te3
+    local w
+    for w in $(seq 1 30); do
+        te1=$(psql -d postgres -h 127.0.0.1 -p "$DN1_PORT" -tAXc \
+            "SELECT dn_epoch::text FROM pg_catalog.falcon_dn_node WHERE server_id=1 LIMIT 1;" 2>/dev/null | tr -d '[:space:]')
+        te2=$(psql -d postgres -h 127.0.0.1 -p "$DN2_PORT" -tAXc \
+            "SELECT dn_epoch::text FROM pg_catalog.falcon_dn_node WHERE server_id=2 LIMIT 1;" 2>/dev/null | tr -d '[:space:]')
+        if kv_three_dns_enabled; then
+            te3=$(psql -d postgres -h 127.0.0.1 -p "$DN3_PORT" -tAXc \
+                "SELECT dn_epoch::text FROM pg_catalog.falcon_dn_node WHERE server_id=3 LIMIT 1;" 2>/dev/null | tr -d '[:space:]')
+        else
+            te3="ok"
+        fi
+        if [ -n "$te1" ] && [ -n "$te2" ] && [ -n "$te3" ]; then
+            e1=$te1
+            e2=$te2
+            if kv_three_dns_enabled; then
+                e3=$te3
+            fi
+            break
+        fi
+        sleep 2
+    done
+
+    if kv_three_dns_enabled; then
+        if ! psql -v ON_ERROR_STOP=1 -d postgres -h 127.0.0.1 -p "$CN_PORT" -c "\
+SELECT pg_catalog.falcon_dn_node_register(1, 'worker0'::cstring, '127.0.0.1'::cstring, ${DN1_POOLER_PORT}::int, ${DN1_POOLER_PORT}::int, ${e1}::bigint);\
+SELECT pg_catalog.falcon_dn_node_register(2, 'worker1'::cstring, '127.0.0.1'::cstring, ${DN2_POOLER_PORT}::int, ${DN2_POOLER_PORT}::int, ${e2}::bigint);\
+SELECT pg_catalog.falcon_dn_node_register(3, 'worker2'::cstring, '127.0.0.1'::cstring, ${DN3_POOLER_PORT}::int, ${DN3_POOLER_PORT}::int, ${e3}::bigint);\
+" >/dev/null; then
+            log_error "falcon_dn_node_register seed onto CN failed"
+            return 1
+        fi
+        log_info "CN falcon_dn_node seed OK (server_id 1..3 dn_epochs ${e1},${e2},${e3})"
+    else
+        if ! psql -v ON_ERROR_STOP=1 -d postgres -h 127.0.0.1 -p "$CN_PORT" -c "\
+SELECT pg_catalog.falcon_dn_node_register(1, 'worker0'::cstring, '127.0.0.1'::cstring, ${DN1_POOLER_PORT}::int, ${DN1_POOLER_PORT}::int, ${e1}::bigint);\
+SELECT pg_catalog.falcon_dn_node_register(2, 'worker1'::cstring, '127.0.0.1'::cstring, ${DN2_POOLER_PORT}::int, ${DN2_POOLER_PORT}::int, ${e2}::bigint);\
+" >/dev/null; then
+            log_error "falcon_dn_node_register seed onto CN failed"
+            return 1
+        fi
+        log_info "CN falcon_dn_node seed OK (server_id 1 dn_epoch=${e1}, server_id 2 dn_epoch=${e2})"
+    fi
 }
 
 stop_pg_node() {
@@ -205,6 +340,10 @@ start_all() {
     check_port $DN1_POOLER_PORT || exit 1
     check_port $DN2_PORT || exit 1
     check_port $DN2_POOLER_PORT || exit 1
+    if kv_three_dns_enabled; then
+        check_port $DN3_PORT || exit 1
+        check_port $DN3_POOLER_PORT || exit 1
+    fi
     check_port $CLIENT1_RPC_PORT || exit 1
     check_port $CLIENT2_RPC_PORT || exit 1
     log_info "All ports are available"
@@ -214,6 +353,13 @@ start_all() {
     export PATH="$INSTALL_DIR/falcon_client/bin:$(pg_config --bindir):${PATH:-}"
     export LD_LIBRARY_PATH="$INSTALL_DIR/falcon_client/lib:$INSTALL_DIR/falcon_meta/lib:$(pg_config --libdir):${LD_LIBRARY_PATH:-}"
     export CONFIG_FILE="$INSTALL_DIR/falcon_client/config/config.json"
+
+    local FALCON_CLIENT_BIN="$INSTALL_DIR/falcon_client/bin/falcon_client"
+    if [ ! -x "$FALCON_CLIENT_BIN" ]; then
+        log_error "falcon_client not found or not executable: $FALCON_CLIENT_BIN"
+        log_error "Install the client (e.g. sudo ./build.sh install) or set FALCONFS_INSTALL_DIR to a prefix that contains falcon_client/bin/falcon_client"
+        exit 1
+    fi
     
     # 4. Install Falcon extension to PostgreSQL
     log_step "【1/6】Installing Falcon extension to PostgreSQL..."
@@ -300,6 +446,7 @@ falcon_communication.server_ip = '127.0.0.1'
 falcon_plugin.directory = '$INSTALL_DIR/plugins'
 falcon.local_ip = '127.0.0.1'
 falcon.perf_enabled = on
+falcon_kv.store_spill_endpoint = '127.0.0.1:${KV_STORE_BRPC_PORT}'
 EOF
     echo "host all all 0.0.0.0/0 trust" >>"$dn1_path/pg_hba.conf"
     
@@ -345,6 +492,7 @@ falcon_communication.server_ip = '127.0.0.1'
 falcon_plugin.directory = '$INSTALL_DIR/plugins'
 falcon.local_ip = '127.0.0.1'
 falcon.perf_enabled = on
+falcon_kv.store_spill_endpoint = '127.0.0.1:${KV_STORE_BRPC_PORT}'
 EOF
     echo "host all all 0.0.0.0/0 trust" >>"$dn2_path/pg_hba.conf"
     
@@ -360,17 +508,67 @@ EOF
     
     psql -d postgres -h 127.0.0.1 -p $DN2_PORT -c "CREATE EXTENSION IF NOT EXISTS falcon;"
     log_info "DN2 started successfully"
+
+    if kv_three_dns_enabled; then
+        log_step "【4b/8】Starting DN3 Worker (port: $DN3_PORT)..."
+        local dn3_path="$META_DB_DIR/worker2"
+        mkdir -p "$dn3_path"
+
+        if [ ! -d "$dn3_path/PG_VERSION" ]; then
+            initdb -D "$dn3_path" --username=$USER
+        fi
+
+        cat >"$dn3_path/postgresql.conf" <<EOF
+shared_preload_libraries = 'falcon'
+port=$DN3_PORT
+listen_addresses = '*'
+wal_level = logical
+max_prepared_transactions = 100
+max_replication_slots = 8
+max_wal_senders = 8
+falcon_connection_pool.port = $DN3_POOLER_PORT
+falcon_connection_pool.pool_size = 32
+falcon_connection_pool.shmem_size = 256
+falcon_connection_pool.batch_size = 1024
+falcon_connection_pool.wait_adjust = 1
+falcon_connection_pool.wait_min = 1
+falcon_connection_pool.wait_max = 500
+falcon_communication.plugin_path = '$comm_plugin_path'
+falcon_communication.server_ip = '127.0.0.1'
+falcon_plugin.directory = '$INSTALL_DIR/plugins'
+falcon.local_ip = '127.0.0.1'
+falcon.perf_enabled = on
+falcon_kv.store_spill_endpoint = '127.0.0.1:${KV_STORE_BRPC_PORT}'
+EOF
+        echo "host all all 0.0.0.0/0 trust" >>"$dn3_path/pg_hba.conf"
+
+        pg_ctl start -l "/tmp/falcon_dn3.log" -D "$dn3_path" -c
+        sleep 3
+
+        if ! pg_ctl status -D "$dn3_path" >/dev/null 2>&1; then
+            log_error "DN3 failed to start. Check log: /tmp/falcon_dn3.log"
+            tail -30 /tmp/falcon_dn3.log
+            exit 1
+        fi
+
+        psql -d postgres -h 127.0.0.1 -p $DN3_PORT -c "CREATE EXTENSION IF NOT EXISTS falcon;"
+        log_info "DN3 started successfully"
+    fi
     
     # 8. Register servers in the cluster
     # IMPORTANT: Register on ALL nodes so they all know each other
     log_step "【5/8】Registering servers to cluster..."
 
-    local node_ports=("$CN_PORT" "$DN1_PORT" "$DN2_PORT")
+    local node_ports=( "$CN_PORT" "$DN1_PORT" "$DN2_PORT" )
+    if kv_three_dns_enabled; then
+        node_ports+=( "$DN3_PORT" )
+    fi
 
     for target_port in "${node_ports[@]}"; do
         local cn_local=false
         local dn1_local=false
         local dn2_local=false
+        local dn3_local=false
 
         if [ "$target_port" -eq "$CN_PORT" ]; then
             cn_local=true
@@ -378,6 +576,8 @@ EOF
             dn1_local=true
         elif [ "$target_port" -eq "$DN2_PORT" ]; then
             dn2_local=true
+        elif kv_three_dns_enabled && [ "$target_port" -eq "$DN3_PORT" ]; then
+            dn3_local=true
         fi
 
         psql -d postgres -h 127.0.0.1 -p "$target_port" \
@@ -386,6 +586,10 @@ EOF
             -c "SELECT falcon_insert_foreign_server(1, 'worker0', '127.0.0.1', $DN1_PORT, $dn1_local, '$USER');"
         psql -d postgres -h 127.0.0.1 -p "$target_port" \
             -c "SELECT falcon_insert_foreign_server(2, 'worker1', '127.0.0.1', $DN2_PORT, $dn2_local, '$USER');"
+        if kv_three_dns_enabled; then
+            psql -d postgres -h 127.0.0.1 -p "$target_port" \
+                -c "SELECT falcon_insert_foreign_server(3, 'worker2', '127.0.0.1', $DN3_PORT, $dn3_local, '$USER');"
+        fi
     done
     
     log_info "Servers registered"
@@ -397,22 +601,82 @@ EOF
     psql -d postgres -h 127.0.0.1 -p $CN_PORT -c "SELECT falcon_build_shard_table(50);"
     psql -d postgres -h 127.0.0.1 -p $DN1_PORT -c "SELECT falcon_build_shard_table(50);"
     psql -d postgres -h 127.0.0.1 -p $DN2_PORT -c "SELECT falcon_build_shard_table(50);"
+    if kv_three_dns_enabled; then
+        psql -d postgres -h 127.0.0.1 -p $DN3_PORT -c "SELECT falcon_build_shard_table(50);"
+    fi
     
-    # Create tables and start background services on all nodes
-    for port in $CN_PORT $DN1_PORT $DN2_PORT; do
+    # Create tables and start background services on all nodes.
+    # Membership tables MUST exist before falcon_start_background_service: DN BRPC
+    # self-registration inserts into pg_catalog.falcon_dn_node at startup.
+    local init_ports="$CN_PORT $DN1_PORT $DN2_PORT"
+    if kv_three_dns_enabled; then
+        init_ports="$init_ports $DN3_PORT"
+    fi
+    for port in $init_ports; do
         psql -d postgres -h 127.0.0.1 -p $port <<EOF
 SELECT falcon_create_distributed_data_table();
 SELECT falcon_create_slice_table();
 SELECT falcon_create_kvmeta_table();
+SELECT pg_catalog.falcon_create_kv_membership_tables();
 SELECT falcon_start_background_service();
 EOF
     done
-    
+
+    sleep 3
+    mirror_kv_dn_membership_rows_to_cn || {
+        log_error "CN falcon_dn_node seed failed"
+        exit 1
+    }
+
     # Create root directory on CN only
     psql -d postgres -h 127.0.0.1 -p $CN_PORT -c "SELECT falcon_plain_mkdir('/');"
     
     log_info "Cluster initialization completed"
     sleep 2
+
+    # 9b. v6.5 P2: standalone KV store daemon — DRAM + KVDataService; DNs are metadata-only.
+    KV_STORE_BRPC_PORT="${KV_STORE_BRPC_PORT:-18765}"
+    STORE_COUNT="${STORE_COUNT:-1}"
+    rm -f /tmp/falcon_kv_store.pids /tmp/falcon_kv_store_env.sh
+    if [ "${STORE_COUNT}" -gt 0 ]; then
+        local kv_store_bin="$PROJECT_DIR/build/vllm_kv_cache/falcon_kv_store"
+        if [ ! -x "$kv_store_bin" ]; then
+            log_step "falcon_kv_store binary missing; building..."
+            (cd "$PROJECT_DIR/build" && ninja falcon_kv_store)
+        fi
+        for ((si=0; si<STORE_COUNT; si++)); do
+            local nid=$((si + 1))
+            mkdir -p "/tmp/falcon_kv_store_runtime/n${nid}" 2>/dev/null || true
+        done
+        local store_poolers
+        store_poolers="$(kv_store_poolers_csv)"
+        for ((si=0; si<STORE_COUNT; si++)); do
+            local p=$((KV_STORE_BRPC_PORT + si))
+            local node_id=$((si + 1))
+            local env_prefix=()
+            if kv_three_dns_enabled; then
+                env_prefix+=(NODE_NAME="v65mix${si}")
+            fi
+            nohup env "${env_prefix[@]}" FALCON_KV_STORE_CN_PGPORT="$CN_PORT" \
+                FALCON_KV_STORE_BRPC_PORT="$p" \
+                FALCON_KV_STORE_DN_POOLERS="$store_poolers" \
+                FALCON_KV_STORE_NODE_ID="$node_id" \
+                FALCON_KV_STORE_ADVERTISE_HOST="127.0.0.1" \
+                FALCON_KV_STORE_SHM_NAME="falcon_kv_store_heap_${node_id}" \
+                FALCON_KV_STORE_RUNTIME_DIR="/tmp/falcon_kv_store_runtime/n${node_id}" \
+                "$kv_store_bin" >>"/tmp/falcon_kv_store_${si}.log" 2>&1 &
+            echo $! >> /tmp/falcon_kv_store.pids
+        done
+        for ((si=0; si<STORE_COUNT; si++)); do
+            local p=$((KV_STORE_BRPC_PORT + si))
+            if ! wait_for_listen_tcp "$p" 45; then
+                log_error "falcon_kv_store did not listen on TCP port $p within 45s"
+                exit 1
+            fi
+        done
+        echo "export FALCON_KV_STORE_BRPC_ENDPOINT=127.0.0.1:${KV_STORE_BRPC_PORT}" > /tmp/falcon_kv_store_env.sh
+        log_info "Started STORE_COUNT=${STORE_COUNT} falcon_kv_store (FALCON_KV_STORE_BRPC_ENDPOINT=127.0.0.1:${KV_STORE_BRPC_PORT})"
+    fi
     
     # 10. Start Client1 and Client2 with full cluster view
     # Note: Both clients will attempt to connect to each other in cluster_view
@@ -454,7 +718,7 @@ EOF
 }
 EOF
     
-    nohup env CONFIG_FILE=/tmp/falcon_client1_config.json falcon_client "$CLIENT1_MNT" -f -o direct_io -o attr_timeout=200 -o entry_timeout=200 \
+    nohup env CONFIG_FILE=/tmp/falcon_client1_config.json "$FALCON_CLIENT_BIN" "$CLIENT1_MNT" -f -o direct_io -o attr_timeout=200 -o entry_timeout=200 \
         -brpc true -rpc_endpoint="0.0.0.0:${CLIENT1_RPC_PORT}" \
         -socket_max_unwritten_bytes=268435456 > "$CLIENT1_LOG" 2>&1 &
     CLIENT1_PID=$!
@@ -501,11 +765,23 @@ EOF
     # Wait before starting Client2
     sleep 2
     
-    nohup env CONFIG_FILE=/tmp/falcon_client2_config.json falcon_client "$CLIENT2_MNT" -f -o direct_io -o attr_timeout=200 -o entry_timeout=200 \
+    nohup env CONFIG_FILE=/tmp/falcon_client2_config.json "$FALCON_CLIENT_BIN" "$CLIENT2_MNT" -f -o direct_io -o attr_timeout=200 -o entry_timeout=200 \
         -brpc true -rpc_endpoint="0.0.0.0:${CLIENT2_RPC_PORT}" \
         -socket_max_unwritten_bytes=268435456 > "$CLIENT2_LOG" 2>&1 &
     CLIENT2_PID=$!
     sleep 8
+
+    if ! wait_for_fuse_mount "$CLIENT1_MNT" 90; then
+        log_error "Client1 FUSE mount did not appear at $CLIENT1_MNT within 90s (pid=$CLIENT1_PID)"
+        tail -80 "$CLIENT1_LOG" 2>/dev/null || true
+        exit 1
+    fi
+    if ! wait_for_fuse_mount "$CLIENT2_MNT" 90; then
+        log_error "Client2 FUSE mount did not appear at $CLIENT2_MNT within 90s (pid=$CLIENT2_PID)"
+        tail -80 "$CLIENT2_LOG" 2>/dev/null || true
+        exit 1
+    fi
+    log_info "FUSE mounts verified: $CLIENT1_MNT $CLIENT2_MNT"
     
     # 12. Verify cluster status
     echo ""
@@ -517,6 +793,9 @@ EOF
     log_info "  CN (Coordinator): 127.0.0.1:$CN_PORT (Pooler: $CN_POOLER_PORT)"
     log_info "  DN1 (Worker):     127.0.0.1:$DN1_PORT (Pooler: $DN1_POOLER_PORT)"
     log_info "  DN2 (Worker):     127.0.0.1:$DN2_PORT (Pooler: $DN2_POOLER_PORT)"
+    if kv_three_dns_enabled; then
+        log_info "  DN3 (Worker):     127.0.0.1:$DN3_PORT (Pooler: $DN3_POOLER_PORT)"
+    fi
     log_info "  Client1:          Mount: $CLIENT1_MNT (RPC: $CLIENT1_RPC_PORT)"
     log_info "  Client2:          Mount: $CLIENT2_MNT (RPC: $CLIENT2_RPC_PORT)"
     echo ""
@@ -543,6 +822,31 @@ EOF
 
 stop_all() {
     log_step "Stopping FalconFS cluster..."
+
+    if [ -f /tmp/falcon_kv_store.pids ]; then
+        log_step "Stopping falcon_kv_store daemon(s)..."
+        while read -r pid; do
+            if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+                kill -TERM "${pid}" 2>/dev/null || true
+            fi
+        done < /tmp/falcon_kv_store.pids
+        sleep 1
+        while read -r pid; do
+            if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+                kill -KILL "${pid}" 2>/dev/null || true
+            fi
+        done < /tmp/falcon_kv_store.pids
+        rm -f /tmp/falcon_kv_store.pids
+    fi
+    pkill -TERM falcon_kv_store 2>/dev/null || true
+    sleep 1
+    pkill -KILL falcon_kv_store 2>/dev/null || true
+    KV_STORE_BRPC_PORT="${KV_STORE_BRPC_PORT:-18765}"
+    STORE_COUNT="${STORE_COUNT:-1}"
+    for ((si=0; si<STORE_COUNT; si++)); do
+        kill_listener_on_port "$((KV_STORE_BRPC_PORT + si))" "KV store BRPC" || true
+    done
+    rm -f /tmp/falcon_kv_store_env.sh
     
     # Stop Clients (unmount FUSE)
     for mnt in "$CLIENT1_MNT" "$CLIENT2_MNT"; do
@@ -558,12 +862,15 @@ stop_all() {
     stop_pg_node "CN" "$META_DB_DIR/coordinator0" || true
     stop_pg_node "DN1" "$META_DB_DIR/worker0" || true
     stop_pg_node "DN2" "$META_DB_DIR/worker1" || true
+    stop_pg_node "DN3" "$META_DB_DIR/worker2" || true
     kill_listener_on_port "$CN_PORT" "CN SQL" || true
     kill_listener_on_port "$CN_POOLER_PORT" "CN pooler" || true
     kill_listener_on_port "$DN1_PORT" "DN1 SQL" || true
     kill_listener_on_port "$DN1_POOLER_PORT" "DN1 pooler" || true
     kill_listener_on_port "$DN2_PORT" "DN2 SQL" || true
     kill_listener_on_port "$DN2_POOLER_PORT" "DN2 pooler" || true
+    kill_listener_on_port "$DN3_PORT" "DN3 SQL" || true
+    kill_listener_on_port "$DN3_POOLER_PORT" "DN3 pooler" || true
     
     sleep 2
     log_info "All services stopped"
@@ -598,6 +905,14 @@ show_status() {
     else
         log_error "DN2 not running"
     fi
+
+    if kv_three_dns_enabled; then
+        if pg_ctl status -D "$META_DB_DIR/worker2" >/dev/null 2>&1; then
+            log_info "DN3 (Worker) running (port: $DN3_PORT)"
+        else
+            log_error "DN3 not running"
+        fi
+    fi
     echo ""
     
     # Client status
@@ -617,7 +932,11 @@ show_status() {
     
     # Port listening
     echo "【Port Listening】"
-    ss -tuln 2>/dev/null | grep -E "(${CN_PORT}|${DN1_PORT}|${DN2_PORT}|${CLIENT1_RPC_PORT}|${CLIENT2_RPC_PORT})" || \
+    local port_grep="${CN_PORT}|${DN1_PORT}|${DN2_PORT}|${CLIENT1_RPC_PORT}|${CLIENT2_RPC_PORT}"
+    if kv_three_dns_enabled; then
+        port_grep="${port_grep}|${DN3_PORT}|${DN3_POOLER_PORT}"
+    fi
+    ss -tuln 2>/dev/null | grep -E "(${port_grep})" || \
         log_warn "Cannot check port status"
 }
 
@@ -730,7 +1049,10 @@ run_kv_meta_stress_test() {
         (cd "$PROJECT_DIR/build" && ninja FalconKVMetadataStressE2E)
     fi
 
-    local endpoints=("127.0.0.1:$DN1_POOLER_PORT" "127.0.0.1:$DN2_POOLER_PORT" "127.0.0.1:$CN_POOLER_PORT")
+    local endpoints=("127.0.0.1:$DN1_POOLER_PORT" "127.0.0.1:$DN2_POOLER_PORT")
+    if kv_three_dns_enabled; then
+        endpoints+=("127.0.0.1:$DN3_POOLER_PORT")
+    fi
     local rc=0
     for ep in "${endpoints[@]}"; do
         log_step "  KV stress sweep on $ep"
@@ -745,7 +1067,11 @@ run_kv_meta_stress_test() {
     # stress test uses block hashes prefixed with "stress_" so we only count
     # those.
     local cleanup_rc=0
-    for port in "$DN1_PORT" "$DN2_PORT"; do
+    local stress_ports=( "$DN1_PORT" "$DN2_PORT" )
+    if kv_three_dns_enabled; then
+        stress_ports+=( "$DN3_PORT" )
+    fi
+    for port in "${stress_ports[@]}"; do
         local rows
         rows=$(psql -d postgres -h 127.0.0.1 -p "$port" -tAXc \
             "SELECT count(*) FROM pg_catalog.falcon_kvblock_table WHERE block_hash LIKE 'stress_%';" 2>/dev/null \
@@ -810,6 +1136,12 @@ run_kv_cluster_fault_test() {
         log_step "  [T4] FAILED"; rc=1
     fi
 
+    # T8 partial store write cleanup (v6.5 P8).
+    log_step "  [T8] partial store write cleanup"
+    if ! "$fault_bin" --scenario=partial-store-write --endpoint "127.0.0.1:$DN1_POOLER_PORT"; then
+        log_step "  [T8] FAILED"; rc=1
+    fi
+
     # T5 eviction rollback (§19.4 #5). Spill always fails (no SSD root
     # configured); the eviction worker must roll the row back to STORED.
     log_step "  [T5] eviction rollback"
@@ -836,6 +1168,64 @@ run_kv_cluster_fault_test() {
             # Give the in-plugin recovery runner a moment to bump dn_epoch
             # and rehydrate the engine before BRPC clients hit it.
             sleep 3
+            # v6.5 P2: falcon_kv_store registers DRAM with each DN; after a DN PG
+            # restart the metadata engine is empty until RegisterStoreRegion runs
+            # again — recycle the store daemon so phase2 sees a healthy region.
+            if [ "${STORE_COUNT:-1}" -gt 0 ]; then
+                log_step "  [T3] restarting falcon_kv_store daemon(s) for fresh DN1 region registration"
+                if [ -f /tmp/falcon_kv_store.pids ]; then
+                    while read -r pid; do
+                        if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+                            kill -TERM "${pid}" 2>/dev/null || true
+                        fi
+                    done < /tmp/falcon_kv_store.pids
+                fi
+                rm -f /tmp/falcon_kv_store.pids
+                pkill -TERM falcon_kv_store 2>/dev/null || true
+                sleep 2
+                local kv_store_bin="$PROJECT_DIR/build/vllm_kv_cache/falcon_kv_store"
+                local base="${KV_STORE_BRPC_PORT:-18765}"
+                local sc="${STORE_COUNT:-1}"
+                local si pfree
+                for ((si = 0; si < sc; si++)); do
+                    pfree=$((base + si))
+                    if ! wait_for_tcp_port_free "$pfree" 40; then
+                        log_warn "  [T3] KV store port $pfree still busy after SIGTERM; SIGKILL falcon_kv_store"
+                        pkill -KILL falcon_kv_store 2>/dev/null || true
+                        sleep 2
+                        wait_for_tcp_port_free "$pfree" 15 || true
+                    fi
+                done
+                for ((si = 0; si < sc; si++)); do
+                    local nid=$((si + 1))
+                    mkdir -p "/tmp/falcon_kv_store_runtime/n${nid}" 2>/dev/null || true
+                done
+                local store_poolers
+                store_poolers="$(kv_store_poolers_csv)"
+                for ((si = 0; si < sc; si++)); do
+                    local p=$((base + si))
+                    local node_id=$((si + 1))
+                    local env_prefix=()
+                    if kv_three_dns_enabled; then
+                        env_prefix+=(NODE_NAME="v65mix${si}")
+                    fi
+                    nohup env "${env_prefix[@]}" FALCON_KV_STORE_CN_PGPORT="$CN_PORT" \
+                        FALCON_KV_STORE_BRPC_PORT="$p" \
+                        FALCON_KV_STORE_DN_POOLERS="$store_poolers" \
+                        FALCON_KV_STORE_NODE_ID="$node_id" \
+                        FALCON_KV_STORE_ADVERTISE_HOST="127.0.0.1" \
+                        FALCON_KV_STORE_SHM_NAME="falcon_kv_store_heap_${node_id}" \
+                        FALCON_KV_STORE_RUNTIME_DIR="/tmp/falcon_kv_store_runtime/n${node_id}" \
+                        "$kv_store_bin" >>"/tmp/falcon_kv_store_${si}.log" 2>&1 &
+                    echo $! >> /tmp/falcon_kv_store.pids
+                done
+                for ((si = 0; si < sc; si++)); do
+                    local p=$((base + si))
+                    if ! wait_for_listen_tcp "$p" 45; then
+                        log_step "  [T3] falcon_kv_store did not listen on $p after recycle"; rc=1
+                    fi
+                done
+            fi
             if ! "$fault_bin" --scenario=dn-restart-phase2 --endpoint "127.0.0.1:$DN1_POOLER_PORT" \
                  --state-file "$state_file"; then
                 log_step "  [T3] FAILED at phase 2"; rc=1
@@ -847,17 +1237,78 @@ run_kv_cluster_fault_test() {
     # Best-effort post-drill catalog cleanup (some tests intentionally leak
     # rows that they then force-free; eviction-rollback's cleanup may also
     # have raced an eviction cycle on the same row).
-    for port in "$DN1_PORT" "$DN2_PORT"; do
+    local fault_del_ports=( "$DN1_PORT" "$DN2_PORT" )
+    if kv_three_dns_enabled; then
+        fault_del_ports+=( "$DN3_PORT" )
+    fi
+    for port in "${fault_del_ports[@]}"; do
         psql -d postgres -h 127.0.0.1 -p "$port" \
             -c "DELETE FROM pg_catalog.falcon_kvblock_table WHERE block_hash::text LIKE '\\\\x6661756c745f%';" \
             >/dev/null 2>&1 || true
     done
+
+    if ! mirror_kv_dn_membership_rows_to_cn; then
+        log_step "CN falcon_dn_node re-mirror after fault drill failed"
+        rc=1
+    fi
 
     if [ "$rc" -ne 0 ]; then
         log_step "KV cluster fault tests FAILED"
         return 1
     fi
     log_info "KV cluster fault tests passed"
+}
+
+# ============================================================================
+# KV Cluster Failover Drill (v6.5 P6)
+# ============================================================================
+# Exercises CM-style endpoint switchover SQL and verifies fault drill still
+# passes after endpoint rewrite + restore.
+run_kv_cluster_failover_test() {
+    log_step "Running FalconFS KV cluster failover drill (foreign_server + dn endpoint update)..."
+
+    local rc=0
+
+    # Save current DN1 endpoint.
+    local old_host old_port old_kv_port
+    old_host=$(psql -d postgres -h 127.0.0.1 -p "$CN_PORT" -tAXc \
+        "SELECT host FROM pg_catalog.falcon_foreign_server WHERE server_id=1;" 2>/dev/null || echo "127.0.0.1")
+    old_port=$(psql -d postgres -h 127.0.0.1 -p "$CN_PORT" -tAXc \
+        "SELECT port FROM pg_catalog.falcon_foreign_server WHERE server_id=1;" 2>/dev/null || echo "$DN1_PORT")
+    old_kv_port=$(psql -d postgres -h 127.0.0.1 -p "$CN_PORT" -tAXc \
+        "SELECT kv_brpc_port FROM pg_catalog.falcon_dn_node WHERE server_id=1;" 2>/dev/null || echo "$DN1_POOLER_PORT")
+
+    log_step "  failover step: DN1 -> DN2 endpoint"
+    if ! psql -v ON_ERROR_STOP=1 -d postgres -h 127.0.0.1 -p "$CN_PORT" -c \
+        "SELECT pg_catalog.falcon_update_foreign_server(1, '127.0.0.1', $DN2_PORT);" >/dev/null; then
+        log_step "  failover SQL failed: falcon_update_foreign_server"; rc=1
+    fi
+    if ! psql -v ON_ERROR_STOP=1 -d postgres -h 127.0.0.1 -p "$CN_PORT" -c \
+        "SELECT pg_catalog.falcon_dn_node_update_endpoint(1, 'worker0', '127.0.0.1', $DN2_PORT, $DN2_POOLER_PORT);" >/dev/null; then
+        log_step "  failover SQL failed: falcon_dn_node_update_endpoint"; rc=1
+    fi
+
+    # Restore to original endpoint.
+    log_step "  restore step: DN1 endpoint rollback"
+    if ! psql -v ON_ERROR_STOP=1 -d postgres -h 127.0.0.1 -p "$CN_PORT" -c \
+        "SELECT pg_catalog.falcon_update_foreign_server(1, '$old_host', $old_port);" >/dev/null; then
+        log_step "  restore SQL failed: falcon_update_foreign_server"; rc=1
+    fi
+    if ! psql -v ON_ERROR_STOP=1 -d postgres -h 127.0.0.1 -p "$CN_PORT" -c \
+        "SELECT pg_catalog.falcon_dn_node_update_endpoint(1, 'worker0', '$old_host', $old_port, $old_kv_port);" >/dev/null; then
+        log_step "  restore SQL failed: falcon_dn_node_update_endpoint"; rc=1
+    fi
+
+    # Reuse the existing cluster fault drill as post-failover retry validation.
+    if ! run_kv_cluster_fault_test; then
+        rc=1
+    fi
+
+    if [ "$rc" -ne 0 ]; then
+        log_step "KV cluster failover drill FAILED"
+        return 1
+    fi
+    log_info "KV cluster failover drill passed"
 }
 
 # ============================================================================
@@ -870,6 +1321,12 @@ run_kv_cluster_fault_test() {
 run_kv_cluster_test() {
     log_step "Running FalconFS KV distributed cluster test (§19.4 / M4)..."
 
+    local smoke_bin="$PROJECT_DIR/build/tests/falcon_kv/FalconKVP2SmokeE2E"
+    if [ ! -x "$smoke_bin" ]; then
+        log_step "P2 smoke binary missing; building it now..."
+        (cd "$PROJECT_DIR/build" && ninja FalconKVP2SmokeE2E)
+    fi
+
     local cluster_bin="$PROJECT_DIR/build/tests/falcon_kv/FalconKVClusterE2E"
     if [ ! -x "$cluster_bin" ]; then
         log_step "Cluster E2E binary missing; building it now..."
@@ -878,17 +1335,37 @@ run_kv_cluster_test() {
 
     local rc=0
 
-    log_step "  multi-DN sweep across DN1+DN2 (keys=64, iterations=2)"
-    if ! "$cluster_bin" \
-            --dn "127.0.0.1:$DN1_POOLER_PORT" \
-            --dn "127.0.0.1:$DN2_POOLER_PORT" \
-            --keys 64 --iterations 2; then
+    log_step "  P2 smoke: DN must not host KVDataService"
+    local smoke_dns=( "--dn" "127.0.0.1:$DN1_POOLER_PORT" "--dn" "127.0.0.1:$DN2_POOLER_PORT" )
+    local cluster_dns=( "--dn" "127.0.0.1:$DN1_POOLER_PORT" "--dn" "127.0.0.1:$DN2_POOLER_PORT" )
+    if kv_three_dns_enabled; then
+        smoke_dns+=( "--dn" "127.0.0.1:$DN3_POOLER_PORT" )
+        cluster_dns+=( "--dn" "127.0.0.1:$DN3_POOLER_PORT" )
+    fi
+    if ! "$smoke_bin" --mode=dn-no-kvdata "${smoke_dns[@]}"; then
+        log_step "  P2 smoke (dn-no-kvdata) FAILED"; rc=1
+    fi
+
+    local store_ep="${FALCON_KV_STORE_BRPC_ENDPOINT:-127.0.0.1:${KV_STORE_BRPC_PORT:-18765}}"
+    log_step "  P2 smoke: store round-trip (meta=DN1 pooler store=$store_ep)"
+    if ! "$smoke_bin" --mode=store-smoke \
+            --meta "127.0.0.1:$DN1_POOLER_PORT" \
+            --store "$store_ep"; then
+        log_step "  P2 smoke (store-smoke) FAILED"; rc=1
+    fi
+
+    log_step "  multi-DN sweep (keys=64, iterations=2)"
+    if ! "$cluster_bin" "${cluster_dns[@]}" --keys 64 --iterations 2; then
         log_step "  multi-DN sweep FAILED"; rc=1
     fi
 
     # Verify per-DN catalog cleanup: every test row has the prefix `cluster_`.
     local cleanup_rc=0
-    for port in "$DN1_PORT" "$DN2_PORT"; do
+    local catalog_ports=( "$DN1_PORT" "$DN2_PORT" )
+    if kv_three_dns_enabled; then
+        catalog_ports+=( "$DN3_PORT" )
+    fi
+    for port in "${catalog_ports[@]}"; do
         local rows
         rows=$(psql -d postgres -h 127.0.0.1 -p "$port" -tAXc \
             "SELECT count(*) FROM pg_catalog.falcon_kvblock_table WHERE encode(block_hash, 'escape') LIKE 'cluster_%';" \
@@ -909,11 +1386,81 @@ run_kv_cluster_test() {
 }
 
 # ============================================================================
+# KV mixed colocation drill (v6.5 §19.4.1 #4 — 1 CN + 3 DNs + 4 Stores + 4 Clients)
+# ============================================================================
+# Requires cluster started with KV_THREE_DNS=1 and STORE_COUNT>=4 (harness sets
+# NODE_NAME=v65mix{0..3} per store and three DN poolers per store process).
+run_kv_mixed_colocation_test() {
+    log_step "Running FalconFS KV mixed-colocation drill (v6.5 §19.4.1 #4)..."
+
+    if ! kv_three_dns_enabled; then
+        log_error "KV_THREE_DNS=1 is required (third DN + 3-region stores)"
+        return 1
+    fi
+    local count="${STORE_COUNT:-1}"
+    if [ "$count" -lt 4 ]; then
+        log_error "STORE_COUNT=$count; mixed drill needs STORE_COUNT>=4"
+        return 1
+    fi
+
+    local mix_bin="$PROJECT_DIR/build/tests/falcon_kv/FalconKVMixedColocationE2E"
+    if [ ! -x "$mix_bin" ]; then
+        log_step "Mixed-colocation E2E binary missing; building..."
+        (cd "$PROJECT_DIR/build" && ninja FalconKVMixedColocationE2E)
+    fi
+
+    local pguser="${USER:-postgres}"
+    local cninfo="hostaddr=127.0.0.1 port=${CN_PORT} user=${pguser} dbname=postgres application_name=FalconKVMixedColocationE2E"
+
+    if ! "$mix_bin" --cn-conninfo "$cninfo" \
+        --dn "127.0.0.1:$DN1_POOLER_PORT" \
+        --dn "127.0.0.1:$DN2_POOLER_PORT" \
+        --dn "127.0.0.1:$DN3_POOLER_PORT" \
+        --keys-per-phase 220 --timeout-ms 45000; then
+        log_step "KV mixed colocation drill FAILED"
+        return 1
+    fi
+    log_info "KV mixed colocation drill passed"
+}
+
+run_kv_topology_test() {
+    log_step "Running FalconFS KV topology test (multi-store daemon topology)..."
+    local count="${STORE_COUNT:-1}"
+    if [ "$count" -lt 2 ]; then
+        log_warn "STORE_COUNT=$count; set STORE_COUNT>=2 for full topology coverage"
+    fi
+
+    local port_base="${KV_STORE_BRPC_PORT:-18765}"
+    for ((si=0; si<count; si++)); do
+        local p=$((port_base + si))
+        if ! wait_for_listen_tcp "$p" 3; then
+            log_step "  topology check failed: store daemon not listening on $p"
+            return 1
+        fi
+    done
+    run_kv_cluster_test
+}
+
+run_kv_cluster_promote_test() {
+    log_step "Running FalconFS KV promote-on-read tests..."
+    export PYTHONPATH="$PROJECT_DIR/vllm_kv_cache/python:${PYTHONPATH:-}"
+    python3 "$PROJECT_DIR/vllm_kv_cache/test/test_promote_on_read.py"
+
+    local ut_bin="$PROJECT_DIR/build/tests/falcon_kv/FalconKVPrimitivesUT"
+    if [ ! -x "$ut_bin" ]; then
+        log_step "KV unit binary missing; building it now..."
+        (cd "$PROJECT_DIR/build" && ninja FalconKVPrimitivesUT)
+    fi
+    "$ut_bin" --gtest_filter=KvPromoteFromEvicted.*
+    log_info "KV promote-on-read tests passed"
+}
+
+# ============================================================================
 # Main Entry
 # ============================================================================
 
 usage() {
-    echo "Usage: $0 {build|start|stop|restart|status|test|kv-test|kv-fault-test|kv-meta-stress-test|kv-cluster-test|kv-cluster-fault-test}"
+    echo "Usage: $0 {build|start|stop|restart|status|test|kv-test|kv-fault-test|kv-meta-stress-test|kv-cluster-test|kv-cluster-fault-test|kv-cluster-failover-test|kv-mixed-colocation-test|kv-topology-test|kv-cluster-promote-test}"
     echo ""
     echo "Commands:"
     echo "  build   - Build and install FalconFS"
@@ -927,6 +1474,10 @@ usage() {
     echo "  kv-meta-stress-test - Run KV metadata end-to-end stress tests against the running cluster"
     echo "  kv-cluster-test - Run KV multi-DN distributed test (allocate/write/update/lookup/free across DN1+DN2)"
     echo "  kv-cluster-fault-test - Run KV cluster fault drill (DN restart, eviction rollback, large batch, stale store_epoch)"
+    echo "  kv-cluster-failover-test - Run failover SQL drill + fault regression"
+    echo "  kv-mixed-colocation-test - v6.5 §19.4.1 #4 affinity+fallback (needs KV_THREE_DNS=1, STORE_COUNT>=4)"
+    echo "  kv-topology-test - Run KV topology checks for multi-store daemon setup"
+    echo "  kv-cluster-promote-test - Run promote-from-evicted unit/integration checks"
     exit 1
 }
 
@@ -962,6 +1513,18 @@ case "${1:-}" in
         ;;
     kv-cluster-fault-test)
         run_kv_cluster_fault_test
+        ;;
+    kv-cluster-failover-test)
+        run_kv_cluster_failover_test
+        ;;
+    kv-topology-test)
+        run_kv_topology_test
+        ;;
+    kv-mixed-colocation-test)
+        run_kv_mixed_colocation_test
+        ;;
+    kv-cluster-promote-test)
+        run_kv_cluster_promote_test
         ;;
     kv-fault-test)
         run_kv_fault_test

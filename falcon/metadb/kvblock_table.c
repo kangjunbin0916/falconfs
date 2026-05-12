@@ -409,6 +409,78 @@ void FalconKVBlockBatchDelete(const char *req_buf, uint64_t req_size,
 /*  Recovery scan + dn_epoch (v6 \u00a715.1, \u00a715.4)                                */
 /* ------------------------------------------------------------------------ */
 
+void FalconKVBlockBatchPromoteFromEvicted(const char *req_buf, uint64_t req_size,
+                                          char *resp_buf, uint64_t resp_size)
+{
+    if (req_size < sizeof(uint32_t) || resp_size < sizeof(uint32_t))
+        FALCON_ELOG_ERROR(ARGUMENT_ERROR, "kvblock promote: buffer too small");
+    uint32_t count = 0;
+    memcpy(&count, req_buf, sizeof(uint32_t));
+    const uint64_t expect_req = sizeof(uint32_t) + (uint64_t) count * sizeof(KVCatalogPromoteItem);
+    const uint64_t expect_resp = KVCatalogResponseSize(KV_CATALOG_METHOD_PROMOTE_FROM_EVICTED, count);
+    if (req_size < expect_req || resp_size < expect_resp)
+        FALCON_ELOG_ERROR(ARGUMENT_ERROR, "kvblock promote: count/size mismatch");
+    memcpy(resp_buf, &count, sizeof(uint32_t));
+    if (count == 0)
+        return;
+
+    const KVCatalogPromoteItem *items =
+        (const KVCatalogPromoteItem *)(req_buf + sizeof(uint32_t));
+    KVCatalogPromoteResult *results =
+        (KVCatalogPromoteResult *)(resp_buf + sizeof(uint32_t));
+    memset(results, 0, (size_t) count * sizeof(KVCatalogPromoteResult));
+
+    Relation rel = table_open(KvblockRelationId(), RowExclusiveLock);
+    CatalogIndexState istate = CatalogOpenIndexes(rel);
+    TupleDesc tupdesc = RelationGetDescr(rel);
+
+    for (uint32_t i = 0; i < count; ++i) {
+        Datum datums[Natts_falcon_kvblock_table];
+        bool  isnulls[Natts_falcon_kvblock_table];
+        memset(isnulls, 0, sizeof(isnulls));
+        HeapTuple cur = NULL;
+        bool found = FetchRowByHash(rel, items[i].block_hash, items[i].block_hash_len,
+                                    &cur, datums, isnulls);
+        if (!found) {
+            continue;
+        }
+        int32 cur_status = (int32) DatumGetInt16(datums[Anum_falcon_kvblock_table_status - 1]);
+        int64 cur_version = DatumGetInt64(datums[Anum_falcon_kvblock_table_version - 1]);
+        if (cur_status != KV_CATALOG_STATUS_EVICTED ||
+            (items[i].expected_version > 0 && cur_version != items[i].expected_version)) {
+            heap_freetuple(cur);
+            continue;
+        }
+
+        Datum new_d[Natts_falcon_kvblock_table];
+        bool  new_n[Natts_falcon_kvblock_table];
+        bool  rep[Natts_falcon_kvblock_table];
+        memset(rep, 0, sizeof(rep));
+        memset(new_n, 0, sizeof(new_n));
+        new_d[Anum_falcon_kvblock_table_status - 1]        = Int16GetDatum((int16) KV_CATALOG_STATUS_ALLOCATED);
+        rep[Anum_falcon_kvblock_table_status - 1]          = true;
+        new_d[Anum_falcon_kvblock_table_store_node_id - 1] = Int32GetDatum(items[i].store_node_id);
+        rep[Anum_falcon_kvblock_table_store_node_id - 1]   = true;
+        new_d[Anum_falcon_kvblock_table_pool_offset - 1]   = Int64GetDatum(items[i].pool_offset);
+        rep[Anum_falcon_kvblock_table_pool_offset - 1]     = true;
+        rep[Anum_falcon_kvblock_table_evicted_path - 1]    = true;
+        new_n[Anum_falcon_kvblock_table_evicted_path - 1]  = true;
+        new_d[Anum_falcon_kvblock_table_version - 1]       = Int64GetDatum(cur_version + 1);
+        rep[Anum_falcon_kvblock_table_version - 1]         = true;
+        new_d[Anum_falcon_kvblock_table_updated_at_ms - 1] = Int64GetDatum(items[i].now_ms);
+        rep[Anum_falcon_kvblock_table_updated_at_ms - 1]   = true;
+        HeapTuple updated = heap_modify_tuple(cur, tupdesc, new_d, new_n, rep);
+        CatalogTupleUpdateWithInfo(rel, &cur->t_self, updated, istate);
+        heap_freetuple(updated);
+        heap_freetuple(cur);
+        results[i].promoted = 1;
+        results[i].new_version = cur_version + 1;
+    }
+    CommandCounterIncrement();
+    CatalogCloseIndexes(istate);
+    table_close(rel, RowExclusiveLock);
+}
+
 uint32_t FalconKVBlockScanForRecovery(KVCatalogRecoveryRow *out_rows,
                                       uint32_t out_rows_capacity)
 {

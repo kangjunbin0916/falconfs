@@ -98,6 +98,7 @@ struct Config {
     int iterations = 1;
     int threads = 4;
     int timeout_ms = 30000;
+    std::string shm_runtime_dir;
     std::string run_prefix;
 };
 
@@ -324,7 +325,8 @@ void PrintUsage(const char* argv0) {
         "  --keys N              Total keys generated per iteration (default 64).\n"
         "  --iterations N        Number of full alloc->free sweeps (default 1).\n"
         "  --threads N           [reserved] currently ignored; sequential phases.\n"
-        "  --timeout-ms MS       Per-RPC timeout (default 30000).\n";
+        "  --timeout-ms MS       Per-RPC timeout (default 30000).\n"
+        "  --shm-runtime-dir DIR Optional v6.5 P4 hint for local SHM runtime (logged only).\n";
 }
 
 }  // namespace
@@ -348,6 +350,8 @@ int main(int argc, char** argv) {
             cfg.threads = std::atoi(argv[++i]);
         } else if (a == "--timeout-ms" && i + 1 < argc) {
             cfg.timeout_ms = std::atoi(argv[++i]);
+        } else if (a == "--shm-runtime-dir" && i + 1 < argc) {
+            cfg.shm_runtime_dir = argv[++i];
         } else {
             PrintUsage(argv[0]);
             return Fail("unknown arg: " + a);
@@ -366,7 +370,11 @@ int main(int argc, char** argv) {
     std::cout << "CLUSTER_E2E_BEGIN endpoints=" << cfg.endpoints.size()
               << " keys=" << cfg.total_keys
               << " iterations=" << cfg.iterations
-              << " run_prefix=" << cfg.run_prefix << std::endl;
+              << " run_prefix=" << cfg.run_prefix;
+    if (!cfg.shm_runtime_dir.empty()) {
+        std::cout << " shm_runtime_dir=" << cfg.shm_runtime_dir;
+    }
+    std::cout << std::endl;
 
     const auto t0 = std::chrono::steady_clock::now();
     for (int it = 0; it < cfg.iterations; ++it) {

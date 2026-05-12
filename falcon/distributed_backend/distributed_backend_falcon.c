@@ -8,6 +8,7 @@
 
 #include "metadb/inode_table.h"
 #include "metadb/kvblock_table.h"
+#include "metadb/kv_membership.h"
 #include "metadb/shard_table.h"
 #include "metadb/xattr_table.h"
 #include "utils/error_log.h"
@@ -233,24 +234,26 @@ void FalconCreateKvblockTable()
 {
     /* v6.4 \u00a73.1: one falcon_kvblock_table per DN; not sharded by range_point.
      * Skip if already created. */
-    if (CheckIfRelationExists(KvblockTableName, PG_CATALOG_NAMESPACE))
-        return;
+    if (!CheckIfRelationExists(KvblockTableName, PG_CATALOG_NAMESPACE)) {
+        StringInfo toExecCommand = makeStringInfo();
+        ConstructCreateKvblockTableCommand(toExecCommand, KvblockTableName);
 
-    StringInfo toExecCommand = makeStringInfo();
-    ConstructCreateKvblockTableCommand(toExecCommand, KvblockTableName);
+        int spiConnectionResult = SPI_connect();
+        if (spiConnectionResult != SPI_OK_CONNECT) {
+            SPI_finish();
+            FALCON_ELOG_ERROR(PROGRAM_ERROR, "could not connect to SPI manager.");
+        }
 
-    int spiConnectionResult = SPI_connect();
-    if (spiConnectionResult != SPI_OK_CONNECT) {
+        int spiQueryResult = SPI_execute(toExecCommand->data, false, 0);
+        if (spiQueryResult != SPI_OK_UTILITY) {
+            SPI_finish();
+            FALCON_ELOG_ERROR(PROGRAM_ERROR, "spi exec failed.");
+        }
         SPI_finish();
-        FALCON_ELOG_ERROR(PROGRAM_ERROR, "could not connect to SPI manager.");
     }
 
-    int spiQueryResult = SPI_execute(toExecCommand->data, false, 0);
-    if (spiQueryResult != SPI_OK_UTILITY) {
-        SPI_finish();
-        FALCON_ELOG_ERROR(PROGRAM_ERROR, "spi exec failed.");
-    }
-    SPI_finish();
+    /* v6.5: CN membership tables (idempotent); safe after kvblock exists. */
+    FalconCreateKvMembershipTables();
 }
 
 void FalconPrepareCommands()

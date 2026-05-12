@@ -49,6 +49,11 @@ public:
     // Synchronous: returns once the engine state is fully repopulated.
     KVRecoveryStats Run();
 
+    // Replays SCAN_FOR_RECOVERY only (no dn_epoch bump). Used after the first
+    // `RegisterStoreRegion` so rows that were parked before any region existed
+    // are applied to DRAM (v6.5 P1).
+    KVRecoveryStats ReplayRecoverOnly();
+
 private:
     std::shared_ptr<::falconfs::kv::KVMetadataEngine> engine_;
     int pg_port_;

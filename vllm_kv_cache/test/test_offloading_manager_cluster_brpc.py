@@ -10,8 +10,9 @@ import socket
 import sys
 import time
 import unittest
+import os
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
@@ -19,6 +20,7 @@ sys.path.insert(0, str(ROOT / "python"))
 
 DN1_ENDPOINT = "127.0.0.1:55530"
 DN2_ENDPOINT = "127.0.0.1:55550"
+CN_SQL_ENDPOINT = "127.0.0.1:55500"
 
 
 def _can_reach(endpoint: str, timeout_s: float = 1.0) -> bool:
@@ -35,23 +37,28 @@ def _all_endpoints_reachable(endpoints) -> bool:
 
 
 @unittest.skipUnless(
-    _all_endpoints_reachable([DN1_ENDPOINT, DN2_ENDPOINT]),
+    _all_endpoints_reachable([CN_SQL_ENDPOINT, DN1_ENDPOINT, DN2_ENDPOINT]),
     "Cluster not reachable; run scripts/falcon_distributed_test.sh start first",
 )
 class OffloadingManagerClusterBrpcTest(unittest.TestCase):
     def setUp(self):
         from falconfs_kv.offloading_manager import FalconFSOffloadingManager  # noqa: WPS433
-        self.shard_table: Dict[int, str] = {1: DN1_ENDPOINT, 2: DN2_ENDPOINT}
+        self.cn_conninfo = os.environ.get(
+            "FALCON_KV_CN_CONNINFO",
+            f"host=127.0.0.1 port=55500 dbname=postgres user={os.environ.get('USER', 'postgres')}",
+        )
         # Unique per-test prefix so re-runs do not collide with leftover rows.
         self._prefix = f"py_omcb_{int(time.time() * 1000)}_{id(self)}"
         self.mgr = FalconFSOffloadingManager(
-            shard_table=self.shard_table,
             client_id=4242,
             client_hostname="py-cluster-test",
             mode="cluster",
             block_size=65536,
             timeout_ms=10000,
+            cn_conninfo=self.cn_conninfo,
         )
+        self.shard_table = dict(self.mgr.shard_table)
+        self.assertTrue(self.shard_table)
 
     def _key(self, name: str) -> str:
         return f"{self._prefix}_{name}"
@@ -118,6 +125,14 @@ class OffloadingManagerClusterBrpcTest(unittest.TestCase):
         # Sanity: every grouping bucket maps to one of the configured DNs.
         for dn_id in grouping.keys():
             self.assertIn(dn_id, self.shard_table)
+
+    def test_refresh_membership_cn_discovery(self):
+        stats = self.mgr.refresh_membership(timeout_ms=1000)
+        self.assertEqual(len(stats), 3)
+        self.assertGreaterEqual(stats[0], 1)  # num_dns
+        discovered = self.mgr.shard_table
+        self.assertTrue(discovered)
+        self.assertTrue(any(ep in discovered.values() for ep in (DN1_ENDPOINT, DN2_ENDPOINT)))
 
     def test_complete_store_failure_path_frees_allocations(self):
         keys = [self._key(f"fail{i}") for i in range(3)]

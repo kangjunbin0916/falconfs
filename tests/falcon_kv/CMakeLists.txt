@@ -2,6 +2,12 @@ include(GoogleTest)
 
 enable_testing()
 
+execute_process(
+    COMMAND pg_config --libdir
+    OUTPUT_VARIABLE FALCON_KV_TEST_PG_LIBDIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+
 # ==================== FalconKVPrimitivesUT =================
 add_executable(FalconKVPrimitivesUT
     ${PROJECT_SOURCE_DIR}/tests/falcon_kv/test_bitmap_allocator.cpp
@@ -20,11 +26,24 @@ add_executable(FalconKVPrimitivesUT
     ${PROJECT_SOURCE_DIR}/tests/falcon_kv/test_kv_meta_table_accessor.cpp
     ${PROJECT_SOURCE_DIR}/tests/falcon_kv/test_kv_metadata_recovery.cpp
     ${PROJECT_SOURCE_DIR}/tests/falcon_kv/test_eviction_coordinator.cpp
+    ${PROJECT_SOURCE_DIR}/tests/falcon_kv/test_dn_node_register.cpp
+    ${PROJECT_SOURCE_DIR}/tests/falcon_kv/test_falcon_kv_store_smoke.cpp
+    ${PROJECT_SOURCE_DIR}/tests/falcon_kv/test_dn_metadata_only.cpp
+    ${PROJECT_SOURCE_DIR}/tests/falcon_kv/test_kv_eviction_worker_brpc.cpp
+    ${PROJECT_SOURCE_DIR}/tests/falcon_kv/test_kv_watchdog.cpp
+    ${PROJECT_SOURCE_DIR}/tests/falcon_kv/test_kv_store_facade.cpp
+    ${PROJECT_SOURCE_DIR}/tests/falcon_kv/test_membership_refresh_diff.cpp
+    ${PROJECT_SOURCE_DIR}/tests/falcon_kv/test_membership_refresh_rate_limit.cpp
+    ${PROJECT_SOURCE_DIR}/tests/falcon_kv/test_dn_failover_retry_policy.cpp
+    ${PROJECT_SOURCE_DIR}/tests/falcon_kv/test_kv_promote_from_evicted.cpp
 )
 
 target_include_directories(FalconKVPrimitivesUT PRIVATE
     ${FALCON_KV_INCLUDE_DIRS}
 )
+if(FALCON_KV_TEST_PG_LIBDIR)
+    target_link_directories(FalconKVPrimitivesUT PRIVATE "${FALCON_KV_TEST_PG_LIBDIR}")
+endif()
 
 target_link_libraries(FalconKVPrimitivesUT
     FalconKVCommon
@@ -32,12 +51,17 @@ target_link_libraries(FalconKVPrimitivesUT
     FalconKVDataService
     FalconKVBrpcServiceAdapters
     FalconKVProto
+    ${BRPC_LIBRARIES}
+    ${DYNAMIC_LIB}
+    pq
     gtest
     gtest_main
     pthread
 )
 
-gtest_discover_tests(FalconKVPrimitivesUT)
+gtest_discover_tests(FalconKVPrimitivesUT
+    PROPERTIES LABELS "kv-unit"
+)
 
 # ==================== FalconKVMetadataBrpcE2E =================
 add_executable(FalconKVMetadataBrpcE2E
@@ -126,5 +150,45 @@ target_link_libraries(FalconKVClusterE2E
     FalconKVProto
     ${BRPC_LIBRARIES}
     ${DYNAMIC_LIB}
+    pthread
+)
+
+# ==================== FalconKVP2SmokeE2E (v6.5 P2 cluster gate) ====================
+add_executable(FalconKVP2SmokeE2E
+    ${PROJECT_SOURCE_DIR}/tests/falcon_kv/kv_p2_smoke_e2e.cpp
+)
+
+target_include_directories(FalconKVP2SmokeE2E PRIVATE
+    ${FALCON_KV_INCLUDE_DIRS}
+)
+
+target_link_libraries(FalconKVP2SmokeE2E
+    FalconKVProto
+    ${BRPC_LIBRARIES}
+    ${DYNAMIC_LIB}
+    pthread
+)
+
+# ==================== FalconKVMixedColocationE2E (v6.5 §19.4.1 drill #4) =================
+# Four logical clients (NODE_NAME v65mix0..3), allocator affinity vs preferred_store_id,
+# fallback, and multi-DN routing. Requires harness: KV_THREE_DNS=1, STORE_COUNT=4.
+add_executable(FalconKVMixedColocationE2E
+    ${PROJECT_SOURCE_DIR}/tests/falcon_kv/kv_mixed_colocation_e2e.cpp
+)
+
+target_include_directories(FalconKVMixedColocationE2E PRIVATE
+    ${FALCON_KV_INCLUDE_DIRS}
+)
+
+if(FALCON_KV_TEST_PG_LIBDIR)
+    target_link_directories(FalconKVMixedColocationE2E PRIVATE "${FALCON_KV_TEST_PG_LIBDIR}")
+endif()
+
+target_link_libraries(FalconKVMixedColocationE2E
+    FalconKVBrpcServiceAdapters
+    FalconKVProto
+    ${BRPC_LIBRARIES}
+    ${DYNAMIC_LIB}
+    pq
     pthread
 )

@@ -43,6 +43,7 @@ typedef enum KVCatalogMethod {
     KV_CATALOG_METHOD_SCAN_FOR_RECOVERY = 5,
     KV_CATALOG_METHOD_LOAD_DN_EPOCH     = 6,
     KV_CATALOG_METHOD_BUMP_DN_EPOCH     = 7,
+    KV_CATALOG_METHOD_PROMOTE_FROM_EVICTED = 8,
 } KVCatalogMethod;
 
 /* BlockStatus mirror (v6.4 \u00a73.2). 0 must never be persisted. */
@@ -122,6 +123,24 @@ typedef struct __attribute__((packed)) KVCatalogDeleteResult {
     uint8_t  conflict;
 } KVCatalogDeleteResult;
 
+/* ---- Promote from Evicted ---------------------------------------------- */
+
+typedef struct __attribute__((packed)) KVCatalogPromoteItem {
+    uint16_t block_hash_len;
+    uint8_t  block_hash[KV_CATALOG_BLOCK_HASH_MAX_LEN];
+    int32_t  kv_group_idx;
+    int32_t  layer_mask;
+    int32_t  store_node_id;
+    int64_t  pool_offset;
+    int64_t  expected_version;  /* MUST match EVICTED row version */
+    int64_t  now_ms;
+} KVCatalogPromoteItem;
+
+typedef struct __attribute__((packed)) KVCatalogPromoteResult {
+    uint8_t  promoted;          /* 1 if EVICTED -> ALLOCATED succeeded */
+    int64_t  new_version;
+} KVCatalogPromoteResult;
+
 /* ---- Recovery: ScanForRecovery row layout ------------------------------ */
 /*
  * Recovery scan returns ALL rows in `falcon_kvblock_table` (regardless of
@@ -165,6 +184,8 @@ static inline uint64_t KVCatalogResponseSize(int method, uint32_t count)
             return header + (uint64_t) count * sizeof(KVCatalogCASResult);
         case KV_CATALOG_METHOD_DELETE:
             return header + (uint64_t) count * sizeof(KVCatalogDeleteResult);
+        case KV_CATALOG_METHOD_PROMOTE_FROM_EVICTED:
+            return header + (uint64_t) count * sizeof(KVCatalogPromoteResult);
         default:
             return 0;
     }

@@ -10,6 +10,8 @@
 //                              (kBatchOperationGroupSize=8).
 //   - stale-store-epoch: §19.4 #4  Renew with a deliberately-wrong store_epoch
 //                              expects STALE_EPOCH, retryable=true.
+//   - partial-store-write: v6.5 P8 partial write cleanup drill (half STORED,
+//                              half force-freed; verify lookup split).
 //   - eviction-rollback: §19.4 #5  Allocate + STORED a row; the cluster runs
 //                              the in-plugin eviction worker every
 //                              falcon_kv.eviction_period_ms, but the in-
@@ -155,6 +157,132 @@ int RunLargeBatch(const std::string& endpoint) {
     }
 
     std::cout << "LARGE_BATCH_OK N=" << N << " endpoint=" << endpoint << std::endl;
+    return 0;
+}
+
+// ─────────── partial-store-write (v6.5 P8) ───────────
+
+int RunPartialStoreWrite(const std::string& endpoint) {
+    using namespace falconfs::kv;
+    brpc::Channel channel;
+    if (!InitChannel(endpoint, 30000, &channel)) {
+        return Fail("partial-store-write: channel init failed");
+    }
+    KVMetadataService_Stub stub(&channel);
+
+    const int N = 8;
+    const int half = N / 2;
+    const std::string run_id = "fault_psw_" + std::to_string(NowNs());
+    std::vector<std::string> hashes;
+    hashes.reserve(N);
+    for (int i = 0; i < N; ++i) {
+        hashes.push_back(run_id + "_h" + std::to_string(i));
+    }
+
+    BatchAllocateRequest a;
+    a.mutable_meta()->set_request_id(run_id + "_alloc");
+    a.mutable_meta()->set_client_id(0);
+    for (const auto& h : hashes) {
+        auto* it = a.add_items();
+        it->set_block_hash(h);
+        it->set_block_size(kBlockSize);
+        it->set_preferred_store_id(1);
+        it->set_allow_fallback_store(true);
+    }
+    BatchAllocateResponse ar;
+    brpc::Controller acntl;
+    stub.BatchAllocateWithLease(&acntl, &a, &ar, nullptr);
+    if (acntl.Failed() || ar.results_size() != N) {
+        return Fail("partial-store-write: alloc failed");
+    }
+    for (int i = 0; i < N; ++i) {
+        if (!ar.results(i).result().success()) {
+            return Fail("partial-store-write: alloc item failed idx=" + std::to_string(i));
+        }
+    }
+
+    BatchUpdateStatusRequest u;
+    u.mutable_meta()->set_request_id(run_id + "_upd");
+    u.mutable_meta()->set_client_id(0);
+    for (int i = 0; i < half; ++i) {
+        auto* it = u.add_items();
+        it->set_block_hash(hashes[i]);
+        it->set_expected_from_status(BLOCK_STATUS_ALLOCATED);
+        it->set_to_status(BLOCK_STATUS_STORED);
+        it->set_expected_version(ar.results(i).version());
+    }
+    BatchUpdateStatusResponse ur;
+    brpc::Controller ucntl;
+    stub.BatchUpdateBlockStatus(&ucntl, &u, &ur, nullptr);
+    if (ucntl.Failed() || ur.results_size() != half) {
+        return Fail("partial-store-write: update failed");
+    }
+    for (int i = 0; i < half; ++i) {
+        if (!ur.results(i).result().success()) {
+            return Fail("partial-store-write: update item failed idx=" + std::to_string(i));
+        }
+    }
+
+    BatchFreeAllocatedRequest f;
+    f.mutable_meta()->set_request_id(run_id + "_free_failed");
+    f.mutable_meta()->set_client_id(0);
+    for (int i = half; i < N; ++i) {
+        auto* it = f.add_items();
+        it->set_block_hash(hashes[i]);
+        it->set_expected_version(ar.results(i).version());
+        it->set_force(true);
+    }
+    BatchFreeAllocatedResponse fr;
+    brpc::Controller fcntl;
+    stub.BatchFreeAllocated(&fcntl, &f, &fr, nullptr);
+    if (fcntl.Failed() || fr.results_size() != (N - half)) {
+        return Fail("partial-store-write: free failed");
+    }
+    for (int i = 0; i < fr.results_size(); ++i) {
+        if (!fr.results(i).result().success()) {
+            return Fail("partial-store-write: free item failed");
+        }
+    }
+
+    BatchLookupRequest l;
+    l.mutable_meta()->set_request_id(run_id + "_lookup");
+    for (const auto& h : hashes) {
+        auto* it = l.add_items();
+        it->set_block_hash(h);
+        it->set_renew_lease_on_hit(false);
+    }
+    BatchLookupResponse lr;
+    brpc::Controller lcntl;
+    stub.BatchLookupWithLease(&lcntl, &l, &lr, nullptr);
+    if (lcntl.Failed() || lr.results_size() != N) {
+        return Fail("partial-store-write: lookup failed");
+    }
+    for (int i = 0; i < half; ++i) {
+        if (!lr.results(i).result().success()) {
+            return Fail("partial-store-write: expected STORED hit for idx=" + std::to_string(i));
+        }
+    }
+    for (int i = half; i < N; ++i) {
+        if (lr.results(i).result().success()) {
+            return Fail("partial-store-write: expected miss for freed idx=" + std::to_string(i));
+        }
+    }
+
+    // Cleanup stored half.
+    BatchFreeAllocatedRequest f2;
+    f2.mutable_meta()->set_request_id(run_id + "_cleanup");
+    f2.mutable_meta()->set_client_id(0);
+    for (int i = 0; i < half; ++i) {
+        auto* it = f2.add_items();
+        it->set_block_hash(hashes[i]);
+        it->set_expected_version(ur.results(i).new_version());
+        it->set_force(true);
+    }
+    BatchFreeAllocatedResponse f2r;
+    brpc::Controller f2cntl;
+    stub.BatchFreeAllocated(&f2cntl, &f2, &f2r, nullptr);
+
+    std::cout << "PARTIAL_STORE_WRITE_OK N=" << N << " endpoint=" << endpoint << std::endl;
     return 0;
 }
 
@@ -516,6 +644,7 @@ void PrintUsage(const char* argv0) {
         "Usage: " << argv0 << " --scenario=<NAME> [options]\n"
         "Scenarios:\n"
         "  large-batch          --endpoint HOST:PORT\n"
+        "  partial-store-write  --endpoint HOST:PORT\n"
         "  stale-store-epoch    --endpoint HOST:PORT\n"
         "  eviction-rollback    --endpoint HOST:PORT [--wait-ms N]\n"
         "  dn-restart-phase1    --endpoint HOST:PORT --state-file PATH\n"
@@ -556,6 +685,7 @@ int main(int argc, char** argv) {
     }
 
     if (scenario == "large-batch") return RunLargeBatch(endpoint);
+    if (scenario == "partial-store-write") return RunPartialStoreWrite(endpoint);
     if (scenario == "stale-store-epoch") return RunStaleStoreEpoch(endpoint);
     if (scenario == "eviction-rollback") return RunEvictionRollback(endpoint, wait_ms);
     if (scenario == "dn-restart-phase1") return RunDnRestartPhase1(endpoint, state_file);

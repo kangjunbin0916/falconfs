@@ -14,6 +14,7 @@
 #include "tcop/utility.h"
 
 #include "connection_pool/falcon_connection_pool.h"
+#include "connection_pool/falcon_kv_config.h"
 #include "control/control_flag.h"
 #include "control/hook.h"
 #include "dir_path_shmem/dir_path_hash.h"
@@ -391,6 +392,85 @@ static void RegisterFalconConfigVariables(void)
                             FALCON_KV_EVICTION_CHUNK_DEFAULT,
                             1,
                             1024,
+                            PGC_SIGHUP,
+                            0,
+                            NULL,
+                            NULL,
+                            NULL);
+
+    DefineCustomStringVariable("falcon_kv.store_spill_endpoint",
+                               "BRPC host:port of falcon_kv_store for DN eviction spill (v6.5 P3). "
+                               "Empty disables remote spill.",
+                               NULL,
+                               &FalconKvStoreSpillEndpoint,
+                               "",
+                               PGC_SIGHUP,
+                               0,
+                               NULL,
+                               NULL,
+                               NULL);
+
+    DefineCustomIntVariable("falcon_kv.watchdog_period_ms",
+                            "KV membership watchdog tick period (ms) for falcon_dn_node / "
+                            "falcon_store_node stale-heartbeat checks (v6.5 P3).",
+                            NULL,
+                            &FalconKvWatchdogPeriodMs,
+                            FALCON_KV_WATCHDOG_PERIOD_MS_DEFAULT,
+                            100,
+                            600000,
+                            PGC_SIGHUP,
+                            0,
+                            NULL,
+                            NULL,
+                            NULL);
+
+    DefineCustomIntVariable("falcon_kv.watchdog_skew_ms",
+                            "Wall-clock skew (ms) beyond last_heartbeat_ms before watchdog marks "
+                            "membership rows unhealthy (v6.5 P3).",
+                            NULL,
+                            &FalconKvWatchdogSkewMs,
+                            FALCON_KV_WATCHDOG_SKEW_MS_DEFAULT,
+                            1000,
+                            86400000,
+                            PGC_SIGHUP,
+                            0,
+                            NULL,
+                            NULL,
+                            NULL);
+
+    DefineCustomIntVariable("falcon_kv.promote_enabled",
+                            "Enable best-effort promote-on-read for EVICTED blocks.",
+                            NULL,
+                            &FalconKvPromoteEnabled,
+                            FALCON_KV_PROMOTE_ENABLED_DEFAULT,
+                            0,
+                            1,
+                            PGC_SIGHUP,
+                            0,
+                            NULL,
+                            NULL,
+                            NULL);
+
+    DefineCustomIntVariable("falcon_kv.promote_queue_capacity",
+                            "Bounded promote-on-read queue capacity per DN process.",
+                            NULL,
+                            &FalconKvPromoteQueueCapacity,
+                            FALCON_KV_PROMOTE_QUEUE_CAPACITY_DEFAULT,
+                            1,
+                            65536,
+                            PGC_SIGHUP,
+                            0,
+                            NULL,
+                            NULL,
+                            NULL);
+
+    DefineCustomIntVariable("falcon_kv.promote_max_inflight",
+                            "Maximum in-flight promote-on-read operations per DN process.",
+                            NULL,
+                            &FalconKvPromoteMaxInflight,
+                            FALCON_KV_PROMOTE_MAX_INFLIGHT_DEFAULT,
+                            1,
+                            4096,
                             PGC_SIGHUP,
                             0,
                             NULL,

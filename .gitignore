@@ -9,6 +9,9 @@
 __pycache__
 tmp/
 
+# CTest metadata when runs leave artifacts at repo root (not the in-tree test suite).
+Testing/
+
 .cache
 compile_commands.json
 build

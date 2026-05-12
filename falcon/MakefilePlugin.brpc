@@ -27,7 +27,8 @@ KV_PROTO_OBJS = $(patsubst %.cc, %.o, $(KV_PROTO_SRC))
 
 KV_METADATA_SRC = $(wildcard $(KV_CACHE_SRC_DIR)/metadata/*.cpp)
 KV_STORE_SRC = $(wildcard $(KV_CACHE_SRC_DIR)/store/*.cpp)
-KV_CXX_OBJS = $(patsubst %.cpp,%.o,$(KV_METADATA_SRC) $(KV_STORE_SRC))
+KV_SERVICE_SRC = $(wildcard $(KV_CACHE_SRC_DIR)/service/*.cpp)
+KV_CXX_OBJS = $(patsubst %.cpp,%.o,$(KV_METADATA_SRC) $(KV_STORE_SRC) $(KV_SERVICE_SRC))
 
 PROTO_DIR = $(shell find $(REMOTE_CONNECTION_DEF_DIR) -type d | grep -E '/proto$$')
 PROTO_FILE = $(wildcard $(PROTO_DIR)/*.proto)

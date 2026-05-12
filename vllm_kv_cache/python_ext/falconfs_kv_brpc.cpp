@@ -24,15 +24,37 @@
 #include <brpc/channel.h>
 #include <brpc/controller.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
+#include <unistd.h>
 
 #include "kv_common.pb.h"
 #include "kv_data_service.pb.h"
 #include "kv_metadata_service.pb.h"
+#include "vllm_kv_cache/src/store/kv_store_facade.h"
 
 namespace {
+
+std::mutex g_registry_mu;
+std::unique_ptr<falconfs::kv::KVStoreFacadeRegistry> g_registry;
+
+std::string ResolveLocalHostNodeName()
+{
+    const char* env = std::getenv("NODE_NAME");
+    if (env != nullptr && env[0] != '\0') {
+        return std::string(env);
+    }
+    char host[256];
+    if (::gethostname(host, sizeof(host)) == 0) {
+        host[sizeof(host) - 1] = '\0';
+        return std::string(host);
+    }
+    return "localhost";
+}
 
 bool InitChannel(const char* endpoint, int timeout_ms, brpc::Channel* channel)
 {
@@ -241,6 +263,158 @@ PyObject* PyBatchReadFromSSD(PyObject* /*self*/, PyObject* args)
         });
 }
 
+bool EnsureRegistryLocked(const std::string& conninfo)
+{
+    if (!g_registry) {
+        g_registry.reset(new falconfs::kv::KVStoreFacadeRegistry());
+    }
+    g_registry->Start(ResolveLocalHostNodeName(), conninfo);
+    return true;
+}
+
+PyObject* PyMembershipStart(PyObject* /*self*/, PyObject* args)
+{
+    const char* conninfo_c = nullptr;
+    if (!PyArg_ParseTuple(args, "s", &conninfo_c)) return nullptr;
+    std::lock_guard<std::mutex> lk(g_registry_mu);
+    if (!EnsureRegistryLocked(conninfo_c)) {
+        return WrapRpcError("membership_start", "registry start failed");
+    }
+    Py_RETURN_NONE;
+}
+
+PyObject* PyMembershipStop(PyObject* /*self*/, PyObject* /*args*/)
+{
+    std::lock_guard<std::mutex> lk(g_registry_mu);
+    if (g_registry) {
+        g_registry->Stop();
+    }
+    Py_RETURN_NONE;
+}
+
+PyObject* PyMembershipRefresh(PyObject* /*self*/, PyObject* args)
+{
+    int timeout_ms = 2000;
+    if (!PyArg_ParseTuple(args, "|i", &timeout_ms)) return nullptr;
+    std::lock_guard<std::mutex> lk(g_registry_mu);
+    if (!g_registry) {
+        return WrapRpcError("membership_refresh", "registry not started");
+    }
+    falconfs::kv::RefreshResult out = g_registry->RefreshNow(timeout_ms);
+    return Py_BuildValue("(iiK)", out.num_dns, out.num_stores,
+                         static_cast<unsigned long long>(out.generation));
+}
+
+PyObject* PyDiscoverDnEndpoints(PyObject* /*self*/, PyObject* /*args*/)
+{
+    std::lock_guard<std::mutex> lk(g_registry_mu);
+    if (!g_registry) {
+        return WrapRpcError("discover_dn_endpoints", "registry not started");
+    }
+    PyObject* dict = PyDict_New();
+    const auto snapshot = g_registry->SnapshotDnEndpoints();
+    for (const auto& kv : snapshot) {
+        PyObject* key = PyLong_FromLong(kv.first);
+        PyObject* val = PyUnicode_FromString(kv.second.c_str());
+        if (PyDict_SetItem(dict, key, val) != 0) {
+            Py_DECREF(key);
+            Py_DECREF(val);
+            Py_DECREF(dict);
+            return WrapRpcError("discover_dn_endpoints", "PyDict_SetItem failed");
+        }
+        Py_DECREF(key);
+        Py_DECREF(val);
+    }
+    return dict;
+}
+
+PyObject* PyStoreLocality(PyObject* /*self*/, PyObject* /*args*/)
+{
+    std::lock_guard<std::mutex> lk(g_registry_mu);
+    if (!g_registry) {
+        return WrapRpcError("store_locality", "registry not started");
+    }
+    PyObject* dict = PyDict_New();
+    const auto snapshot = g_registry->SnapshotStoreLocality();
+    for (const auto& kv : snapshot) {
+        PyObject* key = PyLong_FromLong(kv.first);
+        PyObject* val = kv.second ? Py_True : Py_False;
+        Py_INCREF(val);
+        if (PyDict_SetItem(dict, key, val) != 0) {
+            Py_DECREF(key);
+            Py_DECREF(val);
+            Py_DECREF(dict);
+            return WrapRpcError("store_locality", "PyDict_SetItem failed");
+        }
+        Py_DECREF(key);
+        Py_DECREF(val);
+    }
+    return dict;
+}
+
+template <typename Request, typename Response, typename CallFn>
+PyObject* DoFacadeCall(PyObject* args, const char* method_name, CallFn&& call_fn)
+{
+    int store_node_id = 0;
+    const char* request_buf = nullptr;
+    Py_ssize_t request_len = 0;
+    if (!PyArg_ParseTuple(args, "iy#", &store_node_id, &request_buf, &request_len)) {
+        return nullptr;
+    }
+    Request req;
+    if (!req.ParseFromArray(request_buf, static_cast<int>(request_len))) {
+        return WrapRpcError(method_name, "ParseFromString failed");
+    }
+    std::shared_ptr<falconfs::kv::IKVStoreFacade> facade;
+    {
+        std::lock_guard<std::mutex> lk(g_registry_mu);
+        if (!g_registry) {
+            return WrapRpcError(method_name, "registry not started");
+        }
+        facade = g_registry->Resolve(store_node_id);
+    }
+    if (!facade) {
+        return WrapRpcError(method_name, "unknown store_node_id");
+    }
+    Response rsp;
+    call_fn(facade, req, &rsp);
+    std::string out;
+    if (!rsp.SerializeToString(&out)) {
+        return WrapRpcError(method_name, "SerializeToString failed");
+    }
+    return PyBytes_FromStringAndSize(out.data(), static_cast<Py_ssize_t>(out.size()));
+}
+
+PyObject* PyFacadeBatchWriteBlock(PyObject* /*self*/, PyObject* args)
+{
+    using namespace falconfs::kv;
+    return DoFacadeCall<BatchWriteBlockRequest, BatchWriteBlockResponse>(
+        args, "facade_batch_write_block",
+        [](const std::shared_ptr<IKVStoreFacade>& facade,
+           const BatchWriteBlockRequest& req,
+           BatchWriteBlockResponse* rsp) { facade->BatchWriteBlock(req, rsp); });
+}
+
+PyObject* PyFacadeBatchReadBlock(PyObject* /*self*/, PyObject* args)
+{
+    using namespace falconfs::kv;
+    return DoFacadeCall<BatchReadBlockRequest, BatchReadBlockResponse>(
+        args, "facade_batch_read_block",
+        [](const std::shared_ptr<IKVStoreFacade>& facade,
+           const BatchReadBlockRequest& req,
+           BatchReadBlockResponse* rsp) { facade->BatchReadBlock(req, rsp); });
+}
+
+PyObject* PyFacadeBatchReadFromSSD(PyObject* /*self*/, PyObject* args)
+{
+    using namespace falconfs::kv;
+    return DoFacadeCall<BatchReadFromSSDRequest, BatchReadFromSSDResponse>(
+        args, "facade_batch_read_from_ssd",
+        [](const std::shared_ptr<IKVStoreFacade>& facade,
+           const BatchReadFromSSDRequest& req,
+           BatchReadFromSSDResponse* rsp) { facade->BatchReadFromSSD(req, rsp); });
+}
+
 PyMethodDef kModuleMethods[] = {
     {"batch_lookup_with_lease", PyBatchLookupWithLease, METH_VARARGS,
      "Calls KVMetadataService.BatchLookupWithLease over BRPC.\n"
@@ -260,6 +434,22 @@ PyMethodDef kModuleMethods[] = {
      "Calls KVDataService.BatchReadBlock over BRPC."},
     {"batch_read_from_ssd", PyBatchReadFromSSD, METH_VARARGS,
      "Calls KVDataService.BatchReadFromSSD over BRPC."},
+    {"membership_start", PyMembershipStart, METH_VARARGS,
+     "Starts KVStoreFacadeRegistry with CN conninfo."},
+    {"membership_stop", PyMembershipStop, METH_VARARGS,
+     "Stops KVStoreFacadeRegistry."},
+    {"membership_refresh", PyMembershipRefresh, METH_VARARGS,
+     "Calls KVStoreFacadeRegistry.RefreshNow(timeout_ms)."},
+    {"discover_dn_endpoints", PyDiscoverDnEndpoints, METH_VARARGS,
+     "Returns {dn_id: endpoint} from current membership snapshot."},
+    {"store_locality", PyStoreLocality, METH_VARARGS,
+     "Returns {store_id: is_local} from facade registry."},
+    {"facade_batch_write_block", PyFacadeBatchWriteBlock, METH_VARARGS,
+     "Calls facade BatchWriteBlock for store_node_id."},
+    {"facade_batch_read_block", PyFacadeBatchReadBlock, METH_VARARGS,
+     "Calls facade BatchReadBlock for store_node_id."},
+    {"facade_batch_read_from_ssd", PyFacadeBatchReadFromSSD, METH_VARARGS,
+     "Calls facade BatchReadFromSSD for store_node_id."},
     {nullptr, nullptr, 0, nullptr},
 };
 

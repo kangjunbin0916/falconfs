@@ -95,7 +95,11 @@ Three design considerations that were under-specified in v6.4 are now made expli
 
 3. **Store admin RPCs are first-class.** A new BRPC service `KVStoreAdminService` hosted on the DN side carries `RegisterStoreRegion`, `Heartbeat`, and `SpillBlockToSSD`. v6.4 left `KVMetadataEngine::RegisterStoreRegion` as an in-process call only; v6.5 makes registration a network operation issued by every Store at startup, so the DN never assumes a hardcoded region geometry. `SpillBlockToSSD` is invoked by the DN's eviction worker against the Store that owns the eviction candidate; it is BRPC even if Store and DN happen to share a host (per the previous bullet). Detailed wire contract in §5.4.
 
-These additions do not change the hot-path metadata flow described in v6.4; they refine the deployment model and the data-plane affinity policy.
+4. **CN is the single source of truth for cluster membership; KV cache shares DN identities with FalconFS file metadata.** The KV cache does not introduce a parallel DN list; it reuses `server_id` from the existing [`pg_catalog.falcon_foreign_server`](../../falcon/falcon--1.0.sql) and the existing `pg_catalog.falcon_shard_table(range_point, server_id)` for `block_hash → DN` routing. v6.5 adds two CN tables: `pg_catalog.falcon_dn_node` (one row per DN replication group, with **denormalized** `(host_node_name, pg_host, pg_port, kv_brpc_port, dn_epoch, healthy)` so a single `SELECT` suffices for routing — no JOIN on the hot path), and `pg_catalog.falcon_store_node` (one row per `falcon_kv_store` daemon — Stores have no FalconFS analogue). Physical-host identity uses the **`NODE_NAME`** environment variable already standardized by FalconFS CM and docker-compose configs (`cloud_native/falcon_cm/cm/falcon_cm.py:51`, `tests/regress/docker-compose-*.yaml`); `/etc/machine-id` is **not** used because it is unreliable in containers and has no FalconFS adoption. Each Client maintains the **full** DN and Store list locally and runs a **membership refresh loop (§3.4.7)** with three triggers — periodic (every `falcon_kv.membership_refresh_period_ms`, default 5000ms), reactive (on any DN/Store RPC failure / `STALE_EPOCH` / `STORE_NOT_REGISTERED`), and on-demand (`KVStoreFacadeRegistry::RefreshNow()` / `OffloadingManager.refresh_membership()`) — plus an optional `LISTEN/NOTIFY` push channel for sub-second propagation. The loop handles **late-joining Stores** (registered after the Client started — common in autoscale and ops-driven Store roll-out) and **rejoining Stores** (restart bumps `store_epoch` → Client `munmap`s the old segment and `shm_open`s the new one). Same-host Stores (matched by `host_node_name`) use the SHM fast path (§12.6), all others use BRPC. **DN replica handling** inherits FalconFS's CM-driven primary-failover pattern: CM elects a new primary, atomically updates both `falcon_foreign_server` and `falcon_dn_node` in one transaction, clients refresh and retry — `server_id` is stable, hash routing never changes. **Store failure model** is differentiated: stores are single-instance (volatile DRAM cannot be replicated cheaply), unhealthy/unreachable Stores cause client reads to return cache miss (vLLM tolerates miss → recompute), permanently dead Stores are removed from the cluster and DNs purge their KV-meta rows; on Store restart `store_epoch` bumps and DNs delete rows that were DRAM-only on the old epoch. All details in §3.4 (schemas, RPCs, refresh model, watchdog, failover semantics).
+
+5. **Allocation drops the `allow_fallback_store` knob.** v6.4 had a per-request `allow_fallback_store=true|false` flag on `BatchAllocateWithLease`. v6.5 removes it: allocation is always best-effort with the §5.3 priority order and automatic fallback to any healthy Store. The proto field is retired (kept reserved for one release for compatibility) and ignored by the engine.
+
+These additions do not change the hot-path metadata flow described in v6.4; they refine the deployment model, the data-plane affinity policy, and the topology discovery contract.
 
 The remainder of this document is rewritten where the architecture changed; sections that were unaffected (proto contract, error model, vLLM integration) are unchanged.
 
@@ -289,7 +293,7 @@ Component counts come from configuration, never from constants:
 - A **Client process** that finds a local Store discovery descriptor (§12.6) calls `RegisterLocal(store_id, shm_facade)` on its own `KVStoreFacadeRegistry`; every peer (off-host) Store is registered via `RegisterRemote(store_id, endpoint)`.
 - The **DN process** does not participate in the local fast path: its eviction worker resolves Store endpoints via the admin map populated by `RegisterStoreRegion` (§5.4) and always issues `SpillBlockToSSD` over BRPC.
 
-The metadata DN's allocator already supports affinity via `preferred_store_id` + `allow_fallback_store` (§5.3): a same-host Client passes its own host's `store_node_id` as `preferred_store_id`, so freshly allocated blocks land on the local Store's DRAM region whenever capacity permits. This makes the Client-side shared-memory fast path the typical case rather than the exception.
+The metadata DN's allocator supports affinity via `preferred_store_id` (§5.3): a same-host Client passes its own host's `store_node_id` as `preferred_store_id`, so freshly allocated blocks land on the local Store's DRAM region whenever capacity permits. Allocation is always best-effort: if the preferred Store has no space, the DN automatically falls back to the next-best candidate. This makes the Client-side shared-memory fast path the typical case rather than the exception, while still guaranteeing forward progress under pressure.
 
 ---
 
@@ -365,6 +369,306 @@ The database status values should match the proto enum values excluding `UNSPECI
 4. `EVICTED` does not occupy DRAM bitmap slots after eviction finalization.
 5. `version` increments on every successful metadata state mutation.
 6. All updates that change status use `(block_hash, expected_version)` CAS.
+
+### 3.4 CN-resident Cluster Membership
+
+CN is the single source of truth for KV cache topology, and **the KV cache shares DN identities with FalconFS file metadata** — the same `server_id` that routes inode operations also routes KV-cache operations. Two CN-resident catalog tables drive discovery: `pg_catalog.falcon_dn_node` (one row per DN replication group, with denormalized endpoint fields so a single SELECT suffices for routing) and `pg_catalog.falcon_store_node` (one row per Store daemon — Stores are a v6.5-only concept and have no FalconFS analogue). Both reference the cluster manager (CM) for bootstrap and election; both are refreshed by clients on heartbeat cadence and on RPC error.
+
+#### 3.4.1 Background: how FalconFS already identifies DNs
+
+FalconFS allocates DN `server_id` at cluster init: CM (`cloud_native/falcon_cm/utils/filesystem.py:37`) maps `cn → 0`, `dn0 → 1`, `dn1 → 2`, …. Each `dnN` is a **replication group** of `replica_server_num + 1` PostgreSQL instances on distinct physical hosts; one is primary, the rest are streaming standbys. CM uses Zookeeper paths (`/falcon/falcon_clusters/dnN/{hostNodes,replicas}`, see `cloud_native/falcon_cm/cm/falcon_cm.py:686-714`) to track replicas, and on primary failure elects a new leader and writes the new endpoint into `pg_catalog.falcon_foreign_server` via `falcon_update_foreign_server(server_id, host, port)` (`cloud_native/falcon_cm/postgres/postgresql.py:143-145`). Clients then call `falcon_reload_foreign_server_cache()` on the next error to pick up the new primary; `server_id` is stable across failover, so the routing key in `falcon_shard_table` never changes.
+
+The KV cache inherits exactly this pattern. Three concrete consequences:
+
+- **The KV BRPC server lives on the primary only.** The bgworker that hosts it is registered with `BgWorkerStart_RecoveryFinished` (`falcon/falcon_init.c:82`), which means a standby in continuous recovery never spawns it. After CM-driven primary failover, the new primary's bgworker comes up and starts its BRPC server; the old primary (now standby or dead) is silent for KV.
+- **Physical-host identity uses `NODE_NAME`, not `/etc/machine-id`.** FalconFS already standardizes on the `NODE_NAME` environment variable (set by Helm/K8s, docker-compose, or operator scripts; see `cloud_native/falcon_cm/cm/falcon_cm.py:51` and the `tests/regress/docker-compose-*.yaml` files). For bare-metal, operators set it to `$(hostname)` in the systemd unit. `/etc/machine-id` is unreliable in containers and has no FalconFS adoption — v6.5 does **not** use it.
+- **Routing reuses `falcon_shard_table`.** `block_hash` hashes into the same `range_point` space as inodes, so KV cache uses `pg_catalog.falcon_shard_table(range_point, server_id)` directly. No new shard table.
+
+#### 3.4.2 `pg_catalog.falcon_dn_node` (denormalized DN endpoint catalog)
+
+```sql
+-- One row per DN replication group. server_id is a FK to falcon_foreign_server,
+-- but endpoint fields are denormalized so clients SELECT this table alone
+-- (no JOIN with falcon_foreign_server on the hot path).
+CREATE TABLE pg_catalog.falcon_dn_node (
+    server_id          INT  PRIMARY KEY
+                       REFERENCES pg_catalog.falcon_foreign_server(server_id),
+    host_node_name     TEXT   NOT NULL,    -- physical host of CURRENT primary; mirrors CM's
+                                           -- NODE_NAME (see cloud_native/falcon_cm/cm/falcon_cm.py:51)
+    pg_host            TEXT   NOT NULL,    -- denormalized from falcon_foreign_server.host
+    pg_port            INT    NOT NULL,    -- denormalized from falcon_foreign_server.port
+    kv_brpc_port       INT    NOT NULL,    -- BRPC port of KVMetadataService on current primary
+    dn_epoch           BIGINT NOT NULL DEFAULT 0,    -- mirrors falcon_kvblock_dn_epoch.dn_epoch;
+                                                     -- written by DN on registration
+    healthy            BOOL   NOT NULL DEFAULT TRUE,
+    last_heartbeat_ms  BIGINT NOT NULL DEFAULT 0
+);
+GRANT SELECT ON pg_catalog.falcon_dn_node TO public;
+```
+
+**Why denormalize.** The file-metadata path already joins `falcon_foreign_server` (cached in shmem) with shard routing in C; the KV cache's Python and Python-loaded-C client paths would otherwise carry an extra `JOIN` on every membership refresh. Replicating five short fields per DN keeps the Client read to one statement (`SELECT * FROM falcon_dn_node WHERE healthy`) and matches FalconFS's `falcon_renew_shard_table()` shape (`falcon/falcon--1.0.sql:115`) which already returns `(range_min, range_max, host, port, server_id)` for the file-metadata side. Drift is bounded by writer discipline: the only writers are (a) the DN bgworker on its own row at startup, and (b) CM after a primary failover — both update `falcon_foreign_server` and `falcon_dn_node` in the same transaction (§3.4.4).
+
+Self-registration / failover update functions:
+
+```sql
+-- Called by the DN bgworker on startup. Idempotent (ON CONFLICT DO UPDATE).
+CREATE FUNCTION pg_catalog.falcon_dn_node_register(
+    server_id        INT,
+    host_node_name   CSTRING,
+    pg_host          CSTRING,
+    pg_port          INT,
+    kv_brpc_port     INT,
+    dn_epoch         BIGINT
+) RETURNS INTEGER LANGUAGE C STRICT AS 'MODULE_PATHNAME', 'falcon_dn_node_register';
+
+-- Called by the DN bgworker periodically (falcon_kv.dn_heartbeat_period_ms).
+CREATE FUNCTION pg_catalog.falcon_dn_node_heartbeat(
+    server_id INT, now_ms BIGINT
+) RETURNS INTEGER LANGUAGE C STRICT AS 'MODULE_PATHNAME', 'falcon_dn_node_heartbeat';
+
+-- Called by CM after a primary failover. Pairs with falcon_update_foreign_server
+-- in the same transaction so both rows move together.
+CREATE FUNCTION pg_catalog.falcon_dn_node_update_endpoint(
+    server_id        INT,
+    host_node_name   CSTRING,
+    pg_host          CSTRING,
+    pg_port          INT,
+    kv_brpc_port     INT
+) RETURNS INTEGER LANGUAGE C STRICT AS 'MODULE_PATHNAME', 'falcon_dn_node_update_endpoint';
+
+CREATE FUNCTION pg_catalog.falcon_dn_node_unregister(server_id INT)
+    RETURNS INTEGER LANGUAGE C STRICT AS 'MODULE_PATHNAME', 'falcon_dn_node_unregister';
+```
+
+`dn_epoch` is denormalized into `falcon_dn_node` for read-side convenience but its source of truth is still `pg_catalog.falcon_kvblock_dn_epoch(shard_id, dn_epoch)` — DN's bgworker writes the new value to both in a single SPI transaction during recovery (§15.1).
+
+#### 3.4.3 `pg_catalog.falcon_store_node` (Store catalog, new)
+
+Stores are v6.5-only; they have no FalconFS analogue and no shared `server_id` space. Each `falcon_kv_store` daemon owns one row:
+
+```sql
+CREATE TABLE pg_catalog.falcon_store_node (
+    store_node_id     INT  PRIMARY KEY,
+    host_node_name    TEXT   NOT NULL,    -- physical host (same NODE_NAME convention as DN)
+    host              TEXT   NOT NULL,    -- routable hostname / IP for BRPC
+    brpc_port         INT    NOT NULL,    -- KVDataService + KVStoreAdminService port
+    runtime_dir       TEXT   NOT NULL,    -- operational hint: where the Store's runtime files live
+    shm_name          TEXT   NOT NULL,    -- POSIX SHM segment name; same-host Clients shm_open this
+    dram_pool_bytes   BIGINT NOT NULL,
+    block_size        INT    NOT NULL,
+    store_epoch       BIGINT NOT NULL,    -- bumped on every Store restart (DRAM is volatile)
+    healthy           BOOL   NOT NULL DEFAULT TRUE,
+    last_heartbeat_ms BIGINT NOT NULL DEFAULT 0
+);
+GRANT SELECT ON pg_catalog.falcon_store_node TO public;
+
+CREATE FUNCTION pg_catalog.falcon_store_node_register(
+    store_node_id INT, host_node_name CSTRING, host CSTRING, brpc_port INT,
+    runtime_dir CSTRING, shm_name CSTRING,
+    dram_pool_bytes BIGINT, block_size INT,
+    store_epoch BIGINT
+) RETURNS INTEGER LANGUAGE C STRICT AS 'MODULE_PATHNAME', 'falcon_store_node_register';
+
+CREATE FUNCTION pg_catalog.falcon_store_node_heartbeat(
+    store_node_id INT, store_epoch BIGINT, now_ms BIGINT
+) RETURNS INTEGER LANGUAGE C STRICT AS 'MODULE_PATHNAME', 'falcon_store_node_heartbeat';
+
+CREATE FUNCTION pg_catalog.falcon_store_node_unregister(store_node_id INT)
+    RETURNS INTEGER LANGUAGE C STRICT AS 'MODULE_PATHNAME', 'falcon_store_node_unregister';
+```
+
+Stores are **single-instance** (no replicas). Volatile DRAM cannot meaningfully be replicated synchronously without paying memory bandwidth twice, and the cache is by definition reconstructible by recompute, so HA is achieved at the cluster level (multiple Stores, allocator skips dead ones — §3.4.5) instead of per-Store leader election.
+
+#### 3.4.4 DN failure and replica handling (inherits FalconFS pattern)
+
+Clients keep the **full DN list** (`SELECT * FROM falcon_dn_node` cached locally; refreshed on `falcon_kv.membership_refresh_period_ms`, default 5000ms, and on any RPC error). The list contains one row per replication group, always pointing at the current primary. Hash routing on `block_hash → server_id` is therefore stable; what changes on failover is the `(pg_host, pg_port, kv_brpc_port, host_node_name)` tuple for that `server_id`.
+
+Failover sequence (mirrors `falcon_cm.py`'s leader-election path):
+
+1. **Primary dies.** In-flight KV BRPC calls return `UNAVAILABLE` / `BACKEND_DOWN` / connection-refused. The local channel for that `server_id` is marked broken.
+2. **CM elects a new primary** from the standbys in that replication group (the existing FalconFS code path; see `cloud_native/falcon_cm/cm/falcon_cm.py:475-493`). The new primary's bgworker comes up, recovers (§15.1), and re-registers via `falcon_dn_node_register` (which is `INSERT ... ON CONFLICT DO UPDATE`).
+3. **CM atomically updates both catalog rows** in one transaction on CN:
+   ```sql
+   BEGIN;
+     SELECT falcon_update_foreign_server(server_id, new_host, new_pg_port);
+     SELECT falcon_dn_node_update_endpoint(server_id, new_node_name,
+                                           new_host, new_pg_port, new_brpc_port);
+   COMMIT;
+   SELECT falcon_reload_foreign_server_cache();   -- existing FalconFS hook
+   ```
+4. **Client retry policy.** On RPC failure the client (a) immediately retries up to `falcon_kv.retry_during_failover_count` (default 3) against the same endpoint with backoff `falcon_kv.retry_backoff_ms` (default 250ms initial, exponential capped at 2s) — this absorbs short blips, (b) on continued failure refreshes `falcon_dn_node` and rebuilds the channel for that `server_id`, (c) replays the operation against the new primary. Replay is safe because DN ops are idempotent on `block_hash` (§14.4); KV writes also carry `(version, lease_token)` so replays cannot duplicate state.
+5. **No KV-side leader election.** The KV cache trusts CM. There is no separate Zookeeper coordination on the KV path; CM's existing election semantics suffice because the KV bgworker rides on top of the same PG primary.
+
+The total client-visible failover latency is dominated by CM detection (`_lost_node_time` watchdog + Zookeeper session) and the new primary's recovery time (§15.1). v6.5 contributes only the membership-refresh + retry on top.
+
+#### 3.4.5 Store failure model
+
+Stores fail differently from DNs because their state is volatile DRAM with no replica. The cluster handles three regimes:
+
+- **Transient unreachability (heartbeat skip, network blip).** If `last_heartbeat_ms` for a Store exceeds `store_suspect_ms` (default 3000), CM (or a DN-side watchdog) flips `falcon_store_node.healthy=false`. Each DN's allocator immediately stops choosing this Store for new allocations. Existing rows pointing at the Store are left alone in the catalog. **Client-side reads against this Store return cache miss** — `IKVStoreFacade::Read*` returns `NOT_FOUND` rather than blocking, because vLLM tolerates miss-on-recompute and a stuck cache lookup hurts throughput more than the recompute cost. The Store may come back with the same `store_epoch` and resume serving; the watchdog flips `healthy=true` after the first fresh heartbeat.
+
+- **Permanent unreachability (admin removal, `store_offline_ms` exceeded; default 30000).** Each DN runs a small GC pass that scans `falcon_kvblock_table WHERE store_node_id = dead_store_id` and **deletes** those rows after their leases expire (the catalog-side counterpart of §15.2.1). The dead Store row is moved to `healthy=false` permanently; an operator may `falcon_store_node_unregister` to drop the row entirely. Allocator skips it; clients drop the channel and any same-host SHM mapping.
+
+- **Store restart (DRAM lost, hardest case).** This is the canonical "Store-restart recovery" path. The Store comes up, allocates a new SHM segment with a fresh `store_epoch`, calls `falcon_store_node_register` (which UPSERTs the new `store_epoch` and `shm_name` into the same row), and re-issues `RegisterStoreRegion` to every DN. The DN sees a `store_epoch` higher than the value cached in its local `KVStoreEndpointTable` — that delta is what triggers the reconciler. **The DN then scans `falcon_kvblock_table WHERE store_node_id == this` and purges every row that has no on-disk copy** (§15.2 made stricter in v6.5: when DRAM is gone and there is no SSD copy, the row is deleted, not just marked `FAILED`; rows with a valid `evicted_path` are kept and reset to `EVICTED`). The bitmap for that Store's region is rebuilt from the surviving rows, which in the common case is empty. Clients observe the new `store_epoch` on next refresh, `munmap` the old segment fd, and `shm_open` the new one.
+
+The **client-side full-Store view** is therefore: one row per `store_node_id`, with `(host_node_name, host, brpc_port, shm_name, store_epoch, healthy)`. Lookup against any row with `healthy=false` short-circuits to cache-miss; lookup against a row whose `store_epoch` advanced since the last refresh triggers a re-mmap before the next read. Writes against an unhealthy Store are not attempted: the allocator never returns such a Store in the first place, and a write-amid-failover surfaces as `STORE_WRITE_FAILED` which the client maps to the same cache-miss behaviour and lets vLLM recompute.
+
+#### 3.4.6 Lifecycle and discovery
+
+DN startup (`FalconBrpcServer::Run` in the bgworker):
+
+1. read `NODE_NAME` from the env (PostgreSQL inherits it; if unset, fall back to `gethostname()`). Cache as `host_node_name`.
+2. read `LocalServerId` (already populated by FalconFS init from `falcon_foreign_server` where `is_local=true`; see `falcon/metadb/foreign_server.c:332-334`). This is the DN's `server_id`.
+3. bump `dn_epoch` in `falcon_kvblock_dn_epoch` (existing §15.1 path).
+4. open a libpq connection to CN and call `falcon_dn_node_register(server_id, host_node_name, pg_host, pg_port, kv_brpc_port, dn_epoch)`. This is the same connection pattern already used by `KVRecoveryRunner` (`falcon/include/brpc_comm_adapter/kv_recovery_runner.h`).
+5. start a heartbeat loop calling `falcon_dn_node_heartbeat(server_id, now_ms)` every `falcon_kv.dn_heartbeat_period_ms`.
+
+Store startup (`falcon_kv_store/src/main.cpp`):
+
+1. read `NODE_NAME` from env (or `gethostname()`); cache as `host_node_name`.
+2. allocate the SHM segment; choose `shm_name = /falcon_kv_store_${UID}_<store_node_id>`.
+3. open a libpq connection to CN and `falcon_store_node_register(...)` with the new `store_epoch`.
+4. `SELECT * FROM falcon_dn_node WHERE healthy` — single-table read, no JOIN — to learn the active DN list. For each DN, partition a slice of the SHM pool and issue the bilateral `RegisterStoreRegion` BRPC (§5.4) so the DN learns the per-region geometry.
+5. start a heartbeat loop calling `falcon_store_node_heartbeat(...)` (CN side) and `KVStoreAdminService::Heartbeat` BRPC (per-DN side).
+
+Client startup (`OffloadingManager` cluster mode, FUSE `falcon_client`, future apps):
+
+1. read `NODE_NAME` from env (or `gethostname()`); cache as `host_node_name`.
+2. open a libpq read connection to CN. Cache `SELECT * FROM falcon_dn_node WHERE healthy` for DN endpoints, `SELECT * FROM falcon_store_node WHERE healthy` for Store endpoints, and `SELECT range_min, range_max, server_id FROM falcon_renew_shard_table()` for `block_hash → server_id` routing. All three are independent single-table reads.
+3. for every Store row whose `host_node_name` matches the local one, call `KVStoreFacadeRegistry::RegisterLocalShm(store_node_id, shm_name, region_layout)` which does `shm_open` + `mmap(MAP_SHARED)`. For every other Store, call `RegisterRemote(store_node_id, host:brpc_port)`. **All Stores are registered**, healthy or not — unhealthy ones are kept in the registry as a placeholder that returns cache-miss on read, matching §3.4.5.
+4. start the **membership refresh loop** (§3.4.7) which keeps these three views current via three triggers (periodic / reactive / on-demand) and an optional `LISTEN/NOTIFY` push channel. The loop also handles late-joining Stores (registered after the Client was up) and Stores rejoining with a bumped `store_epoch`. Refresh is incremental — only rows whose `(server_id|store_node_id, store_epoch, healthy)` changed trigger a channel rebuild or `munmap+shm_open` (§3.4.7.4).
+
+There is no JSON file descriptor; CN is the only place a Client looks. SHM segment names stay POSIX-namespaced (`/falcon_kv_store_<uid>_<id>`); same-host permission is enforced by file-mode `0660` on the segment plus a shared group membership.
+
+#### 3.4.7 Membership refresh model (Client side)
+
+A Client is rarely the first thing in the cluster to start. Stores can register with CN long after a Client process is up (a vLLM worker may start before its colocated `falcon_kv_store` daemon, an operator may scale Stores up days into a run, a crashed Store may rejoin with a fresh `store_epoch`), and DN primaries can change at any time. To make the Client view converge without restart, every Client process runs a **membership refresh loop** with three triggers and one optional push channel. The loop is owned by a single thread inside `KVStoreFacadeRegistry` (the C++ side of the facade described in §12.6); the Python `OffloadingManager` and the FUSE `falcon_client` both share that registry through the pybind11 binding.
+
+##### 3.4.7.1 Three triggers (always on)
+
+1. **Periodic.** A dedicated refresh thread fires every `falcon_kv.membership_refresh_period_ms` (default `5000`). It pulls three single-table snapshots from CN over a long-lived libpq read connection — `SELECT * FROM falcon_dn_node`, `SELECT * FROM falcon_store_node`, `SELECT range_min, range_max, server_id FROM falcon_renew_shard_table()` — and applies the diff (§3.4.7.4). 5s is a deliberate compromise: sub-second polling is unnecessary because reactive and push channels already cover urgency, and Stores rarely flap; 5s is also the same cadence as the existing FalconFS `falcon_reload_foreign_server_cache()` defaults so operators have one knob to tune.
+
+2. **Reactive (error-driven).** Any DN/Store BRPC call that returns one of `{UNAVAILABLE, BACKEND_DOWN, STALE_EPOCH, STORE_NOT_REGISTERED, NOT_FOUND_AT_DN}` posts a refresh request to the loop's condition variable. The loop wakes, refreshes immediately, and retries the failed RPC against the new view. To absorb error storms (e.g. failover causing dozens of in-flight RPCs to fail at once), refreshes are rate-limited by `falcon_kv.membership_refresh_min_interval_ms` (default `500`): a request issued within that window after the previous refresh started is coalesced into the next pending refresh rather than triggering its own.
+
+3. **On-demand (application API).** Application code may call `KVStoreFacadeRegistry::RefreshNow(timeout_ms)` (or its Python wrapper `OffloadingManager.refresh_membership(timeout_ms=2000)`) at any time. The call posts a refresh request and blocks up to `timeout_ms` for the next refresh cycle to complete; it returns the post-refresh `(num_dns, num_stores, generation)` tuple. Use cases:
+   - vLLM `OffloadingManager.warmup()` before a long batch — proves the local Store is online.
+   - Operator tooling that just registered a new Store and wants to verify the cluster picked it up.
+   - Integration tests that need a deterministic "membership is now X" gate.
+   The same rate-limit (`membership_refresh_min_interval_ms`) applies; on-demand calls are not "more privileged" than reactive ones and cannot drown out the cluster.
+
+A small monotonically-increasing local `generation` counter ticks on every successful refresh. Application code may snapshot the generation before an operation and compare it after to detect "the view shifted under me" without parsing diffs.
+
+##### 3.4.7.2 Optional push channel — PostgreSQL `LISTEN`/`NOTIFY`
+
+Polling has a worst-case lag of `membership_refresh_period_ms` between a Store registering and a Client seeing it. For latency-sensitive deployments (e.g. autoscaled Store fleets) v6.5 ships an opt-in push channel built on PostgreSQL's `LISTEN`/`NOTIFY` (`falcon_kv.membership_notify_enabled`, default `true`).
+
+- **Producer side.** Every catalog mutation function emits a notification:
+  - `falcon_store_node_register`/`heartbeat`/`unregister` → `pg_notify('falcon_kv_store_membership', payload)` where `payload` is a small JSON `{"store_node_id":42,"event":"register","store_epoch":7,"healthy":true}`.
+  - `falcon_dn_node_register`/`heartbeat`/`unregister` and `falcon_dn_node_update_endpoint` → `pg_notify('falcon_kv_dn_membership', payload)`.
+  - The watchdog (§3.4.8) emits `event:"healthy_change"` notifications when it flips a row.
+- **Consumer side.** Each Client process opens a second libpq connection (separate from the read connection used for periodic refresh) and runs `LISTEN falcon_kv_store_membership; LISTEN falcon_kv_dn_membership`. A small reader thread blocks on `PQnotifies()` and posts a refresh request on every notification. The actual refresh still goes through the rate-limited single loop, so a thousand simultaneous notifications collapse into one CN read.
+- **Fallback.** If the LISTEN connection drops or the GUC is `false`, the loop silently degrades to the periodic + reactive triggers. There is no correctness dependency on `NOTIFY`; it is purely a latency optimization.
+
+Push is recommended for Store membership (where late-join / rejoin matters most for cache hit rate) and disabled by default for shard-table changes (rare, already covered by reactive refresh on `STALE_SHARD` errors).
+
+##### 3.4.7.3 Late join and rejoin — concrete sequences
+
+**Late join** (Store registers after Client startup):
+
+```text
+T+0     Client starts. RefreshNow() returns: 0 stores, 1 DN.
+T+0     Client::Allocate routes to DN; DN's allocator is empty for that machine
+        (no Store registered) → returns STORE_UNAVAILABLE. Client returns
+        cache-miss to vLLM (which falls back to recompute). [v6 baseline]
+T+60    Operator starts falcon_kv_store with store_node_id=42 on the same host.
+T+60    Store: shm_open + mmap, falcon_store_node_register(42, ...), and
+        RegisterStoreRegion BRPC to every DN. CN emits NOTIFY
+        'falcon_kv_store_membership' with event=register, store_node_id=42.
+T+60.05 Client's LISTEN reader receives NOTIFY → posts refresh.
+T+60.05 Refresh loop: pulls falcon_store_node, sees row 42 with
+        host_node_name == local. Calls RegisterLocalShm(42, ...) on the
+        registry → shm_open + mmap. generation++.
+T+60.05 Next Client::Allocate routes to DN; DN allocator picks Store 42;
+        Client writes via SHM fast path. Cache hit ratio recovers.
+```
+
+If `membership_notify_enabled=false`, the gap between T+60 and the Client noticing is at most `membership_refresh_period_ms` (5s default).
+
+**Rejoin** (Store crashes and restarts with new `store_epoch`):
+
+```text
+T+0     Store id=42, store_epoch=7, healthy. Client mmap'd at /falcon_kv_store_500_42.
+T+100   Store crashes (segfault, OOM, kill -9). Heartbeat stops.
+T+103   Watchdog flips falcon_store_node.healthy=false (store_suspect_ms exceeded).
+        CN emits NOTIFY event=healthy_change.
+T+103.0 Client refresh: registry switches Store 42 to the "unhealthy" facade
+        → reads/writes return cache-miss (vLLM tolerates).
+T+103.0 The Client still holds the mmap fd. It is harmless — the segment is
+        orphaned (refcount > 0), no other process writes to it, and no Client
+        code reads it (the unhealthy facade short-circuits). The Client does
+        NOT munmap eagerly: keeping the fd avoids a TOCTOU race where the
+        Store comes back with the same store_epoch (rare; admin restart kept
+        DRAM via SIGSTOP/SIGCONT) and the registry finds the segment gone.
+T+120   Operator restarts falcon_kv_store. New process: shm_unlink(old name),
+        shm_open(new name = /falcon_kv_store_500_42), bumps store_epoch=8,
+        falcon_store_node_register UPSERTs (store_epoch=8, shm_name=...).
+        CN emits NOTIFY event=register, store_epoch=8.
+T+120.05 Client refresh: detects store_epoch 7→8 on Store 42. The registry:
+        (a) replaces the unhealthy facade with a fresh LocalKVStoreShmFacade,
+        (b) close(old fd), munmap(old addr, old size), shm_open(new name),
+            mmap(MAP_SHARED, new size).
+T+120.05 Cache traffic resumes. Old DRAM contents are GONE (not recovered);
+        DN's reconciler purges the dead rows in the background (§15.2).
+```
+
+The key invariant: **the Client never trusts a cached `(store_node_id, store_epoch)` mapping after a refresh sees a new `store_epoch`**. It always tears down and rebuilds, even if the mmap fd is still open.
+
+##### 3.4.7.4 Diff and apply
+
+The refresh loop computes a diff against last-known state and applies these actions atomically per-row (under one short mutex on the registry):
+
+| Change | Action |
+|---|---|
+| New DN row (`server_id` not in old set) | open new `brpc::Channel` for `(pg_host, kv_brpc_port)`; insert into channel cache. |
+| Removed DN row | close channel; future routes to this `server_id` return `NO_DN`. Rows in `falcon_kvblock_table` for this DN are CM's problem (cluster removal). |
+| DN endpoint changed (failover) | rebuild channel for the same `server_id` with the new `(pg_host, kv_brpc_port)`. |
+| DN `healthy: true → false` | mark channel "soft-down"; reads return `cache-miss`, writes are not attempted (allocator skips). |
+| New Store row | if `host_node_name == local`, `shm_open + mmap`, register local facade; else register remote facade. |
+| Removed Store row | tear down facade; close channel or `munmap+close(fd)`. |
+| Store `store_epoch` bumped | tear down old facade fully (close fd, munmap, drop channel); rebuild from the new row exactly as if it were a new row. **Never re-use a stale fd.** |
+| Store `healthy: true → false` | swap to "unhealthy" facade (cache-miss reads, refused writes). Keep the fd open for the rejoin-with-same-epoch case (rare; harmless). |
+| Store `healthy: false → true` | re-resolve from current row (may rebuild if `store_epoch` changed). |
+| `falcon_shard_table` row changed | rebuild the `block_hash → server_id` lookup table. |
+
+If any apply step fails (e.g. `shm_open` returns `ENOENT` because the Store died between the SQL read and the syscall), the loop logs a warning and leaves the row in "unhealthy" state; the next refresh cycle will re-attempt. The loop never throws back into application code on partial failure.
+
+##### 3.4.7.5 Configuration
+
+| GUC / setting | Default | Purpose |
+|---|---|---|
+| `falcon_kv.membership_refresh_period_ms` | `5000` | Periodic poll cadence. |
+| `falcon_kv.membership_refresh_min_interval_ms` | `500` | Rate limit for reactive + on-demand refresh. |
+| `falcon_kv.membership_notify_enabled` | `true` | Enable LISTEN/NOTIFY push channel. |
+| `falcon_kv.membership_notify_reconnect_backoff_ms` | `1000` | Backoff before reopening the LISTEN connection after it drops. |
+| `falcon_kv.refresh_apply_max_inflight` | `8` | Max parallel `shm_open`/`mmap` operations during a single apply phase (protects against fork-bomb on a 100-Store cluster). |
+
+#### 3.4.8 Permissions and watchdog
+
+- `falcon_dn_node` and `falcon_store_node` are written by trusted daemons (DN bgworkers, Store daemons) under their PG role; CM has additional rights to call `falcon_dn_node_update_endpoint`. Clients have `SELECT` only.
+- The Store's POSIX SHM segment is created `0660` and owned by an operator-configured group; same-host Clients must run under that group. Mismatched permissions surface as a `mmap` failure that demotes the facade to `RegisterRemote` (BRPC-only).
+- A watchdog thread on each DN bgworker runs every `falcon_kv.watchdog_period_ms` (default 1000ms) and `UPDATE ... SET healthy=false WHERE last_heartbeat_ms < now_ms - threshold` for both tables. The DN never deletes a peer DN's row — only CM does, atomically with foreign-server removal. The DN may delete a `falcon_store_node` row whose `store_offline_ms` threshold has been exceeded, or leave that to CM if the operator prefers a single writer. Watchdog state changes emit the same `pg_notify` events as the registration functions, so Client-side push refresh sees them too.
+
+#### 3.4.9 Why this layout
+
+| Dimension | v6.5 final | rejected: separate `falcon_kv_dn_membership` | rejected: thin `falcon_kv_node` companion |
+|---|---|---|---|
+| DN identity space | shared with file metadata via `server_id` | divergent; two DN lists drift | shared, but read needs JOIN with `falcon_foreign_server` |
+| Hot-path read | one `SELECT` on `falcon_dn_node` | one `SELECT` (but identity divergence) | `SELECT ... JOIN ...` every refresh |
+| Drift surface | endpoint fields denormalized; CM updates both atomically (§3.4.4) | full DN-list drift; high | minimal; bounded to the JOIN happening client-side |
+| Operator surface | one DN list (`falcon_foreign_server` extended by `falcon_dn_node`) | two DN lists | one list of identities + JOIN view |
+| Failover compatibility | inherits CM's `falcon_update_foreign_server` flow with one extra UPDATE | CM has to update three things | inherits cleanly but Clients pay a JOIN |
+
+The denormalized layout is a deliberate choice: the file-metadata path already tolerates the same drift surface (its endpoint cache is refreshed on error via `falcon_reload_foreign_server_cache()`), and the KV cache consistently extends that pattern rather than inventing a parallel one.
 
 ---
 
@@ -867,9 +1171,9 @@ struct StoreRegionInfo {
 
 Store startup:
 
-1. Store allocates one large DRAM pool: `[0, dram_pool_bytes)`.
-2. Store fetches the current DN/shard membership from the FalconFS shard table (or from a KV Store registry table maintained by CN).
-3. Store partitions its DRAM pool into continuous per-DN regions. Example:
+1. Store allocates one large DRAM pool: `[0, dram_pool_bytes)` as a POSIX SHM segment (§12.6.1).
+2. Store reads `NODE_NAME` from env (or `gethostname()` as fallback) as its `host_node_name`, and inserts/updates its row in `pg_catalog.falcon_store_node` via `falcon_store_node_register` (§3.4). This is the public discovery surface: every Client subsequently locates this Store by reading the CN row.
+3. Store reads the **current DN membership** from CN with a single-table read `SELECT * FROM pg_catalog.falcon_dn_node WHERE healthy` (§3.4 — fields are denormalized so no JOIN needed) and partitions its DRAM pool into one continuous region per healthy DN. Example with 4 DNs:
 
    ```
    Store DRAM pool:
@@ -881,7 +1185,7 @@ Store startup:
    DN3 region: [192 GiB, 256 GiB)
    ```
 
-4. Store sends `RegisterStoreRegion(store_node_id, store_epoch, base_offset, region_bytes, block_size, brpc_address)` to each owner DN.
+4. Store sends `RegisterStoreRegion(store_node_id, store_epoch, base_offset, region_bytes, block_size, brpc_address)` to each owning DN over BRPC. This is the **bilateral region handshake**, complementary to the CN-row publication: CN tells Clients where Stores live; per-DN BRPC tells each DN which slice of which Store it owns.
 5. Each DN creates/updates one `StoreRegionInfo` and initializes a bitmap only for the region assigned to that DN.
 6. DN allocations return absolute `pool_offset = base_offset + block_idx * block_size`.
 7. Store read/write validates that incoming offsets belong to a registered region for the requesting DN.
@@ -914,17 +1218,19 @@ Heartbeat policy:
 
 ### 5.3 Affinity Allocation
 
-Allocation priority:
+Allocation priority — strictly best-effort. The DN tries the candidates in order; if none of the higher-priority Stores has space, it always falls back to a less-preferred but `HEALTHY` Store region. There is no "no fallback" mode and no `allow_fallback_store` knob in v6.5.
 
-1. preferred Store region if `HEALTHY`, owned by this DN, and has space,
-2. same-host Store region as client hostname,
+1. preferred Store region (`preferred_store_id`) if `HEALTHY`, owned by this DN, and has space,
+2. same-host Store region as the client's `host_node_name` (resolved from `pg_catalog.falcon_store_node`, §3.4),
 3. least-used healthy Store region owned by this DN,
-4. fallback allowed only if `allow_fallback_store=true`.
+4. any other `HEALTHY` Store region owned by this DN.
 
 If no Store can allocate:
 
 - return `THROTTLED` if transient pressure or all suitable regions are temporarily `SUSPECT`/`DRAINING`,
-- return non-retryable storage exhaustion code if cluster capacity exhausted.
+- return non-retryable storage-exhaustion error code if cluster capacity is exhausted.
+
+`BatchAllocateWithLease.AllocateItem` therefore carries only `block_hash`, `block_size`, and `preferred_store_id`. The legacy `allow_fallback_store` field is retired (kept reserved in the proto for one release for backward compatibility but is ignored by the engine).
 
 ### 5.4 Store admin BRPC contract
 
@@ -1962,14 +2268,15 @@ Crucially, the **Store is always a standalone daemon (`falcon_kv_store`)**. It i
 
 The DN does **not** use this registry. DN↔Store traffic (`RegisterStoreRegion`, `Heartbeat`, `SpillBlockToSSD` — §5.4) is admin-only, not latency-critical, and always BRPC. Restricting the facade to Client callers keeps the registry's surface area small and removes a class of cross-process invariants from the DN bgworker.
 
-#### 12.6.1 Store-side: shared memory segment + discovery descriptor
+#### 12.6.1 Store-side: shared memory segment + CN row publication
 
-At Store startup, before issuing `RegisterStoreRegion` (§5.4):
+At Store startup, before issuing `RegisterStoreRegion` to each DN (§5.4):
 
-1. Allocate the DRAM pool as a POSIX shared-memory segment:
+1. Allocate the DRAM pool as a POSIX shared-memory segment. The segment name is `${UID}`-scoped so multiple uids on the same machine do not collide:
 
    ```cpp
-   const std::string shm_name = "/falcon_kv_store_" + std::to_string(store_node_id);
+   const std::string shm_name =
+       "/falcon_kv_store_" + std::to_string(getuid()) + "_" + std::to_string(store_node_id);
    int fd = shm_open(shm_name.c_str(), O_CREAT | O_RDWR, 0660);
    ftruncate(fd, dram_pool_bytes);
    void* base = mmap(nullptr, dram_pool_bytes,
@@ -1978,29 +2285,13 @@ At Store startup, before issuing `RegisterStoreRegion` (§5.4):
                      fd, 0);
    ```
 
-2. Write a JSON discovery descriptor under a well-known runtime path (`falcon_kv.store_runtime_dir`, default `/var/run/falcon_kv_store/`):
+2. Read `NODE_NAME` from env (or `gethostname()` fallback) as `host_node_name`. Open a libpq connection to CN and call `pg_catalog.falcon_store_node_register(store_node_id, host_node_name, host, brpc_port, runtime_dir, shm_name, dram_pool_bytes, block_size, store_epoch)` (§3.4). This is the only public discovery surface — there is no per-host JSON descriptor in v6.5 final. Bump `store_epoch` and re-register if the Store restarts; Clients observe the new value through CN.
 
-   ```json
-   {
-     "store_node_id": 1,
-     "shm_name":      "/falcon_kv_store_1",
-     "shm_bytes":     1073741824,
-     "block_size":    65536,
-     "store_epoch":   1,
-     "brpc_address":  "10.0.0.42:55610",
-     "regions": [
-       { "owner_dn_id": 1, "base_offset": 0,         "region_bytes": 536870912 },
-       { "owner_dn_id": 2, "base_offset": 536870912, "region_bytes": 536870912 }
-     ],
-     "host_id":   "<machine-id>",
-     "owner_uid": 1000,
-     "owner_pid": 4711
-   }
-   ```
+3. Per-DN region partitioning still flows through the bilateral `RegisterStoreRegion` BRPC (§5.4) so each DN learns its slice of the segment. The DN's `KVStoreEndpointTable` is independent of CN — it is fed by these BRPC calls. CN's `falcon_store_node` is the directory; per-DN `RegisterStoreRegion` is the region handshake. Heartbeats hit both (`falcon_store_node_heartbeat` SQL on CN, `KVStoreAdminService::Heartbeat` BRPC on each owning DN).
 
-   Filename convention: `<store_runtime_dir>/store_<store_node_id>.json`. Atomic write via tmp + rename. The descriptor is removed on clean shutdown; stale descriptors are GC'd by Clients on read (PID no longer alive).
+4. SSD spill files keep using their FS-path layout from §12.4 (`<ssd_root>/<store_node_id>/<hash_prefix>/<block_hash>.<version>.kv`). They are accessed by absolute path, so no extra discovery is needed; same-machine Clients can `open()` them directly when `BatchReadFromSSD` is mapped to the local fast path.
 
-3. SSD spill files keep using their FS-path layout from §12.4 (`<ssd_root>/<store_node_id>/<hash_prefix>/<block_hash>.<version>.kv`). They are accessed by absolute path, so no extra discovery is needed; same-host Clients can `open()` them directly when `BatchReadFromSSD` is mapped to the local fast path.
+5. On clean shutdown the Store calls `falcon_store_node_unregister`, then `shm_unlink`s the segment. A crashed Store leaves the row `healthy=true` until the watchdog (§3.4.8) flips it.
 
 #### 12.6.2 Client-side: facade interface and discovery
 
@@ -2035,11 +2326,41 @@ class RemoteKVStoreFacade : public IKVStoreFacade {
 
 class KVStoreFacadeRegistry {
 public:
-    // Discovery: scan `store_runtime_dir`, mmap each segment whose
-    // descriptor's host_id matches the local machine-id (or whose owner_pid
-    // is reachable). Failed mmaps are demoted to remote.
-    void DiscoverLocalStores(const std::string& runtime_dir);
+    // One-shot bootstrap. After this call returns, the periodic refresh
+    // thread is running and the LISTEN connection is established
+    // (if membership_notify_enabled). Idempotent.
+    void Start(const std::string& local_host_node_name,
+               const std::string& cn_libpq_conninfo);
+    void Stop();   // joins the refresh thread + closes LISTEN connection.
 
+    // ---- Membership refresh (§3.4.7) ----
+    //
+    // Three triggers feed one refresh loop:
+    //   - periodic   (membership_refresh_period_ms, default 5000)
+    //   - reactive   (call sites post on RPC failure / STALE_EPOCH)
+    //   - on-demand  (RefreshNow below)
+    //
+    // All three are coalesced through the same rate-limited cycle
+    // (membership_refresh_min_interval_ms, default 500).
+
+    // Application-callable. Triggers a refresh and waits up to timeout_ms
+    // for the next cycle to complete. Returns the post-refresh
+    // (num_dns, num_stores, generation) tuple. Used by:
+    //   - vLLM OffloadingManager.warmup() before a long batch,
+    //   - operator tools verifying a freshly-registered Store appeared,
+    //   - integration tests that want a deterministic gate.
+    struct RefreshResult { int num_dns; int num_stores; uint64_t generation; };
+    RefreshResult RefreshNow(int32_t timeout_ms);
+
+    // Posted by RPC call sites on transport-level failures so the loop
+    // wakes immediately. Coalesced; cheap to call from the hot path.
+    void NotifyRpcFailure(int32_t store_or_dn_id, RpcFailureKind kind);
+
+    // Generation counter; ticks after every successful refresh.
+    // Use to gate "view shifted under me" application logic.
+    uint64_t Generation() const noexcept;
+
+    // ---- Internal ----
     void RegisterLocalShm (int32_t store_id, LocalShmHandle handle);
     void RegisterRemote   (int32_t store_id, const std::string& brpc_endpoint);
     std::shared_ptr<IKVStoreFacade> Resolve(int32_t store_id);
@@ -2062,14 +2383,14 @@ public:
 
 4. **Remote.** `RemoteKVStoreFacade::*` issues the matching `KVDataService_Stub::*` over a pooled `brpc::Channel`. Same observable surface modulo latency.
 
-5. **Resolve.** `KVStoreFacadeRegistry::Resolve(store_id)` returns the local facade if discovery found a same-host descriptor for that id and the mmap succeeded, else the remote facade. Discovery runs once at process startup and refreshes when `RegisterStoreRegion` advertises a new Store or when a `Heartbeat` reports a new `store_epoch` (which means the Store restarted and re-created its segment).
+5. **Resolve.** `KVStoreFacadeRegistry::Resolve(store_id)` returns the local facade if CN discovery (§3.4.6) found a same-`host_node_name` Store row for that id and the `shm_open` + `mmap` succeeded; otherwise the remote facade. If the Store row is `healthy=false` the resolver returns a special "unhealthy" facade that short-circuits reads to cache-miss and refuses writes — matching §3.4.5. The registry's view is kept current by the **membership refresh model in §3.4.7** (periodic + reactive-on-error + on-demand `RefreshNow()`, optional `LISTEN/NOTIFY` push channel). Late-joining Stores and Stores that rejoin with a bumped `store_epoch` are absorbed by that loop; resolve-time semantics here are intentionally simple — the registry is always pointing at the most recent applied state.
 
 #### 12.6.4 Coherence and isolation
 
 The shared-memory path is byte-level only. All metadata correctness still flows through the DN:
 
 - The Client trusts the `(pool_offset, expected_version, expected_store_epoch)` triple returned by `BatchAllocateWithLease` / `BatchLookupWithLease`. Version + status are validated by the metadata catalog (CAS in `BatchUpdateBlockStatus`); the Store does not track per-block versions in v6.
-- `expected_store_epoch` is checked client-side against the descriptor's `store_epoch`; a mismatch fails fast with `STALE_EPOCH (retryable)` and the Client refreshes the descriptor. This catches Store restart even if the descriptor was not yet rotated.
+- `expected_store_epoch` is checked client-side against the cached `store_epoch` of the CN row; a mismatch fails fast with `STALE_EPOCH (retryable)` and the Client re-reads `falcon_store_node`. This catches Store restart even if the heartbeat watchdog has not yet flipped `healthy`.
 - The Store daemon's BRPC service still enforces admission control / inflight limits / version checks for **remote** Clients; a same-host Client doing direct SHM access does not consume the Store's BRPC inflight budget (it is not BRPC traffic), so admission is purely a Client-side responsibility — sized by `falcon_kv.client_max_inflight_per_store` already declared in §27.
 - Permissions: the SHM segment is created `0660` and owned by the operator-configured group; all Client processes intended to share it must run under that group. The Store rejects (or warns) on a permission mismatch at startup.
 
@@ -2327,18 +2648,20 @@ Ordering invariants:
 
 ### 15.2 Store Restart Recovery (DRAM lost)
 
-When a Store restarts, every block on that Store whose status is `ALLOCATED`, `STORED`, or `EVICTING` is no longer recoverable from DRAM.
+When a Store restarts, every block on that Store whose status was `ALLOCATED`, `STORED`, or `EVICTING` is no longer recoverable from DRAM. v6.5 sharpens the v6 reconciliation: rows that have **no on-disk copy** are **deleted**, not just marked `FAILED`. The cache is reconstructible by recompute (vLLM tolerates miss), so deleting reclaims catalog space and keeps the bitmap honest with reality. Rows whose `evicted_path` is still valid are kept and reset to `EVICTED` so the SSD copy can still answer reads.
 
 Steps:
 
-1. Store registers with DN with a new Store epoch.
-2. DN scans rows where `store_node_id == restarted_store_id` and:
-   - if status is `EVICTED` and `evicted_path` is valid -> keep,
-   - if status is `EVICTED` and the SSD file is missing/corrupt -> `FAILED`,
-   - if status is `STORED` and a valid SSD copy exists (e.g. from a prior eviction) -> reset to `EVICTED` with that path,
-   - otherwise -> `FAILED`.
-3. DN clears the bitmap for that Store and rebuilds it from the post-reconciliation rows.
-4. Clients observing `FAILED` get a non-retryable miss (or a clear `NOT_FOUND` if the row is later GC'd).
+1. Store comes up, allocates a fresh SHM segment with a new `store_epoch`, calls `pg_catalog.falcon_store_node_register(...)` (UPSERT) so CN reflects `(shm_name, store_epoch)`.
+2. Store re-issues `RegisterStoreRegion` BRPC to every DN it serves. DN side wakes its `Store-Restart Reconciler` for that `store_node_id`.
+3. **DN's reconciler is triggered by `RegisterStoreRegion` carrying a new `store_epoch`** (different from the value cached in DN-local `KVStoreEndpointTable`). The DN scans `falcon_kvblock_table WHERE store_node_id == restarted_store_id` (the kvblock table itself does not carry a `store_epoch` column — DN-local state is the source of truth for "fresh restart") and applies, one libpq transaction per shard, batched:
+   - `EVICTED` + `evicted_path` valid → **keep**, no rewrite needed (the row is already pointing at SSD; subsequent reads use the SSD path via §12.6.3).
+   - `EVICTED` + SSD file missing/corrupt → **delete row**.
+   - `STORED` + a previously-spilled SSD copy exists → reset to `EVICTED` with that path.
+   - `STORED` / `ALLOCATED` / `EVICTING` with no SSD copy → **delete row** (the DRAM is gone; nothing to recover).
+   The reconciler is idempotent: a second Store restart finds whatever survived the first pass plus any new traffic, and applies the same rules.
+4. DN clears the bitmap for that Store's region(s) and rebuilds it from the post-reconciliation rows.
+5. Clients observing a vanished row get `NOT_FOUND` on the next lookup, exactly the cache-miss path. Their next refresh of `falcon_store_node` will see the new `store_epoch` and trigger a `munmap`/`shm_open` of the new segment.
 
 ### 15.2.1 Store Temporary Removal
 
@@ -2635,6 +2958,30 @@ vllm_kv_cache/
 5. eviction rollback,
 6. Store restart handling,
 7. large batch chunking.
+
+### 19.4.1 Topology generality drills (v6.5)
+
+The harness must demonstrate that no count is hardcoded and that the SHM fast path lights up on a per-Client basis according to `host_node_name`.
+
+1. **Minimal**: `1 CN + 1 DN + 1 Store + 1 Client`, all on one host. Smoke check that everything wires up; the Client should hit the SHM fast path for every block.
+2. **Cross-host BRPC**: `1 CN + 1 DN + 2 Stores + 2 Clients` where the two Clients have different `host_node_name`s and each Store sits with one Client. Each Client must hit SHM only on its colocated Store and BRPC on the other.
+3. **Multi-DN with single Store host**: `1 CN + 3 DNs + 1 Store + 1 Client` (Store partitions its DRAM into 3 regions, registers one with each DN). Client always uses SHM regardless of which DN allocated the block; proves DN count does not change Client-side discovery.
+4. **Reference v6.5 mixed colocation**: `1 CN + 3 DNs + 4 Stores + 4 Clients`, every Client paired with one Store on a distinct `host_node_name`. Each Store partitions its DRAM into 3 regions (one per DN). For every key:
+   - the DN that owns the key's shard runs `BatchAllocateWithLease`; `preferred_store_id` carries the requesting Client's local Store id;
+   - if that local Store has space the alloc lands on it (Client uses SHM facade); otherwise the alloc falls back to another healthy Store and the Client uses BRPC;
+   - the test asserts via the per-Client `local_writes` / `remote_writes` / `local_reads` / `remote_reads` counters that affinity won the typical case (~75%+ traffic is local) but that fallback exercised every cross-host pair at least once.
+5. **Membership churn**: under load, restart one Store; CN row is updated on re-register with a new `store_epoch`; Clients refresh and re-mmap; every in-flight call observes either `STALE_EPOCH (retryable)` or success on the new epoch.
+6. **DN dynamic add**: with the cluster running, start a 4th DN replication group; CM creates the `pg_catalog.falcon_foreign_server` row and the new bgworker inserts the matching `pg_catalog.falcon_dn_node` row on startup; `pg_catalog.falcon_shard_table` is renewed so a fraction of `block_hash` space now routes to the new `server_id`; existing Stores re-read `falcon_dn_node` (single-table SELECT) and (re-)issue `RegisterStoreRegion` to the new DN with the next slice of their DRAM pool; subsequent allocations route through the new DN. A second sub-drill **DN primary failover** kills the current primary of `dn0`; CM elects a new primary, atomically updates `falcon_foreign_server` and `falcon_dn_node`, clients refresh on the next RPC error, replay succeeds against the new primary, and the test asserts that no key was lost and `server_id` mapping in `falcon_shard_table` did not change.
+7. **Late-joining Store** (§3.4.7.3): start `1 CN + 1 DN + 1 Client`, no Store. Run a vLLM-style workload — every lookup is cache-miss (vLLM recomputes), every alloc returns `STORE_UNAVAILABLE`. After T+30s start `falcon_kv_store` on the Client's host. Three sub-assertions:
+   - **Push path** (`membership_notify_enabled=true`, default): Client receives `pg_notify` within `< 200ms` of `falcon_store_node_register`; refresh loop applies the new row; the next allocation lands on the Store using the SHM facade.
+   - **Polling fallback** (run with `membership_notify_enabled=false`): same scenario; assert Client picks the Store up within `<= membership_refresh_period_ms + jitter` (≤ 5.5s in default config).
+   - **On-demand path**: a second variant calls `OffloadingManager.refresh_membership(timeout_ms=2000)` immediately after the operator confirms the Store registered, and asserts the call returns within budget with `num_stores=1`.
+8. **Store rejoin with bumped `store_epoch`** (§3.4.7.3): start `1 CN + 1 DN + 1 Store + 1 Client`. After 1k successful writes, `kill -9` the Store. Watchdog flips `healthy=false` within `store_suspect_ms`; Client reads return cache-miss. After 5s restart the Store (same `store_node_id`, new `store_epoch`). Assert:
+   - the old `shm_name` is `shm_unlink`'d cleanly;
+   - the Client tears down the old facade (close fd, munmap), `shm_open`s the new segment, and `mmap`s it;
+   - the DN reconciler purges `falcon_kvblock_table` rows for that Store that have no SSD copy (verified via SQL `SELECT COUNT(*) WHERE store_node_id=...`);
+   - subsequent writes succeed and use the new SHM segment (verified via `local_writes` counter).
+9. **`RefreshNow()` rate-limit and coalescing** (§3.4.7.1): from a single Client, fire 1000 `RefreshNow()` calls in parallel from 100 threads with `timeout_ms=2000`. Assert that fewer than `(elapsed_ms / membership_refresh_min_interval_ms) + 2` actual CN reads happened (verified by counting `pg_stat_activity` queries against `falcon_store_node`), but every caller eventually returned with a generation `>=` the generation seen at call entry.
 
 ### 19.5 Performance Tests
 

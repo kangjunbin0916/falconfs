@@ -1,6 +1,7 @@
 #include "vllm_kv_cache/src/store/kv_store_engine.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -14,6 +15,33 @@
 namespace falconfs::kv {
 
 namespace {
+
+bool BlockHashForcedToFailSpill(const std::string& block_hash) {
+    const char* env = std::getenv("FALCON_KV_FORCED_SPILL_FAIL_HASHES");
+    if (env == nullptr || env[0] == '\0') {
+        return false;
+    }
+    std::string hay(env);
+    std::size_t pos = 0;
+    while (pos < hay.size()) {
+        std::size_t comma = hay.find(',', pos);
+        std::string tok = (comma == std::string::npos) ? hay.substr(pos) : hay.substr(pos, comma - pos);
+        while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t')) {
+            tok.erase(0, 1);
+        }
+        while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t')) {
+            tok.pop_back();
+        }
+        if (tok == block_hash) {
+            return true;
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        pos = comma + 1;
+    }
+    return false;
+}
 
 StoreResultMeta MakeResult(bool success, int32_t error_code, bool retryable, const char* message) {
     StoreResultMeta out;
@@ -245,6 +273,10 @@ public:
                                      std::string* out_evicted_path) {
         std::lock_guard<std::mutex> lock(mu_);
         StoreWriteResult out;
+        if (BlockHashForcedToFailSpill(block_hash)) {
+            out.result = MakeResult(false, ErrorCode::STORE_WRITE_FAILED, true, "forced spill failure (FALCON_KV_FORCED_SPILL_FAIL_HASHES)");
+            return out;
+        }
         if (spill_manager_ == nullptr) {
             out.result = MakeResult(false, ErrorCode::INTERNAL_ERROR, false, "spill manager not configured");
             return out;

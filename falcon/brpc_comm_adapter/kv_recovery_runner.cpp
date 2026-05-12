@@ -235,4 +235,27 @@ KVRecoveryStats KVRecoveryRunner::Run()
     return stats;
 }
 
+KVRecoveryStats KVRecoveryRunner::ReplayRecoverOnly()
+{
+    KVRecoveryStats stats;
+    if (engine_ == nullptr) {
+        return stats;
+    }
+
+    PGconn *conn = OpenRecoveryConnection(pg_port_);
+    if (conn == nullptr) {
+        return stats;
+    }
+
+    LibpqRecoveryAccessor accessor(conn, shard_id_);
+    ::falconfs::kv::MetadataRecoveryStats r =
+        ::falconfs::kv::ReplayRecoverMetadataFromAccessor(&accessor, engine_.get(), shard_id_, NowMs());
+    PQfinish(conn);
+
+    stats.ok                = true;
+    stats.recovered_rows    = r.recovered_rows;
+    stats.reconciled_evicting = r.reconciled_evicting_rows;
+    return stats;
+}
+
 }  // namespace falcon::kv_proto
