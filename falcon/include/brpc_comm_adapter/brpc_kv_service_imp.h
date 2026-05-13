@@ -57,6 +57,19 @@ public:
         : impl_(std::move(impl)) {}
     ~BrpcKVDataServiceImpl() override = default;
 
+    void WriteBlock(::google::protobuf::RpcController *controller,
+                    const ::falconfs::kv::WriteBlockRequest *request,
+                    ::falconfs::kv::WriteBlockResponse *response,
+                    ::google::protobuf::Closure *done) override;
+    void ReadBlock(::google::protobuf::RpcController *controller,
+                   const ::falconfs::kv::ReadBlockRequest *request,
+                   ::falconfs::kv::ReadBlockResponse *response,
+                   ::google::protobuf::Closure *done) override;
+    void ReadFromSSD(::google::protobuf::RpcController *controller,
+                       const ::falconfs::kv::ReadFromSSDRequest *request,
+                       ::falconfs::kv::ReadFromSSDResponse *response,
+                       ::google::protobuf::Closure *done) override;
+
     void BatchWriteBlock(::google::protobuf::RpcController *controller,
                          const ::falconfs::kv::BatchWriteBlockRequest *request,
                          ::falconfs::kv::BatchWriteBlockResponse *response,

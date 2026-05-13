@@ -6,6 +6,7 @@
 
 #include "kv_common.pb.h"
 #include "kv_metadata_service.pb.h"
+#include "tests/falcon_kv/kv_e2e_block_size.h"
 
 namespace {
 
@@ -68,7 +69,7 @@ int main(int argc, char **argv)
     alloc_req.set_deduplicate_in_request(true);
     auto *alloc_item = alloc_req.add_items();
     alloc_item->set_block_hash(block_hash);
-    alloc_item->set_block_size(65536);
+    alloc_item->set_block_size(falconfs::kv::test::E2eKvBlockSize());
     alloc_item->set_preferred_store_id(1);
     alloc_item->set_allow_fallback_store(true);
 

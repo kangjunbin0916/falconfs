@@ -131,8 +131,8 @@ TEST(KVDataBrpcServiceAdapter, WriteThenReadRoundtripThroughServiceAbi) {
     auto* r = rreq.add_items();
     r->set_block_hash("brpc-d1");
     r->set_pool_offset(0);
-    r->set_block_size(65536);
-    r->set_expected_version(1);
+    r->set_block_size(10);
+    r->set_expected_version(0);
     r->set_expected_store_epoch(1);
     BatchReadBlockResponse rrsp;
     FlagClosure rdone;

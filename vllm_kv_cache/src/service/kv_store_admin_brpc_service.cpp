@@ -114,7 +114,12 @@ public:
         const std::string hash(req.block_hash().data(), static_cast<std::size_t>(req.block_hash().size()));
         std::string evicted_path;
         StoreWriteResult wr =
-            engine_->SpillBlockToSSD(hash, req.expected_version(), &evicted_path);
+            engine_->SpillBlockToSSD(hash,
+                                     req.pool_offset(),
+                                     req.expected_version(),
+                                     req.expected_store_epoch(),
+                                     req.dram_read_size(),
+                                     &evicted_path);
         ItemResultMeta* m = resp->mutable_result();
         m->set_success(wr.result.success);
         m->set_error_code(static_cast<ErrorCode>(wr.result.error_code));

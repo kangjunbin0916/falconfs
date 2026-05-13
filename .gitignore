@@ -1,6 +1,12 @@
 .DS_Store
 .idea
 .vscode
+.cursor/
+
+# Editor swap files
+*.swp
+*.swo
+*~
 *.log
 *.a
 *.o

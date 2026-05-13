@@ -46,12 +46,10 @@
 
 #include "kv_common.pb.h"
 #include "kv_metadata_service.pb.h"
+#include "tests/falcon_kv/kv_e2e_block_size.h"
 
-namespace {
-
-constexpr int32_t kBlockSize = 65536;
-// region_bytes = 64 * 65536 in falcon/connection_pool/kv_backend_rpc.cpp, so
-// at most 64 distinct DRAM slots per DN engine. Keep total <= 64 per phase.
+// At most 64 distinct DRAM slots per DN engine (per-region bitmap); stress
+// configs keep threads*batch_size*waves <= this bound.
 constexpr int kMaxDistinctBlocks = 64;
 
 struct StressConfig {
@@ -145,7 +143,7 @@ bool RunAllocate(const GlobalConfig& gcfg, const StressConfig& cfg, int wid, Wav
     for (const auto& h : st->hashes) {
         auto* it = req.add_items();
         it->set_block_hash(h);
-        it->set_block_size(kBlockSize);
+        it->set_block_size(falconfs::kv::test::E2eKvBlockSize());
         it->set_preferred_store_id(1);
         it->set_allow_fallback_store(true);
     }
@@ -527,7 +525,7 @@ bool RunInRequestDedup(const GlobalConfig& gcfg, std::string* err) {
     for (int i = 0; i < N; ++i) {
         auto* it = req.add_items();
         it->set_block_hash(hash);
-        it->set_block_size(kBlockSize);
+        it->set_block_size(falconfs::kv::test::E2eKvBlockSize());
         it->set_preferred_store_id(1);
         it->set_allow_fallback_store(true);
     }
@@ -629,7 +627,7 @@ bool RunCrossRequestRaceWithRetry(const GlobalConfig& gcfg, std::string* err) {
                 req.set_deduplicate_in_request(false);
                 auto* it = req.add_items();
                 it->set_block_hash(hash);
-                it->set_block_size(kBlockSize);
+                it->set_block_size(falconfs::kv::test::E2eKvBlockSize());
                 it->set_preferred_store_id(1);
                 it->set_allow_fallback_store(true);
                 falconfs::kv::BatchAllocateResponse rsp;
@@ -739,8 +737,6 @@ void PrintUsage(const char* argv0) {
         "every block is fully reclaimed between sweeps so the engine bitmap and the\n"
         "persistent catalog return to a clean state.\n";
 }
-
-} // namespace
 
 int main(int argc, char** argv) {
     GlobalConfig gcfg;

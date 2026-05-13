@@ -101,6 +101,25 @@ public:
         }
     }
 
+    void WriteBlock(const WriteBlockRequest& req, WriteBlockResponse* resp) override
+    {
+        auto* wr = resp->mutable_result();
+        wr->set_block_hash(req.item().block_hash());
+        FillErr(wr->mutable_result(), "store unhealthy");
+    }
+    void ReadBlock(const ReadBlockRequest& req, ReadBlockResponse* resp) override
+    {
+        auto* rr = resp->mutable_result();
+        rr->set_block_hash(req.item().block_hash());
+        FillErr(rr->mutable_result(), "store unhealthy");
+    }
+    void ReadFromSSD(const ReadFromSSDRequest& req, ReadFromSSDResponse* resp) override
+    {
+        auto* sr = resp->mutable_result();
+        sr->set_block_hash(req.item().block_hash());
+        FillErr(sr->mutable_result(), "store unhealthy");
+    }
+
 private:
     int32_t sid_;
 };
@@ -138,6 +157,28 @@ public:
         KVDataService_Stub stub(ch_.get());
         brpc::Controller cntl;
         stub.BatchReadFromSSD(&cntl, &req, resp, nullptr);
+    }
+
+    void WriteBlock(const WriteBlockRequest& req, WriteBlockResponse* resp) override
+    {
+        if (ch_ == nullptr) return;
+        KVDataService_Stub stub(ch_.get());
+        brpc::Controller cntl;
+        stub.WriteBlock(&cntl, &req, resp, nullptr);
+    }
+    void ReadBlock(const ReadBlockRequest& req, ReadBlockResponse* resp) override
+    {
+        if (ch_ == nullptr) return;
+        KVDataService_Stub stub(ch_.get());
+        brpc::Controller cntl;
+        stub.ReadBlock(&cntl, &req, resp, nullptr);
+    }
+    void ReadFromSSD(const ReadFromSSDRequest& req, ReadFromSSDResponse* resp) override
+    {
+        if (ch_ == nullptr) return;
+        KVDataService_Stub stub(ch_.get());
+        brpc::Controller cntl;
+        stub.ReadFromSSD(&cntl, &req, resp, nullptr);
     }
 
 private:
@@ -230,6 +271,65 @@ public:
         KVDataService_Stub stub(ssd_ch_.get());
         brpc::Controller cntl;
         stub.BatchReadFromSSD(&cntl, &req, resp, nullptr);
+    }
+
+    void WriteBlock(const WriteBlockRequest& req, WriteBlockResponse* resp) override
+    {
+        if (!IsHealthy()) {
+            auto* wr = resp->mutable_result();
+            wr->set_block_hash(req.item().block_hash());
+            FillErr(wr->mutable_result(), "local shm not mapped");
+            return;
+        }
+        const WriteItem& it = req.item();
+        auto* wr          = resp->mutable_result();
+        wr->set_block_hash(it.block_hash());
+        const size_t off = static_cast<size_t>(it.pool_offset());
+        const size_t psz = it.payload().size();
+        if (it.pool_offset() < 0 || off + psz > shm_->len) {
+            FillErr(wr->mutable_result(), "pool_offset/payload out of range");
+            return;
+        }
+        std::memcpy(static_cast<char*>(shm_->base) + off, it.payload().data(), psz);
+        wr->mutable_result()->set_success(true);
+        wr->set_bytes_written(static_cast<int32_t>(psz));
+    }
+
+    void ReadBlock(const ReadBlockRequest& req, ReadBlockResponse* resp) override
+    {
+        if (!IsHealthy()) {
+            auto* rr = resp->mutable_result();
+            rr->set_block_hash(req.item().block_hash());
+            FillErr(rr->mutable_result(), "local shm not mapped");
+            return;
+        }
+        const ReadItem& it = req.item();
+        auto* rr          = resp->mutable_result();
+        rr->set_block_hash(it.block_hash());
+        const size_t off = static_cast<size_t>(it.pool_offset());
+        const int bs     = it.block_size() > 0 ? it.block_size() : shm_->block_size;
+        if (it.pool_offset() < 0 || off + static_cast<size_t>(bs) > shm_->len) {
+            FillErr(rr->mutable_result(), "pool_offset out of range");
+            return;
+        }
+        const char* p = static_cast<const char*>(shm_->base) + off;
+        rr->set_payload(p, static_cast<size_t>(bs));
+        rr->mutable_result()->set_success(true);
+        rr->set_compression(CompressionType::COMPRESSION_NONE);
+        rr->set_original_size(bs);
+    }
+
+    void ReadFromSSD(const ReadFromSSDRequest& req, ReadFromSSDResponse* resp) override
+    {
+        if (ssd_ch_ == nullptr) {
+            auto* sr = resp->mutable_result();
+            sr->set_block_hash(req.item().block_hash());
+            FillErr(sr->mutable_result(), "ssd path requires store BRPC");
+            return;
+        }
+        KVDataService_Stub stub(ssd_ch_.get());
+        brpc::Controller cntl;
+        stub.ReadFromSSD(&cntl, &req, resp, nullptr);
     }
 
 private:

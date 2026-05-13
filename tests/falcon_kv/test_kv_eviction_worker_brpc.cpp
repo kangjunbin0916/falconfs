@@ -77,6 +77,7 @@ TEST(KvEvictionWorkerBrpc, SpillBlockToSSDOverBrpcSucceedsAgainstStore) {
     req.set_block_hash("spill-brpc-ok");
     req.set_expected_version(1);
     req.set_expected_store_epoch(1);
+    req.set_dram_read_size(12);
     brpc::Controller cntl;
     stub.SpillBlockToSSD(&cntl, &req, &resp, nullptr);
     ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
@@ -86,7 +87,7 @@ TEST(KvEvictionWorkerBrpc, SpillBlockToSSDOverBrpcSucceedsAgainstStore) {
     server.Join();
 }
 
-TEST(KvEvictionWorkerBrpc, SpillBlockToSSDOverBrpcFailsOnStaleVersion) {
+TEST(KvEvictionWorkerBrpc, SpillBlockToSSDOverBrpcFailsOnStaleStoreEpoch) {
     const auto root =
         (fs::temp_directory_path() / ("kv_ev_brpc_bad_" + std::to_string(::getpid()))).string();
     fs::create_directories(root);
@@ -137,8 +138,9 @@ TEST(KvEvictionWorkerBrpc, SpillBlockToSSDOverBrpcFailsOnStaleVersion) {
     req.set_store_node_id(1);
     req.set_pool_offset(0);
     req.set_block_hash("spill-brpc-bad");
-    req.set_expected_version(99);
-    req.set_expected_store_epoch(1);
+    req.set_expected_version(1);
+    req.set_expected_store_epoch(99);
+    req.set_dram_read_size(1);
     brpc::Controller cntl;
     stub.SpillBlockToSSD(&cntl, &req, &resp, nullptr);
     ASSERT_FALSE(cntl.Failed());

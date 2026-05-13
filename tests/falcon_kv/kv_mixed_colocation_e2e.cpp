@@ -29,11 +29,10 @@
 
 #include "kv_common.pb.h"
 #include "kv_metadata_service.pb.h"
+#include "tests/falcon_kv/kv_e2e_block_size.h"
 #include "vllm_kv_cache/src/store/kv_store_facade.h"
 
 namespace {
-
-constexpr int32_t kBlockSize = 65536;
 
 int Fail(const std::string& msg) {
     std::cerr << "MIXED_COLOCATION_FAIL: " << msg << std::endl;
@@ -80,7 +79,7 @@ bool AllocateOne(const std::string& dn_ep,
     auto* it = req.add_items();
     it->set_block_hash("mix_" + run_id + "_p" + std::to_string(phase) + "_k" +
                        std::to_string(key_idx));
-    it->set_block_size(kBlockSize);
+    it->set_block_size(falconfs::kv::test::E2eKvBlockSize());
     it->set_preferred_store_id(preferred_store_id);
     it->set_allow_fallback_store(true);
     req.set_deduplicate_in_request(true);
@@ -203,6 +202,37 @@ int main(int argc, char** argv) {
         if (rate < 0.72) {
             return Fail("phase " + std::to_string(phase) + " affinity " + std::to_string(rate) +
                         " below 0.72 threshold");
+        }
+        reg.Stop();
+    }
+
+    if (global_fallback < 1) {
+        // When every phase hits its preferred store (common with 4 stores + healthy
+        // regions), still prove the allocator can leave the preferred hint: prefer a
+        // store id that is not registered on the DN so PickRegions orders fallbacks.
+        const std::string fb_node = "v65mix_fb";
+        if (setenv("NODE_NAME", fb_node.c_str(), 1) != 0) {
+            return Fail("setenv NODE_NAME failed (fallback probe)");
+        }
+        falconfs::kv::KVStoreFacadeRegistry reg;
+        reg.Start(fb_node, cn_conninfo);
+        (void)reg.RefreshNow(8000);
+        constexpr int32_t kAbsentPreferredStore = 2147483647;
+        const std::string h = "mix_" + run_id + "_p4_k0";
+        const size_t ep_idx = RouteIndex(h, dn_endpoints.size());
+        int32_t sid = 0;
+        if (!AllocateOne(dn_endpoints[ep_idx], timeout_ms, run_id, 4, 0, kAbsentPreferredStore, &sid)) {
+            reg.Stop();
+            return Fail("forced fallback allocate failed");
+        }
+        if (sid == kAbsentPreferredStore) {
+            reg.Stop();
+            return Fail("forced fallback returned absent preferred store id");
+        }
+        ++global_fallback;
+        if (!FreeOne(dn_endpoints[ep_idx], timeout_ms, run_id, 4, h, 1)) {
+            reg.Stop();
+            return Fail("forced fallback free failed");
         }
         reg.Stop();
     }

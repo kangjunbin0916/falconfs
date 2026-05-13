@@ -31,6 +31,12 @@ class BatchReadBlockRequest;
 class BatchReadBlockResponse;
 class BatchReadFromSSDRequest;
 class BatchReadFromSSDResponse;
+class WriteBlockRequest;
+class WriteBlockResponse;
+class ReadBlockRequest;
+class ReadBlockResponse;
+class ReadFromSSDRequest;
+class ReadFromSSDResponse;
 
 // Trip kind reported by RPC call sites that observed a transport-level
 // failure. The refresh loop uses this to decide whether to refresh the DN
@@ -61,6 +67,10 @@ public:
     virtual int32_t StoreNodeId() const = 0;
     virtual bool    IsLocal()      const = 0;
     virtual bool    IsHealthy()    const = 0;
+
+    virtual void WriteBlock(const WriteBlockRequest&, WriteBlockResponse*)     = 0;
+    virtual void ReadBlock(const ReadBlockRequest&, ReadBlockResponse*)       = 0;
+    virtual void ReadFromSSD(const ReadFromSSDRequest&, ReadFromSSDResponse*) = 0;
 
     virtual void BatchWriteBlock (const BatchWriteBlockRequest&,
                                   BatchWriteBlockResponse*)  = 0;

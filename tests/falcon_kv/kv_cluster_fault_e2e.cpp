@@ -45,10 +45,9 @@
 
 #include "kv_common.pb.h"
 #include "kv_metadata_service.pb.h"
+#include "tests/falcon_kv/kv_e2e_block_size.h"
 
 namespace {
-
-constexpr int32_t kBlockSize = 65536;
 
 int Fail(const std::string& msg) {
     std::cerr << "CLUSTER_FAULT_FAIL: " << msg << std::endl;
@@ -95,7 +94,7 @@ int RunLargeBatch(const std::string& endpoint) {
     for (const auto& h : hashes) {
         auto* it = a.add_items();
         it->set_block_hash(h);
-        it->set_block_size(kBlockSize);
+        it->set_block_size(falconfs::kv::test::E2eKvBlockSize());
         it->set_preferred_store_id(1);
         it->set_allow_fallback_store(true);
     }
@@ -185,7 +184,7 @@ int RunPartialStoreWrite(const std::string& endpoint) {
     for (const auto& h : hashes) {
         auto* it = a.add_items();
         it->set_block_hash(h);
-        it->set_block_size(kBlockSize);
+        it->set_block_size(falconfs::kv::test::E2eKvBlockSize());
         it->set_preferred_store_id(1);
         it->set_allow_fallback_store(true);
     }
@@ -302,7 +301,7 @@ int RunStaleStoreEpoch(const std::string& endpoint) {
     a.mutable_meta()->set_request_id(run_id + "_alloc");
     auto* ait = a.add_items();
     ait->set_block_hash(h);
-    ait->set_block_size(kBlockSize);
+    ait->set_block_size(falconfs::kv::test::E2eKvBlockSize());
     ait->set_preferred_store_id(1);
     ait->set_allow_fallback_store(true);
     BatchAllocateResponse ar;
@@ -380,7 +379,7 @@ int RunEvictionRollback(const std::string& endpoint, int wait_ms) {
     a.mutable_meta()->set_request_id(run_id + "_alloc");
     auto* ait = a.add_items();
     ait->set_block_hash(h);
-    ait->set_block_size(kBlockSize);
+    ait->set_block_size(falconfs::kv::test::E2eKvBlockSize());
     ait->set_preferred_store_id(1);
     ait->set_allow_fallback_store(true);
     BatchAllocateResponse ar;
@@ -503,7 +502,7 @@ int RunDnRestartPhase1(const std::string& endpoint, const std::string& state_fil
     a.mutable_meta()->set_request_id(run_id + "_alloc");
     auto* ait = a.add_items();
     ait->set_block_hash(s.block_hash);
-    ait->set_block_size(kBlockSize);
+    ait->set_block_size(falconfs::kv::test::E2eKvBlockSize());
     ait->set_preferred_store_id(1);
     ait->set_allow_fallback_store(true);
     BatchAllocateResponse ar;

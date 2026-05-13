@@ -36,10 +36,9 @@
 
 #include "kv_common.pb.h"
 #include "kv_metadata_service.pb.h"
+#include "tests/falcon_kv/kv_e2e_block_size.h"
 
 namespace {
-
-constexpr int32_t kBlockSize = 65536;
 
 int Fail(const std::string& msg) {
     std::cerr << "CLUSTER_E2E_FAIL: " << msg << std::endl;
@@ -167,7 +166,7 @@ bool RunIteration(const Config& cfg, int iteration_idx,
             [&](BatchAllocateRequest& req, KeyState& st) {
                 auto* it = req.add_items();
                 it->set_block_hash(st.block_hash);
-                it->set_block_size(kBlockSize);
+                it->set_block_size(falconfs::kv::test::E2eKvBlockSize());
                 it->set_preferred_store_id(1);
                 it->set_allow_fallback_store(true);
                 req.set_deduplicate_in_request(true);

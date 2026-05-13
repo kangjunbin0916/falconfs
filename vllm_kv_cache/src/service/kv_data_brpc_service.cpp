@@ -17,6 +17,30 @@ struct ClosureGuard {
 
 }  // namespace
 
+void KVDataBrpcServiceAdapter::WriteBlock(::google::protobuf::RpcController* /*controller*/,
+                                          const WriteBlockRequest* request,
+                                          WriteBlockResponse* response,
+                                          ::google::protobuf::Closure* done) {
+    ClosureGuard guard(done);
+    impl_->WriteBlock(*request, response);
+}
+
+void KVDataBrpcServiceAdapter::ReadBlock(::google::protobuf::RpcController* /*controller*/,
+                                         const ReadBlockRequest* request,
+                                         ReadBlockResponse* response,
+                                         ::google::protobuf::Closure* done) {
+    ClosureGuard guard(done);
+    impl_->ReadBlock(*request, response);
+}
+
+void KVDataBrpcServiceAdapter::ReadFromSSD(::google::protobuf::RpcController* /*controller*/,
+                                           const ReadFromSSDRequest* request,
+                                           ReadFromSSDResponse* response,
+                                           ::google::protobuf::Closure* done) {
+    ClosureGuard guard(done);
+    impl_->ReadFromSSD(*request, response);
+}
+
 void KVDataBrpcServiceAdapter::BatchWriteBlock(::google::protobuf::RpcController* /*controller*/,
                                                const BatchWriteBlockRequest* request,
                                                BatchWriteBlockResponse* response,

@@ -8,9 +8,11 @@
  */
 
 #include <brpc/channel.h>
+#include <brpc/protocol.h>
 #include <brpc/server.h>
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -280,12 +282,23 @@ int main(int argc, char** argv) {
     (void) argc;
     (void) argv;
 
+    /* Large vLLM KV blocks in a single BatchWrite/BatchRead need a bigger cap
+     * than brpc's default (~64 MiB). Applies to this process only. */
+    constexpr uint64_t kMinBrpcMaxBody = 512ULL * 1024 * 1024;
+    if (brpc::FLAGS_max_body_size < kMinBrpcMaxBody) {
+        brpc::FLAGS_max_body_size = kMinBrpcMaxBody;
+    }
+
     const int cn_port = GetEnvInt("FALCON_KV_STORE_CN_PGPORT", 55500);
     const int store_brpc_port = GetEnvInt("FALCON_KV_STORE_BRPC_PORT", 18765);
     const std::string dn_csv = GetEnvStr("FALCON_KV_STORE_DN_POOLERS", "55530,55550");
     const int32_t store_node_id = static_cast<int32_t>(GetEnvInt("FALCON_KV_STORE_NODE_ID", 1));
     const int64_t store_epoch = GetEnvInt64("FALCON_KV_STORE_EPOCH", 1);
-    const int32_t block_size  = static_cast<int32_t>(GetEnvInt("FALCON_KV_STORE_BLOCK_SIZE", 65536));
+    /* Default matches vLLM-style logical KV block bytes (fp16 Llama-class slice):
+     * 2 * layers * kv_heads * head_dim * gpu_block_tokens * sizeof(fp16). */
+    constexpr int kVllmDefaultBlockBytes = 2 * 32 * 8 * 128 * 16 * 2;
+    const int32_t block_size =
+        static_cast<int32_t>(GetEnvInt("FALCON_KV_STORE_BLOCK_SIZE", kVllmDefaultBlockBytes));
     const std::string bind_ip = GetEnvStr("FALCON_KV_STORE_BIND_IP", "0.0.0.0");
 
     const std::vector<int> dn_ports = ParseDnPoolerPorts(dn_csv);
@@ -295,8 +308,21 @@ int main(int argc, char** argv) {
     }
 
     constexpr int64_t kBytesPerDnRegion = 64LL * 65536LL;
-    const int64_t kLegacyTotalBytes     = kBytesPerDnRegion * static_cast<int64_t>(dn_ports.size());
-    const int64_t slice_bytes           = kBytesPerDnRegion;
+    const int64_t kLegacyTotalBytes = kBytesPerDnRegion * static_cast<int64_t>(dn_ports.size());
+    const int64_t dram_env            = GetEnvInt64("FALCON_KV_STORE_DRAM_BYTES", 0);
+    const int64_t dn_n                = static_cast<int64_t>(std::max<std::size_t>(1, dn_ports.size()));
+    const int64_t bs                  = static_cast<int64_t>(block_size);
+    /* At least 64 logical blocks per DN slice so multi-DN routing + batched tests
+     * fit; round ``region_bytes`` so each DN slice is an integer multiple of
+     * ``block_size`` (RegisterStoreRegion / pool offsets rely on alignment). */
+    const int64_t min_slots_total = bs * 64LL * dn_n;
+    int64_t region_bytes =
+        (dram_env > 0) ? dram_env : std::max(kLegacyTotalBytes, min_slots_total);
+    const int64_t align = bs * dn_n;
+    if (align > 0) {
+        region_bytes = (region_bytes + align - 1) / align * align;
+    }
+    const int64_t slice_bytes = region_bytes / dn_n;
 
     const std::string host_node = ResolveHostNodeName();
     const std::string advertise_host = GetEnvStr("FALCON_KV_STORE_ADVERTISE_HOST", "127.0.0.1");
@@ -309,7 +335,7 @@ int main(int argc, char** argv) {
     auto store_engine = std::make_shared<falconfs::kv::KVStoreEngine>(
         store_node_id,
         /*base_offset=*/0,
-        /*region_bytes=*/kLegacyTotalBytes,
+        /*region_bytes=*/region_bytes,
         block_size,
         store_epoch);
 
@@ -351,7 +377,7 @@ int main(int argc, char** argv) {
         return 4;
     }
     if (!ExecStoreRegister(cn, store_node_id, host_node, advertise_host, store_brpc_port, runtime_dir,
-                            shm_name, kLegacyTotalBytes, block_size, store_epoch)) {
+                            shm_name, region_bytes, block_size, store_epoch)) {
         fprintf(stderr, "[falcon_kv_store] falcon_store_node_register failed\n");
         PQfinish(cn);
         server.Stop(0);
@@ -394,7 +420,7 @@ int main(int argc, char** argv) {
     });
 
     printf("[falcon_kv_store] ready store_node_id=%d brpc=%s dram_bytes=%lld\n", store_node_id,
-           store_brpc_endpoint.c_str(), static_cast<long long>(kLegacyTotalBytes));
+           store_brpc_endpoint.c_str(), static_cast<long long>(region_bytes));
     fflush(stdout);
 
     server.RunUntilAskedToQuit();

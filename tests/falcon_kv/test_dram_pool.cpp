@@ -1,7 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "vllm_kv_cache/src/store/dram_pool.h"
 
@@ -45,6 +48,54 @@ TEST(DramPool, OversizedPayloadRejected) {
 
 TEST(DramPool, RejectsNonMultipleSize) {
     EXPECT_THROW(DramPool(5000, 4096), std::invalid_argument);
+}
+
+TEST(DramPool, ConcurrentWritesDisjointStripes) {
+    DramPool pool(8192, 4096);
+    ASSERT_GE(pool.NumStripes(), 2u);
+    std::vector<std::thread> threads;
+    threads.emplace_back([&] {
+        DramPoolWriteResult w = pool.Write(0, "aaaa");
+        ASSERT_TRUE(w.ok);
+    });
+    threads.emplace_back([&] {
+        DramPoolWriteResult w = pool.Write(4096, "bbbb");
+        ASSERT_TRUE(w.ok);
+    });
+    for (auto& t : threads) {
+        t.join();
+    }
+    std::string a;
+    std::string b;
+    ASSERT_TRUE(pool.Read(0, 4, &a));
+    ASSERT_TRUE(pool.Read(4096, 4, &b));
+    EXPECT_EQ(a, "aaaa");
+    EXPECT_EQ(b, "bbbb");
+}
+
+TEST(DramPool, ConcurrentReadsSameSlot) {
+    DramPool pool(4096, 4096);
+    ASSERT_TRUE(pool.Write(0, "concurrent-read").ok);
+    constexpr int kReaders = 16;
+    std::vector<std::thread> threads;
+    threads.reserve(kReaders);
+    for (int i = 0; i < kReaders; ++i) {
+        threads.emplace_back([&pool] {
+            std::string out;
+            ASSERT_TRUE(pool.Read(0, 15, &out));
+            EXPECT_EQ(out, "concurrent-read");
+        });
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+}
+
+TEST(DramPool, StripeCountFromEnv) {
+    ASSERT_EQ(::setenv("FALCON_KV_STORE_DRAM_STRIPES", "3", 1), 0);
+    DramPool pool(4096, 4096);
+    EXPECT_EQ(pool.NumStripes(), 3u);
+    ::unsetenv("FALCON_KV_STORE_DRAM_STRIPES");
 }
 
 }  // namespace falconfs::kv

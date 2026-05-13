@@ -17,6 +17,9 @@ from typing import List
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 
+# Match ``falcon_kv_store`` default / mixed E2E (vLLM logical KV block bytes).
+_VLLM_DEFAULT_KV_BLOCK_BYTES = 2 * 32 * 8 * 128 * 16 * 2
+
 
 DN1_ENDPOINT = "127.0.0.1:55530"
 DN2_ENDPOINT = "127.0.0.1:55550"
@@ -49,11 +52,12 @@ class OffloadingManagerClusterBrpcTest(unittest.TestCase):
         )
         # Unique per-test prefix so re-runs do not collide with leftover rows.
         self._prefix = f"py_omcb_{int(time.time() * 1000)}_{id(self)}"
+        blk = int(os.environ.get("FALCON_MIX_KV_BLOCK_BYTES", str(_VLLM_DEFAULT_KV_BLOCK_BYTES)))
         self.mgr = FalconFSOffloadingManager(
             client_id=4242,
             client_hostname="py-cluster-test",
             mode="cluster",
-            block_size=65536,
+            block_size=max(4096, blk),
             timeout_ms=10000,
             cn_conninfo=self.cn_conninfo,
         )
@@ -96,10 +100,11 @@ class OffloadingManagerClusterBrpcTest(unittest.TestCase):
             allocated_keys = {s["block_hash"] for s in spec.specs}
             self.assertEqual(allocated_keys, set(keys))
 
+            bs = self.mgr.block_size
             # complete_store(success=True) drives BatchWrite + STORED CAS.
             self.mgr.complete_store(
                 keys,
-                data={k: b"\x00" * 256 for k in keys},
+                data={k: b"\x00" * bs for k in keys},
                 req_context=None,
                 success=True,
             )
@@ -111,6 +116,26 @@ class OffloadingManagerClusterBrpcTest(unittest.TestCase):
 
             # touch (renew) succeeds end-to-end without raising.
             self.mgr.touch(keys, req_context=None)
+        finally:
+            self._cleanup(keys)
+
+    def test_prepare_load_roundtrip_after_store(self):
+        """Exercise ``prepare_load`` / ``complete_load`` (BatchRead) after STORED."""
+        keys = [self._key(f"ld{i}") for i in range(3)]
+        bs = self.mgr.block_size
+        pat = bytes(i & 0xFF for i in range(256))
+        blob = (pat * ((bs + 255) // 256))[:bs]
+        payload = {k: blob for k in keys}
+        try:
+            self.assertFalse(any(self.mgr.batch_lookup(keys, None).values()))
+            spec = self.mgr.prepare_store(keys, None)
+            self.assertIsNotNone(spec)
+            self.mgr.complete_store(keys, payload, None, success=True)
+            self.assertTrue(all(self.mgr.batch_lookup(keys, None).values()))
+            ld = self.mgr.prepare_load(keys, None)
+            for k in keys:
+                self.assertEqual(ld.data.get(k), payload[k], k)
+            self.mgr.complete_load(keys, None)
         finally:
             self._cleanup(keys)
 

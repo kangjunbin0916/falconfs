@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
@@ -23,6 +26,24 @@ STATUS_STORED = int(BlockStatus.STORED)
 STATUS_EVICTING = int(BlockStatus.EVICTING)
 STATUS_EVICTED = int(BlockStatus.EVICTED)
 STATUS_FAILED = int(BlockStatus.FAILED)
+
+
+def _v66_default_data_parallelism_max() -> int:
+    """``falcon_kv.client_data_parallelism_max`` — design §29.5.2: min(64, hw_concurrency*2)."""
+    n = os.cpu_count() or 1
+    return min(64, max(1, n * 2))
+
+
+def _env_parallelism_max(env_name: str, default: int) -> int:
+    """Positive int from env, clamped to [1, 4096]; invalid or empty → default."""
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return default
+    try:
+        v = int(raw)
+        return max(1, min(v, 4096))
+    except ValueError:
+        return default
 
 
 @dataclass
@@ -67,6 +88,16 @@ class FalconFSOffloadingManager:
     test scaffold that lets reference tests push payload bytes through the
     Python in-memory store; the native (cluster-mode) client receives bytes
     via the Store BRPC service and does not pass them through this method.
+
+    **Cluster store I/O (v6.6.x §29.5):** ``complete_store`` / ``prepare_load``
+    fan out **one unary** ``Store.write`` / ``Store.read`` (BRPC ``WriteBlock`` /
+    ``ReadBlock`` with ``items_size==1``) **per logical block** through
+    ``_data_stage_pool`` when multiple keys are in flight. ``(dn_id, store_id)``
+    is only a routing index — concurrency is capped by
+    ``FALCON_KV_CLIENT_DATA_PARALLELISM_MAX`` (default ``min(64, hw*2)``) and
+    ``FALCON_KV_CLIENT_META_PARALLELISM_MAX`` (default ``num_dns`` in cluster
+    mode). Metadata updates after each write use per-key ``update_status`` unless
+    the DN client exposes ``batch_update_status``.
     """
 
     def __init__(
@@ -131,6 +162,24 @@ class FalconFSOffloadingManager:
         self._router = Router(self.shard_table) if self.shard_table else None
         self._routing: Dict[str, int] = {}
         self._promote_worker = PromoteWorker(self) if mode == "cluster" else None
+        _dns = max(1, len(self.shard_table)) if self.shard_table else 1
+        _data_def = _v66_default_data_parallelism_max()
+        _meta_def = _dns if mode == "cluster" else min(_dns, _v66_default_data_parallelism_max())
+        self._data_parallelism_max = _env_parallelism_max(
+            "FALCON_KV_CLIENT_DATA_PARALLELISM_MAX", _data_def
+        )
+        self._meta_parallelism_max = _env_parallelism_max(
+            "FALCON_KV_CLIENT_META_PARALLELISM_MAX", _meta_def
+        )
+        self._data_stage_pool = ThreadPoolExecutor(
+            max_workers=self._data_parallelism_max, thread_name_prefix="kv-om-data"
+        )
+        self._meta_stage_pool = ThreadPoolExecutor(
+            max_workers=self._meta_parallelism_max, thread_name_prefix="kv-om-meta"
+        )
+        self._meta_update_locks: Dict[int, threading.Lock] = {}
+        if mode == "cluster":
+            self._meta_update_locks = {int(dn): threading.Lock() for dn in sorted(self.shard_table.keys())}
 
     def lookup(self, key: str, req_context=None) -> bool | None:
         result = self._batch_lookup_impl([key], req_context, renew_lease_on_hit=False)
@@ -197,6 +246,9 @@ class FalconFSOffloadingManager:
                 }
             self._router = Router(self.shard_table)
             self._routing.clear()
+            for dn_id in self._clusters:
+                if dn_id not in self._meta_update_locks:
+                    self._meta_update_locks[dn_id] = threading.Lock()
         return stats
 
     def batch_lookup(self, keys: List[str], req_context) -> Dict[str, bool]:
@@ -292,28 +344,39 @@ class FalconFSOffloadingManager:
                 )
         return LoadStoreSpec(specs=specs)
 
-    def _batch_complete_store_impl(
-        self, keys: List[str], data: Dict[str, bytes], req_context
-    ) -> Dict[str, bool]:
-        batch_id = self._mk_request_id()
-        successful: Dict[str, bool] = {}
-        for key in keys:
-            payload = data.get(key)
-            if payload is None:
-                continue
-            loc = self.local_cache.get(key)
-            if not loc:
-                continue
-            cluster = self._clusters.get(loc.dn_id) or self._cluster_for(key)
-            write = cluster.store.write(
-                loc.store_id,
-                loc.pool_offset,
-                payload,
-                loc.store_epoch,
-                self.block_size,
-            )
-            if not write.success:
-                continue
+    def _complete_store_write_one_key(
+        self, key: str, data: Dict[str, bytes], batch_id: str, req_context
+    ) -> bool:
+        del req_context
+        payload = data.get(key)
+        if payload is None:
+            return False
+        loc = self.local_cache.get(key)
+        if not loc:
+            return False
+        cluster = self._clusters.get(loc.dn_id) or self._cluster_for(key)
+        write = cluster.store.write(
+            loc.store_id,
+            loc.pool_offset,
+            payload,
+            loc.store_epoch,
+            self.block_size,
+            block_hash=key.encode("utf-8"),
+        )
+        if not write.success:
+            return False
+        if self.mode == "cluster":
+            lk = self._meta_update_locks.setdefault(loc.dn_id, threading.Lock())
+            with lk:
+                update, row = cluster.metadata.update_status(
+                    key,
+                    BlockStatus.ALLOCATED,
+                    BlockStatus.STORED,
+                    loc.version,
+                    request_id=f"{batch_id}:{key}",
+                    client_id=self.client_id,
+                )
+        else:
             update, row = cluster.metadata.update_status(
                 key,
                 BlockStatus.ALLOCATED,
@@ -322,11 +385,74 @@ class FalconFSOffloadingManager:
                 request_id=f"{batch_id}:{key}",
                 client_id=self.client_id,
             )
-            if update.success and row:
-                loc.status = int(row.status)
-                loc.version = row.version
-                successful[key] = True
+        if update.success and row:
+            loc.status = int(row.status)
+            loc.version = row.version
+            return True
+        return False
+
+    def _store_io_wave_chunk_size(self) -> int:
+        """Limit concurrent unary store RPCs per wave (default ``falcon_kv.store_max_inflight`` is 256)."""
+        return min(192, max(16, self._data_parallelism_max))
+
+    def _reference_batch_complete_store(
+        self, keys: List[str], data: Dict[str, bytes], req_context
+    ) -> Dict[str, bool]:
+        batch_id = self._mk_request_id()
+        successful: Dict[str, bool] = {}
+        work = [k for k in keys if k in data]
+        if len(work) <= 1:
+            for key in work:
+                if self._complete_store_write_one_key(key, data, batch_id, req_context):
+                    successful[key] = True
+            return successful
+
+        step = self._store_io_wave_chunk_size()
+        for off in range(0, len(work), step):
+            chunk = work[off : off + step]
+            futs = {
+                self._data_stage_pool.submit(self._complete_store_write_one_key, k, data, batch_id, req_context): k
+                for k in chunk
+            }
+            for fut in as_completed(futs):
+                k = futs[fut]
+                if fut.result():
+                    successful[k] = True
         return successful
+
+    def _cluster_batch_complete_store(
+        self, keys: List[str], data: Dict[str, bytes], req_context
+    ) -> Dict[str, bool]:
+        batch_id = self._mk_request_id()
+        work = [k for k in keys if k in data and self.local_cache.get(k)]
+        successful: Dict[str, bool] = {}
+        if not work:
+            return successful
+        if len(work) == 1:
+            k0 = work[0]
+            if self._complete_store_write_one_key(k0, data, batch_id, req_context):
+                successful[k0] = True
+            return successful
+
+        step = self._store_io_wave_chunk_size()
+        for off in range(0, len(work), step):
+            chunk = work[off : off + step]
+            futs = {
+                self._data_stage_pool.submit(self._complete_store_write_one_key, k, data, batch_id, req_context): k
+                for k in chunk
+            }
+            for fut in as_completed(futs):
+                k = futs[fut]
+                if fut.result():
+                    successful[k] = True
+        return successful
+
+    def _batch_complete_store_impl(
+        self, keys: List[str], data: Dict[str, bytes], req_context
+    ) -> Dict[str, bool]:
+        if self.mode == "cluster":
+            return self._cluster_batch_complete_store(keys, data, req_context)
+        return self._reference_batch_complete_store(keys, data, req_context)
 
     def _free_allocated_for_keys(self, keys: List[str]) -> None:
         batch_id = self._mk_request_id()
@@ -346,63 +472,109 @@ class FalconFSOffloadingManager:
             self.local_cache.pop(key, None)
             self._routing.pop(key, None)
 
-    def _batch_load_impl(self, keys: List[str]) -> LoadStoreSpec:
-        loaded: Dict[str, bytes] = {}
-        for key in keys:
-            loc = self.local_cache.get(key)
-            if not loc:
-                raise RuntimeError(f"Block {key} not found in local cache")
-            cluster = self._clusters.get(loc.dn_id) or self._cluster_for(key)
-            if loc.status == STATUS_EVICTED and loc.evicted_path:
-                result, payload = cluster.store.read_from_ssd(
-                    loc.evicted_path, loc.store_epoch, expected_version=loc.version, block_size=self.block_size
+    def _load_one_key_bytes(self, key: str) -> bytes:
+        loc = self.local_cache.get(key)
+        if not loc:
+            raise RuntimeError(f"Block {key} not found in local cache")
+        cluster = self._clusters.get(loc.dn_id) or self._cluster_for(key)
+        if loc.status == STATUS_EVICTED and loc.evicted_path:
+            result, payload = cluster.store.read_from_ssd(
+                loc.store_id,
+                loc.evicted_path,
+                loc.store_epoch,
+                expected_version=loc.version,
+                block_size=self.block_size,
+            )
+            if result.success and self._promote_worker is not None:
+                self._promote_worker.enqueue(
+                    key,
+                    payload,
+                    loc.store_id,
+                    loc.pool_offset,
+                    loc.version,
+                    loc.store_epoch,
+                    loc.dn_id,
                 )
-                if result.success and self._promote_worker is not None:
-                    self._promote_worker.enqueue(
-                        key,
-                        payload,
-                        loc.store_id,
-                        loc.pool_offset,
-                        loc.version,
-                        loc.store_epoch,
-                        loc.dn_id,
-                    )
-            else:
-                try:
-                    result, payload = cluster.store.read(
-                        loc.store_id,
-                        loc.pool_offset,
-                        loc.store_epoch,
-                        expected_version=loc.version,
-                        block_size=self.block_size,
-                    )
-                except TypeError:
-                    result, payload = cluster.store.read(
-                        loc.store_id, loc.pool_offset, loc.store_epoch
-                    )
-            if not result.success:
-                raise RuntimeError(f"Failed to read {key}: {result.error_code}")
-            loaded[key] = payload
+        else:
+            # Store DRAM versioning is engine-local (see KVStoreEngine::Write); metadata
+            # block version after STORED can diverge. Use 0 to read latest payload at
+            # (store_id, pool_offset) once metadata already validated the lease.
+            result, payload = cluster.store.read(
+                loc.store_id,
+                loc.pool_offset,
+                loc.store_epoch,
+                0,
+                self.block_size,
+                block_hash=key.encode("utf-8"),
+            )
+        if not result.success:
+            raise RuntimeError(f"Failed to read {key}: {result.error_code}")
+        return payload
+
+    def _reference_batch_load(self, keys: List[str]) -> LoadStoreSpec:
+        if len(keys) <= 1:
+            loaded = {key: self._load_one_key_bytes(key) for key in keys}
+            return LoadStoreSpec(data=loaded)
+
+        loaded: Dict[str, bytes] = {}
+        step = self._store_io_wave_chunk_size()
+        for off in range(0, len(keys), step):
+            chunk = keys[off : off + step]
+            futs = {self._data_stage_pool.submit(self._load_one_key_bytes, k): k for k in chunk}
+            for fut in as_completed(futs):
+                k = futs[fut]
+                loaded[k] = fut.result()
         return LoadStoreSpec(data=loaded)
+
+    def _cluster_batch_load(self, keys: List[str]) -> LoadStoreSpec:
+        work = [k for k in keys if self.local_cache.get(k)]
+        if not work:
+            return LoadStoreSpec(data={})
+        if len(work) == 1:
+            k0 = work[0]
+            return LoadStoreSpec(data={k0: self._load_one_key_bytes(k0)})
+
+        loaded: Dict[str, bytes] = {}
+        step = self._store_io_wave_chunk_size()
+        for off in range(0, len(work), step):
+            chunk = work[off : off + step]
+            futs = {self._data_stage_pool.submit(self._load_one_key_bytes, k): k for k in chunk}
+            for fut in as_completed(futs):
+                k = futs[fut]
+                loaded[k] = fut.result()
+        return LoadStoreSpec(data=loaded)
+
+    def _batch_load_impl(self, keys: List[str]) -> LoadStoreSpec:
+        if self.mode == "cluster":
+            return self._cluster_batch_load(keys)
+        return self._reference_batch_load(keys)
+
+    def _renew_one_key(self, key: str, now_ms: int) -> None:
+        loc = self.local_cache.get(key)
+        if not loc:
+            return
+        if loc.lease_token <= 0:
+            return
+        cluster = self._clusters.get(loc.dn_id) or self._cluster_for(key)
+        result, lease = cluster.metadata.lease_manager.renew(
+            key,
+            loc.lease_token,
+            loc.dn_epoch,
+            loc.store_epoch,
+            now_ms,
+        )
+        if result.success and lease:
+            loc.lease_expire_ms = lease.lease_expire_ms
 
     def _batch_renew_impl(self, keys: List[str]) -> None:
         now = self._now_ms()
+        if self.mode == "cluster" and len(keys) > 1:
+            futs = {self._meta_stage_pool.submit(self._renew_one_key, k, now): k for k in keys}
+            for fut in as_completed(futs):
+                fut.result()
+            return
         for key in keys:
-            loc = self.local_cache.get(key)
-            if not loc:
-                continue
-            if loc.lease_token <= 0:
-                continue
-            cluster = self._clusters.get(loc.dn_id) or self._cluster_for(key)
-            result, lease = cluster.metadata.lease_manager.renew(
-                key,
-                loc.lease_token,
-                loc.dn_epoch,
-                loc.store_epoch,
-                now,
-            )
-            if result.success and lease:
-                loc.lease_expire_ms = lease.lease_expire_ms
+            self._renew_one_key(key, now)
 
     def _cache_location(self, key, row, lease, dn_id: int) -> None:
         self.local_cache[key] = KVBlockLocation(

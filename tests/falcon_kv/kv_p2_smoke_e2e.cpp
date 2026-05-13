@@ -15,6 +15,7 @@
 #include "kv_common.pb.h"
 #include "kv_data_service.pb.h"
 #include "kv_metadata_service.pb.h"
+#include "tests/falcon_kv/kv_e2e_block_size.h"
 
 namespace {
 
@@ -52,7 +53,7 @@ int RunVerifyDnNoKvData(const std::vector<std::string>& dns) {
         it->set_block_hash("");
         it->set_pool_offset(0);
         it->set_payload("x");
-        it->set_block_size(65536);
+        it->set_block_size(falconfs::kv::test::E2eKvBlockSize());
         it->set_expected_store_epoch(1);
         it->set_expected_version(0);
         falconfs::kv::BatchWriteBlockResponse resp;
@@ -78,7 +79,7 @@ int RunVerifyStoreRoundTrip(const std::string& meta_ep, const std::string& store
     areq.mutable_meta()->set_request_id("p2_smoke_alloc");
     auto* ait = areq.add_items();
     ait->set_block_hash(h);
-    ait->set_block_size(65536);
+    ait->set_block_size(falconfs::kv::test::E2eKvBlockSize());
     ait->set_preferred_store_id(1);
     ait->set_allow_fallback_store(true);
     falconfs::kv::BatchAllocateResponse aresp;
@@ -117,7 +118,7 @@ int RunVerifyStoreRoundTrip(const std::string& meta_ep, const std::string& store
     wit->set_block_hash("");
     wit->set_pool_offset(pool_off);
     wit->set_payload(payload);
-    wit->set_block_size(65536);
+    wit->set_block_size(falconfs::kv::test::E2eKvBlockSize());
     wit->set_expected_store_epoch(sep);
     wit->set_expected_version(0);
     falconfs::kv::BatchWriteBlockResponse wrsp;

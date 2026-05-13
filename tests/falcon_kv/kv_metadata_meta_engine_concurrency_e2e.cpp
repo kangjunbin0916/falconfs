@@ -13,12 +13,10 @@
 
 #include "kv_common.pb.h"
 #include "kv_metadata_service.pb.h"
+#include "tests/falcon_kv/kv_e2e_block_size.h"
 
 namespace {
 
-constexpr int32_t kBlockSize = 65536;
-// Must match falcon/connection_pool/kv_backend_rpc.cpp KVMetadataEngine construction:
-// region_bytes = 64 * 65536, block_size = 65536 => at most 64 distinct slots.
 constexpr int kMaxDistinctBlocks = 64;
 
 struct Config {
@@ -107,7 +105,7 @@ void RunAllocatePhase(int wid, const Config &cfg, WaveWorkState *st, std::atomic
     for (const auto &h : st->hashes) {
         auto *it = alloc_req.add_items();
         it->set_block_hash(h);
-        it->set_block_size(kBlockSize);
+        it->set_block_size(falconfs::kv::test::E2eKvBlockSize());
         it->set_preferred_store_id(1);
         it->set_allow_fallback_store(true);
     }

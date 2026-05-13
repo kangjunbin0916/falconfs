@@ -33,14 +33,17 @@ struct EvictionCycleResult {
 
 class EvictionCoordinator {
 public:
-    // Spill callback contract: given the block_hash and the current EVICTING
-    // version, perform the SSD spill and return `{ok, evicted_path}`. On
-    // failure, the coordinator CAS-rolls the row back to STORED.
+    // Spill callback: after STORED→EVICTING CAS, spill bytes from
+    // `(pool_offset, store_epoch)` at `version`, return `{ok, evicted_path}`.
+    // On failure, the coordinator CAS-rolls the row back to STORED.
     struct SpillOutcome {
         bool ok = false;
         std::string evicted_path;
     };
-    using SpillFn = std::function<SpillOutcome(const std::string& block_hash, int64_t version)>;
+    using SpillFn = std::function<SpillOutcome(const std::string& block_hash,
+                                               int64_t version,
+                                               int64_t pool_offset,
+                                               int64_t store_epoch)>;
 
     // Status-update callback contract (v6 §14.3): performs a CAS state
     // transition on the row identified by `block_hash` (e.g. STORED ->

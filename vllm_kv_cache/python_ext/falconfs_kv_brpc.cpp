@@ -23,12 +23,16 @@
 
 #include <brpc/channel.h>
 #include <brpc/controller.h>
+#include <brpc/protocol.h>
 
+#include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <vector>
 #include <unistd.h>
 
@@ -41,6 +45,29 @@ namespace {
 
 std::mutex g_registry_mu;
 std::unique_ptr<falconfs::kv::KVStoreFacadeRegistry> g_registry;
+
+// Facade BatchRead/BatchWrite counters (local SHM vs remote BRPC) for regression tests.
+std::atomic<uint64_t> g_facade_ipc_local_reads{0};
+std::atomic<uint64_t> g_facade_ipc_local_writes{0};
+std::atomic<uint64_t> g_facade_ipc_remote_reads{0};
+std::atomic<uint64_t> g_facade_ipc_remote_writes{0};
+
+static void BumpFacadeIpcCounters(bool is_write, bool is_local)
+{
+    if (is_write) {
+        if (is_local) {
+            g_facade_ipc_local_writes.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_facade_ipc_remote_writes.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
+        if (is_local) {
+            g_facade_ipc_local_reads.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_facade_ipc_remote_reads.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
 
 std::string ResolveLocalHostNodeName()
 {
@@ -263,6 +290,39 @@ PyObject* PyBatchReadFromSSD(PyObject* /*self*/, PyObject* args)
         });
 }
 
+PyObject* PyWriteBlock(PyObject* /*self*/, PyObject* args)
+{
+    using namespace falconfs::kv;
+    return DoDataCall<WriteBlockRequest, WriteBlockResponse>(
+        args, "WriteBlock",
+        [](KVDataService_Stub& s, brpc::Controller& c,
+           const WriteBlockRequest& req, WriteBlockResponse& rsp) {
+            s.WriteBlock(&c, &req, &rsp, nullptr);
+        });
+}
+
+PyObject* PyReadBlock(PyObject* /*self*/, PyObject* args)
+{
+    using namespace falconfs::kv;
+    return DoDataCall<ReadBlockRequest, ReadBlockResponse>(
+        args, "ReadBlock",
+        [](KVDataService_Stub& s, brpc::Controller& c,
+           const ReadBlockRequest& req, ReadBlockResponse& rsp) {
+            s.ReadBlock(&c, &req, &rsp, nullptr);
+        });
+}
+
+PyObject* PyReadFromSSD(PyObject* /*self*/, PyObject* args)
+{
+    using namespace falconfs::kv;
+    return DoDataCall<ReadFromSSDRequest, ReadFromSSDResponse>(
+        args, "ReadFromSSD",
+        [](KVDataService_Stub& s, brpc::Controller& c,
+           const ReadFromSSDRequest& req, ReadFromSSDResponse& rsp) {
+            s.ReadFromSSD(&c, &req, &rsp, nullptr);
+        });
+}
+
 bool EnsureRegistryLocked(const std::string& conninfo)
 {
     if (!g_registry) {
@@ -353,7 +413,7 @@ PyObject* PyStoreLocality(PyObject* /*self*/, PyObject* /*args*/)
 }
 
 template <typename Request, typename Response, typename CallFn>
-PyObject* DoFacadeCall(PyObject* args, const char* method_name, CallFn&& call_fn)
+PyObject* DoFacadeCall(PyObject* args, const char* method_name, bool is_write, CallFn&& call_fn)
 {
     int store_node_id = 0;
     const char* request_buf = nullptr;
@@ -377,7 +437,26 @@ PyObject* DoFacadeCall(PyObject* args, const char* method_name, CallFn&& call_fn
         return WrapRpcError(method_name, "unknown store_node_id");
     }
     Response rsp;
-    call_fn(facade, req, &rsp);
+    {
+        Py_BEGIN_ALLOW_THREADS;
+        call_fn(facade, req, &rsp);
+        Py_END_ALLOW_THREADS;
+    }
+    int bump_times = 1;
+    if constexpr (std::is_same_v<Request, falconfs::kv::BatchWriteBlockRequest>) {
+        bump_times = std::max(1, req.items_size());
+    } else if constexpr (std::is_same_v<Request, falconfs::kv::BatchReadBlockRequest>) {
+        bump_times = std::max(1, req.items_size());
+    } else if constexpr (std::is_same_v<Request, falconfs::kv::WriteBlockRequest>) {
+        bump_times = 1;
+    } else if constexpr (std::is_same_v<Request, falconfs::kv::ReadBlockRequest>) {
+        bump_times = 1;
+    } else if constexpr (std::is_same_v<Request, falconfs::kv::ReadFromSSDRequest>) {
+        bump_times = 1;
+    }
+    for (int i = 0; i < bump_times; ++i) {
+        BumpFacadeIpcCounters(is_write, facade->IsLocal());
+    }
     std::string out;
     if (!rsp.SerializeToString(&out)) {
         return WrapRpcError(method_name, "SerializeToString failed");
@@ -385,11 +464,30 @@ PyObject* DoFacadeCall(PyObject* args, const char* method_name, CallFn&& call_fn
     return PyBytes_FromStringAndSize(out.data(), static_cast<Py_ssize_t>(out.size()));
 }
 
+PyObject* PyFacadeIpcStatsReset(PyObject* /*self*/, PyObject* /*args*/)
+{
+    g_facade_ipc_local_reads.store(0, std::memory_order_relaxed);
+    g_facade_ipc_local_writes.store(0, std::memory_order_relaxed);
+    g_facade_ipc_remote_reads.store(0, std::memory_order_relaxed);
+    g_facade_ipc_remote_writes.store(0, std::memory_order_relaxed);
+    Py_RETURN_NONE;
+}
+
+PyObject* PyFacadeIpcStats(PyObject* /*self*/, PyObject* /*args*/)
+{
+    return Py_BuildValue(
+        "(KKKK)",
+        static_cast<unsigned long long>(g_facade_ipc_local_reads.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_facade_ipc_local_writes.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_facade_ipc_remote_reads.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_facade_ipc_remote_writes.load(std::memory_order_relaxed)));
+}
+
 PyObject* PyFacadeBatchWriteBlock(PyObject* /*self*/, PyObject* args)
 {
     using namespace falconfs::kv;
     return DoFacadeCall<BatchWriteBlockRequest, BatchWriteBlockResponse>(
-        args, "facade_batch_write_block",
+        args, "facade_batch_write_block", /*is_write=*/true,
         [](const std::shared_ptr<IKVStoreFacade>& facade,
            const BatchWriteBlockRequest& req,
            BatchWriteBlockResponse* rsp) { facade->BatchWriteBlock(req, rsp); });
@@ -399,7 +497,7 @@ PyObject* PyFacadeBatchReadBlock(PyObject* /*self*/, PyObject* args)
 {
     using namespace falconfs::kv;
     return DoFacadeCall<BatchReadBlockRequest, BatchReadBlockResponse>(
-        args, "facade_batch_read_block",
+        args, "facade_batch_read_block", /*is_write=*/false,
         [](const std::shared_ptr<IKVStoreFacade>& facade,
            const BatchReadBlockRequest& req,
            BatchReadBlockResponse* rsp) { facade->BatchReadBlock(req, rsp); });
@@ -409,10 +507,40 @@ PyObject* PyFacadeBatchReadFromSSD(PyObject* /*self*/, PyObject* args)
 {
     using namespace falconfs::kv;
     return DoFacadeCall<BatchReadFromSSDRequest, BatchReadFromSSDResponse>(
-        args, "facade_batch_read_from_ssd",
+        args, "facade_batch_read_from_ssd", /*is_write=*/false,
         [](const std::shared_ptr<IKVStoreFacade>& facade,
            const BatchReadFromSSDRequest& req,
            BatchReadFromSSDResponse* rsp) { facade->BatchReadFromSSD(req, rsp); });
+}
+
+PyObject* PyFacadeWriteBlock(PyObject* /*self*/, PyObject* args)
+{
+    using namespace falconfs::kv;
+    return DoFacadeCall<WriteBlockRequest, WriteBlockResponse>(
+        args, "facade_write_block", /*is_write=*/true,
+        [](const std::shared_ptr<IKVStoreFacade>& facade,
+           const WriteBlockRequest& req,
+           WriteBlockResponse* rsp) { facade->WriteBlock(req, rsp); });
+}
+
+PyObject* PyFacadeReadBlock(PyObject* /*self*/, PyObject* args)
+{
+    using namespace falconfs::kv;
+    return DoFacadeCall<ReadBlockRequest, ReadBlockResponse>(
+        args, "facade_read_block", /*is_write=*/false,
+        [](const std::shared_ptr<IKVStoreFacade>& facade,
+           const ReadBlockRequest& req,
+           ReadBlockResponse* rsp) { facade->ReadBlock(req, rsp); });
+}
+
+PyObject* PyFacadeReadFromSSD(PyObject* /*self*/, PyObject* args)
+{
+    using namespace falconfs::kv;
+    return DoFacadeCall<ReadFromSSDRequest, ReadFromSSDResponse>(
+        args, "facade_read_from_ssd", /*is_write=*/false,
+        [](const std::shared_ptr<IKVStoreFacade>& facade,
+           const ReadFromSSDRequest& req,
+           ReadFromSSDResponse* rsp) { facade->ReadFromSSD(req, rsp); });
 }
 
 PyMethodDef kModuleMethods[] = {
@@ -434,6 +562,12 @@ PyMethodDef kModuleMethods[] = {
      "Calls KVDataService.BatchReadBlock over BRPC."},
     {"batch_read_from_ssd", PyBatchReadFromSSD, METH_VARARGS,
      "Calls KVDataService.BatchReadFromSSD over BRPC."},
+    {"write_block", PyWriteBlock, METH_VARARGS,
+     "Calls KVDataService.WriteBlock over BRPC."},
+    {"read_block", PyReadBlock, METH_VARARGS,
+     "Calls KVDataService.ReadBlock over BRPC."},
+    {"read_from_ssd", PyReadFromSSD, METH_VARARGS,
+     "Calls KVDataService.ReadFromSSD over BRPC."},
     {"membership_start", PyMembershipStart, METH_VARARGS,
      "Starts KVStoreFacadeRegistry with CN conninfo."},
     {"membership_stop", PyMembershipStop, METH_VARARGS,
@@ -444,12 +578,22 @@ PyMethodDef kModuleMethods[] = {
      "Returns {dn_id: endpoint} from current membership snapshot."},
     {"store_locality", PyStoreLocality, METH_VARARGS,
      "Returns {store_id: is_local} from facade registry."},
+    {"facade_ipc_stats_reset", PyFacadeIpcStatsReset, METH_VARARGS,
+     "Resets per-process facade local/remote read/write counters (test hook)."},
+    {"facade_ipc_stats", PyFacadeIpcStats, METH_VARARGS,
+     "Returns (local_reads, local_writes, remote_reads, remote_writes) for facade data path."},
     {"facade_batch_write_block", PyFacadeBatchWriteBlock, METH_VARARGS,
      "Calls facade BatchWriteBlock for store_node_id."},
     {"facade_batch_read_block", PyFacadeBatchReadBlock, METH_VARARGS,
      "Calls facade BatchReadBlock for store_node_id."},
     {"facade_batch_read_from_ssd", PyFacadeBatchReadFromSSD, METH_VARARGS,
      "Calls facade BatchReadFromSSD for store_node_id."},
+    {"facade_write_block", PyFacadeWriteBlock, METH_VARARGS,
+     "Calls facade WriteBlock for store_node_id."},
+    {"facade_read_block", PyFacadeReadBlock, METH_VARARGS,
+     "Calls facade ReadBlock for store_node_id."},
+    {"facade_read_from_ssd", PyFacadeReadFromSSD, METH_VARARGS,
+     "Calls facade ReadFromSSD for store_node_id."},
     {nullptr, nullptr, 0, nullptr},
 };
 
@@ -471,5 +615,9 @@ PyModuleDef kModuleDef = {
 
 PyMODINIT_FUNC PyInit_falconfs_kv_brpc(void)
 {
+    constexpr uint64_t kMinBrpcMaxBody = 512ULL * 1024 * 1024;
+    if (brpc::FLAGS_max_body_size < kMinBrpcMaxBody) {
+        brpc::FLAGS_max_body_size = kMinBrpcMaxBody;
+    }
     return PyModule_Create(&kModuleDef);
 }

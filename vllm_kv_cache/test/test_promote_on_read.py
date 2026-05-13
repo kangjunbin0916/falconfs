@@ -34,8 +34,10 @@ class _FakeStore:
         del store_node_id, pool_offset, expected_store_epoch
         return ItemResult(False), b""
 
-    def read_from_ssd(self, evicted_path, expected_store_epoch, expected_version=0, block_size=65536):
-        del evicted_path, expected_store_epoch, expected_version, block_size
+    def read_from_ssd(
+        self, store_node_id, evicted_path, expected_store_epoch, expected_version=0, block_size=65536
+    ):
+        del store_node_id, evicted_path, expected_store_epoch, expected_version, block_size
         return ItemResult(True), b"from-ssd"
 
     def write(self, store_node_id, pool_offset, payload, expected_store_epoch, block_size, expected_version=0):

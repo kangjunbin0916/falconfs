@@ -56,6 +56,7 @@ class PromoteWorker:
             alloc_row.location.store_epoch,
             self._manager.block_size,
             expected_version=alloc_row.version,
+            block_hash=block_hash.encode("utf-8"),
         )
         if not write.success:
             return

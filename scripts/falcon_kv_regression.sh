@@ -16,7 +16,9 @@
 #   6. When REGRESSION_PROFILE=full only (P8 final gate):
 #         kv-cluster-failover-test, kv-topology-test, kv-mixed-colocation-test,
 #         kv-cluster-promote-test
-#   7. Python unittest under vllm_kv_cache/test/ (excluding vllm/ subfolder)
+#   7. Python unittest under vllm_kv_cache/test/ (excluding vllm/ subfolder), including
+#         ``test_offloading_manager_cluster_mixed_e2e`` (vLLM OffloadingManager meta+data
+#         BRPC against 3 DNs + 4 stores). Full profile fails fast if that topology is down.
 #   8. Cluster down
 #   9. Coloured summary
 #
@@ -238,6 +240,25 @@ suite_kv_cluster_promote_test() {
 suite_python_unittest() {
     cd "$PROJECT_DIR"
     export PYTHONPATH="$PROJECT_DIR/vllm_kv_cache/python:$PROJECT_DIR/vllm_kv_cache/test:${PYTHONPATH:-}"
+    if [ "$PROFILE" = "full" ]; then
+        log_step "  full profile: require vLLM mixed-cluster topology (3 DNs + 4 stores) for Python E2E"
+        if ! $PYTHON_BIN -c "
+import sys
+sys.path.insert(0, 'vllm_kv_cache/python')
+sys.path.insert(0, 'vllm_kv_cache/test')
+import test_offloading_manager_cluster_mixed_e2e as m
+if not m.mixed_topology_available():
+    print(
+        'REGRESSION_FAIL: mixed topology unreachable (need KV_THREE_DNS=1, STORE_COUNT=4, '
+        'CN + DN1/2/3 poolers + four falcon_kv_store BRPC ports). '
+        'See vllm_kv_cache/test/test_offloading_manager_cluster_mixed_e2e.py',
+        file=sys.stderr,
+    )
+    sys.exit(1)
+"; then
+            return 1
+        fi
+    fi
     # All Python tests directly under vllm_kv_cache/test/ are
     # unittest.TestCase-based; avoid a pytest dependency. The vllm/
     # subfolder requires vLLM at import time and is opt-in.

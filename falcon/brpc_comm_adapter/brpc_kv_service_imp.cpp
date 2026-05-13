@@ -74,6 +74,36 @@ void BrpcKVMetadataServiceImpl::BatchFreeAllocated(::google::protobuf::RpcContro
     DispatchKVJob(dispatchFunc_, FalconKVServiceMethod::BATCH_FREE_ALLOCATED, request, response, done);
 }
 
+void BrpcKVDataServiceImpl::WriteBlock(::google::protobuf::RpcController *controller,
+                                       const ::falconfs::kv::WriteBlockRequest *request,
+                                       ::falconfs::kv::WriteBlockResponse *response,
+                                       ::google::protobuf::Closure *done)
+{
+    (void) controller;
+    brpc::ClosureGuard guard(done);
+    impl_->WriteBlock(*request, response);
+}
+
+void BrpcKVDataServiceImpl::ReadBlock(::google::protobuf::RpcController *controller,
+                                      const ::falconfs::kv::ReadBlockRequest *request,
+                                      ::falconfs::kv::ReadBlockResponse *response,
+                                      ::google::protobuf::Closure *done)
+{
+    (void) controller;
+    brpc::ClosureGuard guard(done);
+    impl_->ReadBlock(*request, response);
+}
+
+void BrpcKVDataServiceImpl::ReadFromSSD(::google::protobuf::RpcController *controller,
+                                        const ::falconfs::kv::ReadFromSSDRequest *request,
+                                        ::falconfs::kv::ReadFromSSDResponse *response,
+                                        ::google::protobuf::Closure *done)
+{
+    (void) controller;
+    brpc::ClosureGuard guard(done);
+    impl_->ReadFromSSD(*request, response);
+}
+
 void BrpcKVDataServiceImpl::BatchWriteBlock(::google::protobuf::RpcController *controller,
                                             const ::falconfs::kv::BatchWriteBlockRequest *request,
                                             ::falconfs::kv::BatchWriteBlockResponse *response,

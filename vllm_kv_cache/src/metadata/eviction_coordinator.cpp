@@ -67,7 +67,10 @@ EvictionCycleResult EvictionCoordinator::RunOneCycle(const EvictionConfig& cfg) 
             continue;
         }
 
-        SpillOutcome spill = spill_fn_(block_hash, to_evicting.new_version);
+        SpillOutcome spill = spill_fn_(block_hash,
+                                       to_evicting.new_version,
+                                       lookup.row->location.pool_offset,
+                                       lookup.row->location.store_epoch);
         if (spill.ok) {
             EngineUpdateStatusResult to_evicted = DoUpdateStatus(
                 block_hash, kEvicting, kEvicted, to_evicting.new_version,

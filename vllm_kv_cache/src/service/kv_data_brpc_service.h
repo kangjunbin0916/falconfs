@@ -20,6 +20,21 @@ public:
                          BatchWriteBlockResponse* response,
                          ::google::protobuf::Closure* done) override;
 
+    void WriteBlock(::google::protobuf::RpcController* controller,
+                    const WriteBlockRequest* request,
+                    WriteBlockResponse* response,
+                    ::google::protobuf::Closure* done) override;
+
+    void ReadBlock(::google::protobuf::RpcController* controller,
+                   const ReadBlockRequest* request,
+                   ReadBlockResponse* response,
+                   ::google::protobuf::Closure* done) override;
+
+    void ReadFromSSD(::google::protobuf::RpcController* controller,
+                     const ReadFromSSDRequest* request,
+                     ReadFromSSDResponse* response,
+                     ::google::protobuf::Closure* done) override;
+
     void BatchReadBlock(::google::protobuf::RpcController* controller,
                         const BatchReadBlockRequest* request,
                         BatchReadBlockResponse* response,

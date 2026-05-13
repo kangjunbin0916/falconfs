@@ -37,6 +37,24 @@ namespace {
 
 constexpr int32_t kKvShardId = 1;
 
+/* Match ``falcon_kv_store`` default (``FALCON_KV_STORE_BLOCK_SIZE``): vLLM logical
+ * KV block bytes for a representative fp16 slice (2 * L * Hkv * D * tokens * 2). */
+constexpr int32_t kVllmDefaultKvBlockBytes = 2 * 32 * 8 * 128 * 16 * 2;
+
+int32_t ResolveDnKvBlockSize()
+{
+    const char *v = std::getenv("FALCON_KV_STORE_BLOCK_SIZE");
+    if (v == nullptr || v[0] == '\0') {
+        return kVllmDefaultKvBlockBytes;
+    }
+    char *end = nullptr;
+    long x = std::strtol(v, &end, 10);
+    if (end == v || x <= 0 || x > 2147483647L) {
+        return kVllmDefaultKvBlockBytes;
+    }
+    return static_cast<int32_t>(x);
+}
+
 std::string GetCurrentUserName()
 {
     const char *u = std::getenv("USER");
@@ -279,7 +297,7 @@ class FalconBrpcServer {
             /*store_node_id=*/1,
             /*dn_id=*/1,
             /*region_bytes=*/0,
-            /*block_size=*/65536,
+            /*block_size=*/ResolveDnKvBlockSize(),
             /*dn_epoch=*/1,
             /*store_epoch=*/1,
             /*kvblock_shard_id=*/kKvShardId);

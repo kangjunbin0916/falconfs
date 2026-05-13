@@ -8,6 +8,9 @@ import "kv_common.proto";
 option cc_generic_services = true;
 
 service KVDataService {
+  rpc WriteBlock(WriteBlockRequest) returns (WriteBlockResponse);
+  rpc ReadBlock(ReadBlockRequest) returns (ReadBlockResponse);
+  rpc ReadFromSSD(ReadFromSSDRequest) returns (ReadFromSSDResponse);
   rpc BatchWriteBlock(BatchWriteBlockRequest) returns (BatchWriteBlockResponse);
   rpc BatchReadBlock(BatchReadBlockRequest) returns (BatchReadBlockResponse);
   rpc BatchReadFromSSD(BatchReadFromSSDRequest) returns (BatchReadFromSSDResponse);
@@ -38,6 +41,17 @@ message BatchWriteBlockRequest {
   bool verify_checksum = 3;
 }
 
+message WriteBlockRequest {
+  CommonRequestMeta meta = 1;
+  WriteItem item = 2;
+  bool verify_checksum = 3;
+}
+
+message WriteBlockResponse {
+  WriteResult result = 1;
+  int64 server_time_ms = 2;
+}
+
 message BatchWriteBlockResponse {
   repeated WriteResult results = 1;
   int64 server_time_ms = 2;
@@ -66,6 +80,17 @@ message BatchReadBlockRequest {
   bool return_compressed = 3;
 }
 
+message ReadBlockRequest {
+  CommonRequestMeta meta = 1;
+  ReadItem item = 2;
+  bool return_compressed = 3;
+}
+
+message ReadBlockResponse {
+  ReadResult result = 1;
+  int64 server_time_ms = 2;
+}
+
 message BatchReadBlockResponse {
   repeated ReadResult results = 1;
   int64 server_time_ms = 2;
@@ -90,6 +115,17 @@ message BatchReadFromSSDRequest {
   CommonRequestMeta meta = 1;
   repeated SSDReadItem items = 2;
   bool return_compressed = 3;
+}
+
+message ReadFromSSDRequest {
+  CommonRequestMeta meta = 1;
+  SSDReadItem item = 2;
+  bool return_compressed = 3;
+}
+
+message ReadFromSSDResponse {
+  SSDReadResult result = 1;
+  int64 server_time_ms = 2;
 }
 
 message BatchReadFromSSDResponse {

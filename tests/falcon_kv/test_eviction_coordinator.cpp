@@ -34,7 +34,8 @@ TEST(EvictionCoordinator, EvictsColdStoredCandidatesEndToEnd) {
     PreloadStored(*engine, "cold-2", /*now_ms=*/110);
 
     int spill_calls = 0;
-    EvictionCoordinator::SpillFn spill = [&](const std::string& block_hash, int64_t /*version*/) {
+    EvictionCoordinator::SpillFn spill = [&](const std::string& block_hash, int64_t /*version*/,
+                                             int64_t /*pool_offset*/, int64_t /*store_epoch*/) {
         ++spill_calls;
         EvictionCoordinator::SpillOutcome out;
         out.ok = true;
@@ -69,7 +70,7 @@ TEST(EvictionCoordinator, ActiveLeaseSkipsCandidate) {
     ASSERT_GT(lookup.lease->lease_expire_ms, 120);
 
     int spill_calls = 0;
-    EvictionCoordinator::SpillFn spill = [&](const std::string&, int64_t) {
+    EvictionCoordinator::SpillFn spill = [&](const std::string&, int64_t, int64_t, int64_t) {
         ++spill_calls;
         return EvictionCoordinator::SpillOutcome{true, "/never"};
     };
@@ -90,7 +91,7 @@ TEST(EvictionCoordinator, SpillFailureRollsBackToStored) {
     auto engine = std::make_shared<KVMetadataEngine>();
     PreloadStored(*engine, "fail-1", /*now_ms=*/100);
 
-    EvictionCoordinator::SpillFn fail_spill = [&](const std::string&, int64_t) {
+    EvictionCoordinator::SpillFn fail_spill = [&](const std::string&, int64_t, int64_t, int64_t) {
         return EvictionCoordinator::SpillOutcome{false, ""};
     };
     EvictionCoordinator coord(engine, fail_spill);

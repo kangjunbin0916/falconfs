@@ -30,8 +30,8 @@ TEST(KVStoreEngine, WriteReadSuccessWithEpochAndVersion) {
 
     StoreReadResult rr = engine.Read("h1",
                                      /*pool_offset=*/0,
-                                     /*block_size=*/65536,
-                                     /*expected_version=*/1,
+                                     /*read_length=*/7,
+                                     /*expected_version=*/0,
                                      /*expected_store_epoch=*/1);
     ASSERT_TRUE(rr.result.success);
     EXPECT_EQ(rr.payload, "payload");
@@ -72,7 +72,7 @@ TEST(KVStoreEngine, RegionRegistryGatesAllocationAndReads) {
     EXPECT_EQ(drain_write.result.error_code, static_cast<int32_t>(ErrorCode::STORE_WRITE_FAILED));
 
     // Reads still allowed during DRAINING for the previously written block.
-    StoreReadResult drain_read = engine.Read("rk", 0, 65536, 1, 1);
+    StoreReadResult drain_read = engine.Read("rk", 0, 12, 0, 1);
     EXPECT_TRUE(drain_read.result.success);
 }
 
@@ -99,7 +99,12 @@ TEST(KVStoreEngine, SsdSpillRoundtripWithRealSpillManager) {
                     .result.success);
 
     std::string evicted_path;
-    StoreWriteResult sp = engine.SpillBlockToSSD("spill-key", /*expected_version=*/1, &evicted_path);
+    StoreWriteResult sp = engine.SpillBlockToSSD("spill-key",
+                                                 /*pool_offset=*/0,
+                                                 /*expected_version=*/1,
+                                                 /*expected_store_epoch=*/1,
+                                                 /*dram_read_size=*/15,
+                                                 &evicted_path);
     ASSERT_TRUE(sp.result.success);
     EXPECT_EQ(sp.bytes_written, 15);
     EXPECT_TRUE(spill->ValidatePath(evicted_path));

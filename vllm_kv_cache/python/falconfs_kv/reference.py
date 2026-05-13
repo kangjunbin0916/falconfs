@@ -258,7 +258,12 @@ class KVStore:
         payload: bytes,
         expected_store_epoch: int,
         block_size: int,
+        *,
+        block_hash: bytes = b"",
+        expected_version: int = 0,
+        **_kw: object,
     ) -> ItemResult:
+        del block_hash, expected_version, _kw
         region = self.registry.find_by_offset(store_node_id, pool_offset)
         if not region:
             return ItemResult(False, ErrorCode.INVALID_ARGUMENT, False, "unknown region")
@@ -271,7 +276,31 @@ class KVStore:
         self._data[(store_node_id, pool_offset)] = (payload, zlib.crc32(payload), region.store_epoch)
         return ItemResult(True)
 
-    def read(self, store_node_id: int, pool_offset: int, expected_store_epoch: int) -> Tuple[ItemResult, bytes]:
+    def batch_write_blocks(self, store_node_id: int, blocks) -> list:
+        return [
+            self.write(
+                store_node_id,
+                b.pool_offset,
+                b.payload,
+                b.expected_store_epoch,
+                b.block_size,
+                block_hash=b.block_hash,
+                expected_version=b.expected_version,
+            )
+            for b in blocks
+        ]
+
+    def read(
+        self,
+        store_node_id: int,
+        pool_offset: int,
+        expected_store_epoch: int,
+        expected_version: int = 0,
+        block_size: int = 65536,
+        *,
+        block_hash: bytes = b"",
+    ) -> Tuple[ItemResult, bytes]:
+        del expected_version, block_size, block_hash
         region = self.registry.find_by_offset(store_node_id, pool_offset)
         if not region:
             return ItemResult(False, ErrorCode.INVALID_ARGUMENT, False, "unknown region"), b""
@@ -282,6 +311,19 @@ class KVStore:
             return ItemResult(False, ErrorCode.NOT_FOUND, False, "payload missing"), b""
         payload, _, _ = entry
         return ItemResult(True), payload
+
+    def batch_read_blocks(self, store_node_id: int, blocks) -> list:
+        return [
+            self.read(
+                store_node_id,
+                b.pool_offset,
+                b.expected_store_epoch,
+                b.expected_version,
+                b.block_size,
+                block_hash=b.block_hash,
+            )
+            for b in blocks
+        ]
 
 
 class MetadataService:
@@ -399,6 +441,30 @@ class MetadataService:
             if region:
                 region.free(row.location.pool_offset)
         return (ItemResult(True), row)
+
+    def batch_update_status(
+        self,
+        updates: List[Tuple[str, BlockStatus, BlockStatus, int, str]],
+        *,
+        request_id: Optional[str] = None,
+        client_id: int = 0,
+        now_ms: Optional[int] = None,
+    ) -> List[Tuple[ItemResult, Optional[BlockMeta]]]:
+        out: List[Tuple[ItemResult, Optional[BlockMeta]]] = []
+        for block_hash, ef, to_st, exp_ver, ev_path in updates:
+            out.append(
+                self.update_status(
+                    block_hash,
+                    ef,
+                    to_st,
+                    exp_ver,
+                    evicted_path=ev_path,
+                    request_id=request_id,
+                    client_id=client_id,
+                    now_ms=now_ms,
+                )
+            )
+        return out
 
     def free_allocated(
         self,

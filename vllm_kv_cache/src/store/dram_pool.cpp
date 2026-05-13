@@ -2,7 +2,9 @@
 
 #include <sys/mman.h>
 
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 
 namespace falconfs::kv {
@@ -27,10 +29,28 @@ void* MapAnonymous(std::size_t bytes, bool try_huge_pages, bool* used_huge_pages
     return addr;
 }
 
+std::size_t ResolveStripeCount() {
+    const char* es = std::getenv("FALCON_KV_STORE_DRAM_STRIPES");
+    if (es == nullptr || es[0] == '\0') {
+        return 64;
+    }
+    char* end = nullptr;
+    long v = std::strtol(es, &end, 10);
+    if (end == es || v < 1) {
+        return 64;
+    }
+    if (v > 4096) {
+        return 4096;
+    }
+    return static_cast<std::size_t>(v);
+}
+
 }  // namespace
 
 DramPool::DramPool(std::size_t region_bytes, std::size_t block_size, bool try_huge_pages)
-    : region_bytes_(region_bytes), block_size_(block_size) {
+    : region_bytes_(region_bytes),
+      block_size_(block_size),
+      num_stripes_(ResolveStripeCount()) {
     if (region_bytes == 0 || block_size == 0 || (region_bytes % block_size) != 0) {
         throw std::invalid_argument("DramPool: region_bytes must be a positive multiple of block_size");
     }
@@ -39,11 +59,13 @@ DramPool::DramPool(std::size_t region_bytes, std::size_t block_size, bool try_hu
         base_ = nullptr;
         throw std::runtime_error("DramPool: mmap failed");
     }
+    stripe_locks_ = std::make_unique<std::shared_mutex[]>(num_stripes_);
 }
 
 DramPool::~DramPool() { Unmap(); }
 
 void DramPool::Unmap() {
+    stripe_locks_.reset();
     if (base_ != nullptr) {
         ::munmap(base_, region_bytes_);
         base_ = nullptr;
@@ -55,6 +77,11 @@ bool DramPool::ValidOffset(int64_t pool_offset) const {
     auto offset = static_cast<std::size_t>(pool_offset);
     if (offset >= region_bytes_) return false;
     return (offset % block_size_) == 0;
+}
+
+std::size_t DramPool::StripeIndex(int64_t pool_offset) const {
+    const std::size_t slot = static_cast<std::size_t>(pool_offset) / block_size_;
+    return slot % num_stripes_;
 }
 
 DramPoolWriteResult DramPool::Write(int64_t pool_offset, const std::string& payload) {
@@ -69,7 +96,8 @@ DramPoolWriteResult DramPool::Write(int64_t pool_offset, const std::string& payl
     if (offset + block_size_ > region_bytes_) {
         return result;
     }
-    std::lock_guard<std::mutex> lock(mu_);
+    const std::size_t si = StripeIndex(pool_offset);
+    std::unique_lock<std::shared_mutex> g(stripe_locks_[si]);
     char* dst = static_cast<char*>(base_) + offset;
     if (!payload.empty()) {
         std::memcpy(dst, payload.data(), payload.size());
@@ -88,7 +116,8 @@ bool DramPool::Read(int64_t pool_offset, int32_t size, std::string* out) const {
     if (size < 0 || static_cast<std::size_t>(size) > block_size_) return false;
     auto offset = static_cast<std::size_t>(pool_offset);
     if (offset + static_cast<std::size_t>(size) > region_bytes_) return false;
-    std::lock_guard<std::mutex> lock(mu_);
+    const std::size_t si = StripeIndex(pool_offset);
+    std::shared_lock<std::shared_mutex> g(stripe_locks_[si]);
     const char* src = static_cast<const char*>(base_) + offset;
     out->assign(src, static_cast<std::size_t>(size));
     return true;

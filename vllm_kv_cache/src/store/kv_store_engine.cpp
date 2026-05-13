@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -82,23 +83,23 @@ public:
                                                 static_cast<std::size_t>(block_size))) {}
 
     void SetSSDSpillManager(std::shared_ptr<SSDSpillManager> spill_manager) {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::unique_lock<std::shared_mutex> lock(engine_mu_);
         spill_manager_ = std::move(spill_manager);
     }
 
     bool HasSpillManager() const {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::shared_lock<std::shared_mutex> lock(engine_mu_);
         return spill_manager_ != nullptr;
     }
 
     void SetRegionRegistry(std::shared_ptr<StoreRegionRegistry> registry, int32_t owner_dn_id) {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::unique_lock<std::shared_mutex> lock(engine_mu_);
         registry_ = std::move(registry);
         owner_dn_id_ = owner_dn_id;
     }
 
     void SetHeartbeatSender(HeartbeatSender sender) {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::unique_lock<std::shared_mutex> lock(engine_mu_);
         heartbeat_sender_ = std::move(sender);
     }
 
@@ -115,7 +116,11 @@ public:
                            int64_t expected_store_epoch,
                            bool verify_checksum,
                            uint32_t checksum_hint) {
-        std::lock_guard<std::mutex> lock(mu_);
+        (void)block_hash;
+        (void)expected_version;
+        (void)compression;
+        (void)original_size;
+        std::unique_lock<std::shared_mutex> lock(engine_mu_);
         StoreWriteResult out;
         if (expected_store_epoch != store_epoch_) {
             out.result = MakeResult(false, ErrorCode::STALE_EPOCH, true, "stale store epoch");
@@ -139,27 +144,12 @@ public:
             return out;
         }
 
-        auto it = meta_.find(block_hash);
-        int64_t cur_version = (it == meta_.end()) ? 0 : it->second.version;
-        if (expected_version > 0 && expected_version != cur_version) {
-            out.result = MakeResult(false, ErrorCode::CAS_CONFLICT, true, "version mismatch");
-            return out;
-        }
-
         const int64_t pool_relative = pool_offset - base_offset_;
         DramPoolWriteResult dpr = dram_pool_->Write(pool_relative, payload);
         if (!dpr.ok) {
             out.result = MakeResult(false, ErrorCode::INVALID_ARGUMENT, false, "dram write failed");
             return out;
         }
-
-        Entry e;
-        e.pool_offset = pool_offset;
-        e.crc32 = crc;
-        e.compression = compression;
-        e.original_size = (original_size > 0) ? original_size : static_cast<int32_t>(payload.size());
-        e.version = cur_version + 1;
-        meta_[block_hash] = e;
 
         out.result = MakeResult(true, ErrorCode::OK, false, "");
         out.bytes_written = dpr.bytes_written;
@@ -172,7 +162,9 @@ public:
                          int32_t block_size,
                          int64_t expected_version,
                          int64_t expected_store_epoch) const {
-        std::lock_guard<std::mutex> lock(mu_);
+        (void)block_hash;
+        (void)expected_version;
+        std::shared_lock<std::shared_mutex> lock(engine_mu_);
         StoreReadResult out;
         if (expected_store_epoch != store_epoch_) {
             out.result = MakeResult(false, ErrorCode::STALE_EPOCH, true, "stale store epoch");
@@ -186,38 +178,25 @@ public:
             out.result = MakeResult(false, ErrorCode::INVALID_ARGUMENT, false, "invalid offset or block_size");
             return out;
         }
-        auto it = meta_.find(block_hash);
-        if (it == meta_.end() || it->second.pool_offset != pool_offset) {
-            out.result = MakeResult(false, ErrorCode::NOT_FOUND, false, "payload missing");
-            return out;
-        }
-        if (expected_version > 0 && expected_version != it->second.version) {
-            out.result = MakeResult(false, ErrorCode::CAS_CONFLICT, true, "version mismatch");
-            return out;
-        }
-        if (it->second.original_size > block_size) {
-            out.result = MakeResult(false, ErrorCode::INVALID_ARGUMENT, false, "payload exceeds block_size");
-            return out;
-        }
 
         std::string payload;
         const int64_t pool_relative = pool_offset - base_offset_;
-        if (!dram_pool_->Read(pool_relative, it->second.original_size, &payload)) {
+        if (!dram_pool_->Read(pool_relative, block_size, &payload)) {
             out.result = MakeResult(false, ErrorCode::INTERNAL_ERROR, false, "dram read failed");
             return out;
         }
         out.result = MakeResult(true, ErrorCode::OK, false, "");
         out.payload = std::move(payload);
-        out.crc32 = it->second.crc32;
-        out.compression = it->second.compression;
-        out.original_size = it->second.original_size;
+        out.crc32 = ComputeChecksum(out.payload);
+        out.compression = 0;
+        out.original_size = block_size;
         return out;
     }
 
     StoreReadResult ReadFromSSD(const std::string& block_hash,
                                 const std::string& evicted_path,
                                 int64_t expected_version) const {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::shared_lock<std::shared_mutex> lock(engine_mu_);
         StoreReadResult out;
         if (spill_manager_ != nullptr) {
             if (!spill_manager_->ValidatePath(evicted_path)) {
@@ -269,54 +248,62 @@ public:
     }
 
     StoreWriteResult SpillBlockToSSD(const std::string& block_hash,
+                                     int64_t pool_offset,
                                      int64_t expected_version,
+                                     int64_t expected_store_epoch,
+                                     int32_t dram_read_size,
                                      std::string* out_evicted_path) {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::unique_lock<std::shared_mutex> lock(engine_mu_);
         StoreWriteResult out;
         if (BlockHashForcedToFailSpill(block_hash)) {
             out.result = MakeResult(false, ErrorCode::STORE_WRITE_FAILED, true, "forced spill failure (FALCON_KV_FORCED_SPILL_FAIL_HASHES)");
+            return out;
+        }
+        if (expected_store_epoch != store_epoch_) {
+            out.result = MakeResult(false, ErrorCode::STALE_EPOCH, true, "stale store epoch");
             return out;
         }
         if (spill_manager_ == nullptr) {
             out.result = MakeResult(false, ErrorCode::INTERNAL_ERROR, false, "spill manager not configured");
             return out;
         }
-        auto it = meta_.find(block_hash);
-        if (it == meta_.end()) {
-            out.result = MakeResult(false, ErrorCode::NOT_FOUND, false, "missing block");
+        if (!ValidOffset(pool_offset)) {
+            out.result = MakeResult(false, ErrorCode::INVALID_ARGUMENT, false, "invalid pool_offset for spill");
             return out;
         }
-        if (expected_version > 0 && expected_version != it->second.version) {
-            out.result = MakeResult(false, ErrorCode::CAS_CONFLICT, true, "version mismatch");
+        int32_t read_len = dram_read_size > 0 ? dram_read_size : block_size_;
+        if (read_len > block_size_) {
+            out.result = MakeResult(false, ErrorCode::INVALID_ARGUMENT, false, "dram_read_size exceeds block_size");
             return out;
         }
         std::string payload;
-        const int64_t pool_relative = it->second.pool_offset - base_offset_;
-        if (!dram_pool_->Read(pool_relative, it->second.original_size, &payload)) {
+        const int64_t pool_relative = pool_offset - base_offset_;
+        if (!dram_pool_->Read(pool_relative, read_len, &payload)) {
             out.result = MakeResult(false, ErrorCode::INTERNAL_ERROR, false, "dram read failed");
             return out;
         }
-        SSDSpillResult sr = spill_manager_->Spill(store_node_id_, block_hash, it->second.version, payload);
+        const uint32_t crc = ComputeChecksum(payload);
+        SSDSpillResult sr = spill_manager_->Spill(store_node_id_, block_hash, expected_version, payload);
         if (!sr.ok) {
             out.result = MakeResult(false, ErrorCode::STORE_WRITE_FAILED, true, sr.error_message.c_str());
             return out;
         }
         SSDMetadata m;
         m.path = sr.evicted_path;
-        m.crc32 = it->second.crc32;
-        m.compression = it->second.compression;
-        m.original_size = it->second.original_size;
-        m.version = it->second.version;
+        m.crc32 = crc;
+        m.compression = 0;
+        m.original_size = read_len;
+        m.version = expected_version;
         ssd_meta_[block_hash] = m;
         if (out_evicted_path) *out_evicted_path = sr.evicted_path;
         out.result = MakeResult(true, ErrorCode::OK, false, "");
         out.bytes_written = static_cast<int32_t>(payload.size());
-        out.crc32 = it->second.crc32;
+        out.crc32 = crc;
         return out;
     }
 
     int SendHeartbeats(int64_t now_ms) {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::unique_lock<std::shared_mutex> lock(engine_mu_);
         if (heartbeat_sender_ == nullptr || registry_ == nullptr) {
             return 0;
         }
@@ -343,7 +330,7 @@ public:
     }
 
     std::vector<HeartbeatTarget> HeartbeatTargets() const {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::shared_lock<std::shared_mutex> lock(engine_mu_);
         std::vector<HeartbeatTarget> out;
         if (registry_ == nullptr) {
             return out;
@@ -377,7 +364,7 @@ public:
                        int32_t compression,
                        int32_t original_size,
                        int64_t version) {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::unique_lock<std::shared_mutex> lock(engine_mu_);
         SSDEntry e;
         e.path = evicted_path;
         e.payload = payload;
@@ -403,14 +390,6 @@ private:
         return evicted_path.find("..") == std::string::npos;
     }
 
-    struct Entry {
-        int64_t pool_offset = 0;
-        uint32_t crc32 = 0;
-        int32_t compression = 0;
-        int32_t original_size = 0;
-        int64_t version = 0;
-    };
-
     struct SSDEntry {
         std::string path;
         std::string payload;
@@ -435,12 +414,11 @@ private:
     int64_t store_epoch_;
     int32_t owner_dn_id_ = 0;
 
-    mutable std::mutex mu_;
+    mutable std::shared_mutex engine_mu_;
     std::unique_ptr<DramPool> dram_pool_;
     std::shared_ptr<SSDSpillManager> spill_manager_;
     std::shared_ptr<StoreRegionRegistry> registry_;
     HeartbeatSender heartbeat_sender_;
-    std::unordered_map<std::string, Entry> meta_;
     std::unordered_map<std::string, SSDEntry> ssd_data_;       // legacy in-memory SSD test hook
     std::unordered_map<std::string, SSDMetadata> ssd_meta_;    // metadata for real SSDSpillManager-backed entries
 };
@@ -511,9 +489,17 @@ StoreReadResult KVStoreEngine::ReadFromSSD(const std::string& block_hash,
 }
 
 StoreWriteResult KVStoreEngine::SpillBlockToSSD(const std::string& block_hash,
+                                                int64_t pool_offset,
                                                 int64_t expected_version,
+                                                int64_t expected_store_epoch,
+                                                int32_t dram_read_size,
                                                 std::string* out_evicted_path) {
-    return impl_->SpillBlockToSSD(block_hash, expected_version, out_evicted_path);
+    return impl_->SpillBlockToSSD(block_hash,
+                                 pool_offset,
+                                 expected_version,
+                                 expected_store_epoch,
+                                 dram_read_size,
+                                 out_evicted_path);
 }
 
 int KVStoreEngine::SendHeartbeats(int64_t now_ms) {

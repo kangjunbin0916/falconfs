@@ -93,10 +93,14 @@ public:
                                 const std::string& evicted_path,
                                 int64_t expected_version) const;
 
-    // Spills a block currently in DRAM to SSD using the configured
-    // SSDSpillManager, returning the canonical evicted path on success.
+    // Spills DRAM bytes at `pool_offset` to SSD using the configured
+    // SSDSpillManager. `dram_read_size` is the number of bytes to read from the
+    // slot (must be <= BlockSize()); 0 means read the full configured block size.
     StoreWriteResult SpillBlockToSSD(const std::string& block_hash,
+                                     int64_t pool_offset,
                                      int64_t expected_version,
+                                     int64_t expected_store_epoch,
+                                     int32_t dram_read_size,
                                      std::string* out_evicted_path);
 
     // Sends heartbeats for all known owner-DN regions through the configured

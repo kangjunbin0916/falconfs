@@ -42,8 +42,8 @@ TEST(KVDataServiceImpl, ReadStubReturnsPerItemInternalError) {
     auto* ri = req.add_items();
     ri->set_block_hash("r1");
     ri->set_pool_offset(0);
-    ri->set_block_size(65536);
-    ri->set_expected_version(1);
+    ri->set_block_size(5);
+    ri->set_expected_version(0);
     ri->set_expected_store_epoch(1);
 
     BatchReadBlockResponse rsp;

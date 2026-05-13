@@ -353,6 +353,9 @@ start_all() {
     export PATH="$INSTALL_DIR/falcon_client/bin:$(pg_config --bindir):${PATH:-}"
     export LD_LIBRARY_PATH="$INSTALL_DIR/falcon_client/lib:$INSTALL_DIR/falcon_meta/lib:$(pg_config --libdir):${LD_LIBRARY_PATH:-}"
     export CONFIG_FILE="$INSTALL_DIR/falcon_client/config/config.json"
+    # DN ``KVMetadataEngine`` and ``falcon_kv_store`` must use the same logical
+    # KV block size so ``RegisterStoreRegion`` succeeds (see ``ResolveDnKvBlockSize``).
+    export FALCON_KV_STORE_BLOCK_SIZE="${FALCON_KV_STORE_BLOCK_SIZE:-2097152}"
 
     local FALCON_CLIENT_BIN="$INSTALL_DIR/falcon_client/bin/falcon_client"
     if [ ! -x "$FALCON_CLIENT_BIN" ]; then
@@ -650,6 +653,9 @@ EOF
         done
         local store_poolers
         store_poolers="$(kv_store_poolers_csv)"
+        # Start one store at a time: each process registers on the CN then issues
+        # RegisterStoreRegion to every DN. Parallel startups race on DN-side meta
+        # and can cause later stores to unregister (leaving a single falcon_store_node row).
         for ((si=0; si<STORE_COUNT; si++)); do
             local p=$((KV_STORE_BRPC_PORT + si))
             local node_id=$((si + 1))
@@ -661,18 +667,19 @@ EOF
                 FALCON_KV_STORE_BRPC_PORT="$p" \
                 FALCON_KV_STORE_DN_POOLERS="$store_poolers" \
                 FALCON_KV_STORE_NODE_ID="$node_id" \
+                FALCON_KV_STORE_BLOCK_SIZE="${FALCON_KV_STORE_BLOCK_SIZE:-2097152}" \
                 FALCON_KV_STORE_ADVERTISE_HOST="127.0.0.1" \
                 FALCON_KV_STORE_SHM_NAME="falcon_kv_store_heap_${node_id}" \
                 FALCON_KV_STORE_RUNTIME_DIR="/tmp/falcon_kv_store_runtime/n${node_id}" \
                 "$kv_store_bin" >>"/tmp/falcon_kv_store_${si}.log" 2>&1 &
             echo $! >> /tmp/falcon_kv_store.pids
-        done
-        for ((si=0; si<STORE_COUNT; si++)); do
-            local p=$((KV_STORE_BRPC_PORT + si))
             if ! wait_for_listen_tcp "$p" 45; then
                 log_error "falcon_kv_store did not listen on TCP port $p within 45s"
                 exit 1
             fi
+            # falcon_kv_store registers with CN then each DN after Listen; brief pause
+            # before spawning the next store avoids BRPC/meta contention on cold DNs.
+            sleep 1
         done
         echo "export FALCON_KV_STORE_BRPC_ENDPOINT=127.0.0.1:${KV_STORE_BRPC_PORT}" > /tmp/falcon_kv_store_env.sh
         log_info "Started STORE_COUNT=${STORE_COUNT} falcon_kv_store (FALCON_KV_STORE_BRPC_ENDPOINT=127.0.0.1:${KV_STORE_BRPC_PORT})"
@@ -1213,6 +1220,7 @@ run_kv_cluster_fault_test() {
                         FALCON_KV_STORE_BRPC_PORT="$p" \
                         FALCON_KV_STORE_DN_POOLERS="$store_poolers" \
                         FALCON_KV_STORE_NODE_ID="$node_id" \
+                        FALCON_KV_STORE_BLOCK_SIZE="${FALCON_KV_STORE_BLOCK_SIZE:-2097152}" \
                         FALCON_KV_STORE_ADVERTISE_HOST="127.0.0.1" \
                         FALCON_KV_STORE_SHM_NAME="falcon_kv_store_heap_${node_id}" \
                         FALCON_KV_STORE_RUNTIME_DIR="/tmp/falcon_kv_store_runtime/n${node_id}" \

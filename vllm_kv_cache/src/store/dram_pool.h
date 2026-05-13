@@ -5,14 +5,21 @@
 // and reads index into the region by `pool_offset` relative to the pool base
 // address; this matches the Store data plane in the v6 design.
 //
-// The pool deliberately stores opaque bytes only and does not interpret
-// payload semantics. Per-key metadata (version, crc, compression, original
-// size) lives in `KVStoreEngine`.
+// Per-stripe locking (v6.6.1): a fixed array of std::shared_mutex stripes
+// indexes by (pool_offset / block_size) % N so disjoint slots rarely contend.
+// Writers take exclusive locks; readers take shared locks on the same stripe.
+//
+// Stripe count: environment variable FALCON_KV_STORE_DRAM_STRIPES (default 64,
+// clamped to [1, 4096]).
+//
+// Per-key metadata (version, crc, compression, original size) lives in
+// `KVStoreEngine`.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
-#include <mutex>
+#include <memory>
+#include <shared_mutex>
 #include <string>
 
 namespace falconfs::kv {
@@ -36,6 +43,7 @@ public:
     std::size_t RegionBytes() const { return region_bytes_; }
     std::size_t BlockSize() const { return block_size_; }
     bool UsedHugePages() const { return used_huge_pages_; }
+    std::size_t NumStripes() const { return num_stripes_; }
 
     // True if `pool_offset` is in-range and aligned to `block_size_`.
     bool ValidOffset(int64_t pool_offset) const;
@@ -49,12 +57,15 @@ public:
 
 private:
     void Unmap();
+    std::size_t StripeIndex(int64_t pool_offset) const;
 
     void* base_ = nullptr;
     std::size_t region_bytes_ = 0;
     std::size_t block_size_ = 0;
+    std::size_t num_stripes_ = 64;
     bool used_huge_pages_ = false;
-    mutable std::mutex mu_;
+    // C++17+: std::shared_mutex is neither movable nor copyable; use unique_ptr to array.
+    mutable std::unique_ptr<std::shared_mutex[]> stripe_locks_;
 };
 
 }  // namespace falconfs::kv

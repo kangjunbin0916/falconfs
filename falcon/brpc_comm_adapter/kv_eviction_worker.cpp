@@ -215,12 +215,12 @@ void KVEvictionWorker::Loop()
      * `falcon_kv.store_spill_endpoint` when the in-process store engine is
      * absent (standalone falcon_kv_store). */
     auto spill_fn =
-        [this](const std::string &block_hash, int64_t version) -> EvictionCoordinator::SpillOutcome {
+        [this](const std::string &block_hash, int64_t version, int64_t pool_offset, int64_t store_epoch) -> EvictionCoordinator::SpillOutcome {
         EvictionCoordinator::SpillOutcome out;
         if (store_engine_ != nullptr) {
             std::string evicted_path;
             ::falconfs::kv::StoreWriteResult sp =
-                store_engine_->SpillBlockToSSD(block_hash, version, &evicted_path);
+                store_engine_->SpillBlockToSSD(block_hash, pool_offset, version, store_epoch, 0, &evicted_path);
             out.ok = sp.result.success;
             out.evicted_path = std::move(evicted_path);
             return out;
@@ -248,6 +248,7 @@ void KVEvictionWorker::Loop()
         req.set_block_hash(block_hash.data(), static_cast<int>(block_hash.size()));
         req.set_expected_version(version);
         req.set_expected_store_epoch(loc.store_epoch);
+        req.set_dram_read_size(engine_->BlockSize());
         ::falconfs::kv::SpillBlockToSSDResponse resp;
         brpc::Controller cntl;
         stub.SpillBlockToSSD(&cntl, &req, &resp, nullptr);
