@@ -16,10 +16,12 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
+#include <vector>
 
 // Forward-declare the proto request/response types so this header doesn't
 // drag the protobuf headers into anybody who only needs the resolver type.
@@ -69,7 +71,20 @@ public:
     virtual bool    IsHealthy()    const = 0;
 
     virtual void WriteBlock(const WriteBlockRequest&, WriteBlockResponse*)     = 0;
+    virtual void WriteBlockPayload(const WriteBlockRequest&,
+                                   const char* payload,
+                                   size_t payload_len,
+                                   WriteBlockResponse*) = 0;
+    virtual void BatchWriteBlockPayloads(const BatchWriteBlockRequest&,
+                                         const std::vector<std::string>& payloads,
+                                         BatchWriteBlockResponse*) = 0;
     virtual void ReadBlock(const ReadBlockRequest&, ReadBlockResponse*)       = 0;
+    virtual void ReadBlockPayload(const ReadBlockRequest&,
+                                  ReadBlockResponse*,
+                                  std::string* payload) = 0;
+    virtual void BatchReadBlockPayloads(const BatchReadBlockRequest&,
+                                        BatchReadBlockResponse*,
+                                        std::vector<std::string>* payloads) = 0;
     virtual void ReadFromSSD(const ReadFromSSDRequest&, ReadFromSSDResponse*) = 0;
 
     virtual void BatchWriteBlock (const BatchWriteBlockRequest&,

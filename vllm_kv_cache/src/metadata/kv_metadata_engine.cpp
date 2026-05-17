@@ -92,6 +92,14 @@ struct SlotRef {
     int64_t slot_idx{0};
 };
 
+struct PendingRestoreRow {
+    std::string block_hash;
+    int32_t status{0};
+    EngineBlockLocation location;
+    int64_t version{0};
+    int64_t now_ms{0};
+};
+
 // Per-Store-region owner: atomic bitmap + fixed meta array + CLOCK state.
 struct KVRegion {
     int32_t store_node_id{0};
@@ -261,7 +269,11 @@ public:
         if (region.block_size != block_size_)
             return ToEngineResult(ItemResult::Err(ErrorCode::INVALID_ARGUMENT, false,
                                                   "region block_size mismatch"));
-        return RegisterStoreRegionInternal(region);
+        EngineResultMeta out = RegisterStoreRegionInternal(region);
+        if (out.success) {
+            ApplyPendingRestoresForStore(region.store_node_id);
+        }
+        return out;
     }
 
     EngineResultMeta SetRegionState(int32_t store_node_id, EngineRegionState state) {
@@ -301,6 +313,16 @@ public:
                                 const EngineBlockLocation& location,
                                 int64_t version,
                                 int64_t now_ms) {
+        return RestoreRowInternal(block_hash, status, location, version, now_ms,
+                                  /*park_if_region_missing=*/true);
+    }
+
+    EngineResultMeta RestoreRowInternal(const std::string& block_hash,
+                                        int32_t status,
+                                        const EngineBlockLocation& location,
+                                        int64_t version,
+                                        int64_t now_ms,
+                                        bool park_if_region_missing) {
         // Persist to in-memory catalog only in unit-test / LOCAL_FALLBACK mode.
         if (catalog_tier_ == EngineCatalogTier::LOCAL_FALLBACK) {
             AccessorRow arow;
@@ -321,8 +343,12 @@ public:
             bs == BlockStatus::EVICTING  || bs == BlockStatus::FAILED) {
             std::shared_lock<std::shared_mutex> lk(regions_mu_);
             auto it = regions_.find(location.store_node_id);
-            if (it == regions_.end())
+            if (it == regions_.end()) {
+                if (park_if_region_missing) {
+                    ParkRestoreRow(block_hash, status, location, version, now_ms);
+                }
                 return ToEngineResult(ItemResult::Ok());  // region not registered yet
+            }
             KVRegion& re = *it->second;
             int64_t slot_idx = re.SlotIdxFromOffset(location.pool_offset);
             if (slot_idx < 0 || slot_idx >= re.total_blocks)
@@ -342,13 +368,48 @@ public:
             slot.lease_token   = NewLeaseToken();
             slot.lease_expire_ms = now_ms + kDefaultLeaseTtlMs;
             slot.version       = version;
-            slot.store_epoch   = location.store_epoch;
+            slot.store_epoch   = re.store_epoch;
             slot.block_hash    = block_hash;
             // Publish to hash index (upsert for idempotent recovery).
             shard_index_.Upsert(block_hash,
                                 SlotRef{location.store_node_id, slot_idx});
         }
         return ToEngineResult(ItemResult::Ok());
+    }
+
+    void ParkRestoreRow(const std::string& block_hash,
+                        int32_t status,
+                        const EngineBlockLocation& location,
+                        int64_t version,
+                        int64_t now_ms) {
+        std::lock_guard<std::mutex> lk(pending_restore_mu_);
+        auto& rows = pending_restores_by_store_[location.store_node_id];
+        for (auto& row : rows) {
+            if (row.block_hash == block_hash) {
+                row.status = status;
+                row.location = location;
+                row.version = version;
+                row.now_ms = now_ms;
+                return;
+            }
+        }
+        rows.push_back(PendingRestoreRow{block_hash, status, location, version, now_ms});
+    }
+
+    void ApplyPendingRestoresForStore(int32_t store_node_id) {
+        std::vector<PendingRestoreRow> rows;
+        {
+            std::lock_guard<std::mutex> lk(pending_restore_mu_);
+            auto it = pending_restores_by_store_.find(store_node_id);
+            if (it == pending_restores_by_store_.end()) return;
+            rows.swap(it->second);
+            pending_restores_by_store_.erase(it);
+        }
+        for (const auto& row : rows) {
+            (void)RestoreRowInternal(row.block_hash, row.status, row.location,
+                                     row.version, row.now_ms,
+                                     /*park_if_region_missing=*/false);
+        }
     }
 
     int64_t BumpDnEpoch() {
@@ -1576,6 +1637,8 @@ private:
 
     mutable std::shared_mutex regions_mu_;
     std::unordered_map<int32_t, std::unique_ptr<KVRegion>> regions_;
+    std::mutex pending_restore_mu_;
+    std::unordered_map<int32_t, std::vector<PendingRestoreRow>> pending_restores_by_store_;
 
     mutable ShardHashIndex shard_index_;
 

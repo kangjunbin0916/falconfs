@@ -19,23 +19,13 @@ EngineResultMeta MakeRemoteTierRefusalMeta() {
     return m;
 }
 
-void MaybePromoteCatalogStoredToDram(const std::shared_ptr<KVMetadataEngine>& engine,
-                                     const std::string& block_hash,
-                                     const LookupResult& r,
-                                     int64_t now_ms) {
-    if (engine == nullptr || !r.result().success()) return;
-    if (r.status() != BlockStatus::BLOCK_STATUS_STORED) return;
-    if (!r.has_location() || r.location().pool_offset() < 0) return;
-    EngineBlockLocation eloc;
-    eloc.store_node_id = r.location().store_node_id();
-    eloc.pool_offset = r.location().pool_offset();
-    eloc.evicted_path = r.location().evicted_path();
-    eloc.store_epoch = r.location().store_epoch();
-    engine->RestoreRow(block_hash,
-                       static_cast<int32_t>(BlockStatus::BLOCK_STATUS_STORED),
-                       eloc,
-                       r.version(),
-                       now_ms);
+EngineResultMeta CatalogStoredWithoutDramSlot() {
+    EngineResultMeta err{};
+    err.success = false;
+    err.error_code = static_cast<int32_t>(ErrorCode::CAS_CONFLICT);
+    err.retryable = true;
+    err.error_message = "catalog STORED row has no DRAM slot";
+    return err;
 }
 }  // namespace
 
@@ -193,7 +183,15 @@ void KVMetadataServiceImpl::BatchLookupWithLeaseSplitForPoolWorker(
         LookupResult* dest = response->mutable_results(i);
         dest->CopyFrom(cr);
         dest->set_block_hash(request.items(i).block_hash());
-        MaybePromoteCatalogStoredToDram(engine_, request.items(i).block_hash(), *dest, after_ms);
+        if (request.items(i).renew_lease_on_hit() &&
+            dest->result().success() &&
+            dest->status() == BlockStatus::BLOCK_STATUS_STORED &&
+            !dest->has_lease()) {
+            FillResultMeta(CatalogStoredWithoutDramSlot(), dest->mutable_result());
+            dest->set_status(BlockStatus::BLOCK_STATUS_UNSPECIFIED);
+            dest->clear_location();
+            dest->clear_version();
+        }
     }
     response->set_server_time_ms(after_ms);
 }

@@ -4,7 +4,11 @@
 
 #include "brpc_comm_adapter/brpc_kv_service_imp.h"
 
+#include <brpc/controller.h>
 #include <brpc/server.h>
+
+#include <string>
+#include <utility>
 
 #include "brpc_comm_adapter/brpc_kv_cache_service_job.h"
 
@@ -79,8 +83,17 @@ void BrpcKVDataServiceImpl::WriteBlock(::google::protobuf::RpcController *contro
                                        ::falconfs::kv::WriteBlockResponse *response,
                                        ::google::protobuf::Closure *done)
 {
-    (void) controller;
     brpc::ClosureGuard guard(done);
+    auto *cntl = dynamic_cast<brpc::Controller *>(controller);
+    if (cntl != nullptr && cntl->request_attachment().size() > 0 &&
+        request->has_item() && request->item().payload().empty()) {
+        ::falconfs::kv::WriteBlockRequest with_payload(*request);
+        std::string payload;
+        cntl->request_attachment().copy_to(&payload);
+        with_payload.mutable_item()->set_payload(std::move(payload));
+        impl_->WriteBlock(with_payload, response);
+        return;
+    }
     impl_->WriteBlock(*request, response);
 }
 
@@ -89,9 +102,14 @@ void BrpcKVDataServiceImpl::ReadBlock(::google::protobuf::RpcController *control
                                       ::falconfs::kv::ReadBlockResponse *response,
                                       ::google::protobuf::Closure *done)
 {
-    (void) controller;
     brpc::ClosureGuard guard(done);
     impl_->ReadBlock(*request, response);
+    auto *cntl = dynamic_cast<brpc::Controller *>(controller);
+    if (cntl != nullptr && response->has_result() &&
+        !response->result().payload().empty()) {
+        cntl->response_attachment().append(response->result().payload());
+        response->mutable_result()->clear_payload();
+    }
 }
 
 void BrpcKVDataServiceImpl::ReadFromSSD(::google::protobuf::RpcController *controller,
@@ -99,9 +117,14 @@ void BrpcKVDataServiceImpl::ReadFromSSD(::google::protobuf::RpcController *contr
                                         ::falconfs::kv::ReadFromSSDResponse *response,
                                         ::google::protobuf::Closure *done)
 {
-    (void) controller;
     brpc::ClosureGuard guard(done);
     impl_->ReadFromSSD(*request, response);
+    auto *cntl = dynamic_cast<brpc::Controller *>(controller);
+    if (cntl != nullptr && response->has_result() &&
+        !response->result().payload().empty()) {
+        cntl->response_attachment().append(response->result().payload());
+        response->mutable_result()->clear_payload();
+    }
 }
 
 void BrpcKVDataServiceImpl::BatchWriteBlock(::google::protobuf::RpcController *controller,

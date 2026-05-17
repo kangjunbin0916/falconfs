@@ -6,6 +6,7 @@
 
 #include <brpc/channel.h>
 #include <brpc/controller.h>
+#include <butil/iobuf.h>
 
 #include <fcntl.h>
 #include <libpq-fe.h>
@@ -24,6 +25,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace falconfs::kv {
 
@@ -64,6 +66,47 @@ std::string MakeEndpoint(const char* host, int brpc_port)
     return o.str();
 }
 
+void AppendU64LEIOBuf(butil::IOBuf* out, uint64_t v)
+{
+    char buf[8];
+    for (int i = 0; i < 8; ++i) buf[i] = static_cast<char>((v >> (8 * i)) & 0xff);
+    out->append(buf, sizeof(buf));
+}
+
+void AppendPayloadFramesToIOBuf(const std::vector<std::string>& payloads, butil::IOBuf* out)
+{
+    for (const auto& payload : payloads) {
+        AppendU64LEIOBuf(out, static_cast<uint64_t>(payload.size()));
+        if (!payload.empty()) out->append(payload);
+    }
+}
+
+bool ReadU64LE(const std::string& in, size_t* pos, uint64_t* v)
+{
+    if (*pos + 8 > in.size()) return false;
+    uint64_t x = 0;
+    for (int i = 0; i < 8; ++i) x |= (static_cast<uint64_t>(static_cast<unsigned char>(in[*pos + i])) << (8 * i));
+    *pos += 8;
+    *v = x;
+    return true;
+}
+
+bool DecodePayloadFrames(const std::string& in, int n, std::vector<std::string>* payloads)
+{
+    if (payloads == nullptr) return false;
+    payloads->clear();
+    payloads->reserve(std::max(0, n));
+    size_t pos = 0;
+    for (int i = 0; i < n; ++i) {
+        uint64_t len = 0;
+        if (!ReadU64LE(in, &pos, &len)) return false;
+        if (len > static_cast<uint64_t>(in.size() - pos)) return false;
+        payloads->emplace_back(in.data() + pos, static_cast<size_t>(len));
+        pos += static_cast<size_t>(len);
+    }
+    return pos == in.size();
+}
+
 }  // namespace
 
 class UnhealthyKVStoreFacade final : public IKVStoreFacade {
@@ -91,6 +134,12 @@ public:
             FillErr(rr->mutable_result(), "store unhealthy");
         }
     }
+    void BatchReadBlockPayloads(const BatchReadBlockRequest& req, BatchReadBlockResponse* resp,
+                                std::vector<std::string>* payloads) override
+    {
+        BatchReadBlock(req, resp);
+        if (payloads != nullptr) payloads->assign(req.items_size(), std::string());
+    }
     void BatchReadFromSSD(const BatchReadFromSSDRequest& req,
                           BatchReadFromSSDResponse* resp) override
     {
@@ -107,11 +156,30 @@ public:
         wr->set_block_hash(req.item().block_hash());
         FillErr(wr->mutable_result(), "store unhealthy");
     }
+    void WriteBlockPayload(const WriteBlockRequest& req,
+                           const char* /*payload*/,
+                           size_t /*payload_len*/,
+                           WriteBlockResponse* resp) override
+    {
+        WriteBlock(req, resp);
+    }
+    void BatchWriteBlockPayloads(const BatchWriteBlockRequest& req,
+                                 const std::vector<std::string>& /*payloads*/,
+                                 BatchWriteBlockResponse* resp) override
+    {
+        BatchWriteBlock(req, resp);
+    }
     void ReadBlock(const ReadBlockRequest& req, ReadBlockResponse* resp) override
     {
         auto* rr = resp->mutable_result();
         rr->set_block_hash(req.item().block_hash());
         FillErr(rr->mutable_result(), "store unhealthy");
+    }
+    void ReadBlockPayload(const ReadBlockRequest& req,
+                          ReadBlockResponse* resp,
+                          std::string* /*payload*/) override
+    {
+        ReadBlock(req, resp);
     }
     void ReadFromSSD(const ReadFromSSDRequest& req, ReadFromSSDResponse* resp) override
     {
@@ -138,17 +206,60 @@ public:
     void BatchWriteBlock(const BatchWriteBlockRequest& req,
                          BatchWriteBlockResponse* resp) override
     {
+        std::vector<std::string> payloads;
+        payloads.reserve(req.items_size());
+        BatchWriteBlockRequest wire(req);
+        for (int i = 0; i < wire.items_size(); ++i) {
+            payloads.push_back(wire.items(i).payload());
+            wire.mutable_items(i)->clear_payload();
+        }
+        BatchWriteBlockPayloads(wire, payloads, resp);
+    }
+    void BatchWriteBlockPayloads(const BatchWriteBlockRequest& req,
+                                 const std::vector<std::string>& payloads,
+                                 BatchWriteBlockResponse* resp) override
+    {
         if (ch_ == nullptr) return;
         KVDataService_Stub stub(ch_.get());
         brpc::Controller cntl;
-        stub.BatchWriteBlock(&cntl, &req, resp, nullptr);
+        BatchWriteBlockRequest wire(req);
+        for (int i = 0; i < wire.items_size(); ++i) wire.mutable_items(i)->clear_payload();
+        const bool use_attachment = static_cast<int>(payloads.size()) == req.items_size();
+        if (use_attachment) AppendPayloadFramesToIOBuf(payloads, &cntl.request_attachment());
+        stub.BatchWriteBlock(&cntl, &wire, resp, nullptr);
     }
     void BatchReadBlock(const BatchReadBlockRequest& req, BatchReadBlockResponse* resp) override
+    {
+        std::vector<std::string> payloads;
+        BatchReadBlockPayloads(req, resp, &payloads);
+        for (int i = 0; i < resp->results_size() && i < static_cast<int>(payloads.size()); ++i) {
+            if (!payloads[i].empty() && resp->results(i).payload().empty()) {
+                resp->mutable_results(i)->set_payload(std::move(payloads[i]));
+            }
+        }
+    }
+    void BatchReadBlockPayloads(const BatchReadBlockRequest& req, BatchReadBlockResponse* resp,
+                                std::vector<std::string>* payloads) override
     {
         if (ch_ == nullptr) return;
         KVDataService_Stub stub(ch_.get());
         brpc::Controller cntl;
         stub.BatchReadBlock(&cntl, &req, resp, nullptr);
+        if (payloads == nullptr) return;
+        if (cntl.response_attachment().size() > 0) {
+            std::string framed;
+            cntl.response_attachment().copy_to(&framed);
+            if (DecodePayloadFrames(framed, resp->results_size(), payloads)) {
+                for (int i = 0; i < resp->results_size(); ++i) resp->mutable_results(i)->clear_payload();
+                return;
+            }
+        }
+        payloads->clear();
+        payloads->reserve(resp->results_size());
+        for (int i = 0; i < resp->results_size(); ++i) {
+            payloads->push_back(resp->results(i).payload());
+            resp->mutable_results(i)->clear_payload();
+        }
     }
     void BatchReadFromSSD(const BatchReadFromSSDRequest& req,
                           BatchReadFromSSDResponse* resp) override
@@ -162,16 +273,82 @@ public:
     void WriteBlock(const WriteBlockRequest& req, WriteBlockResponse* resp) override
     {
         if (ch_ == nullptr) return;
-        KVDataService_Stub stub(ch_.get());
-        brpc::Controller cntl;
-        stub.WriteBlock(&cntl, &req, resp, nullptr);
+        WriteBlockPayload(req, req.has_item() ? req.item().payload().data() : nullptr,
+                          req.has_item() ? req.item().payload().size() : 0, resp);
     }
-    void ReadBlock(const ReadBlockRequest& req, ReadBlockResponse* resp) override
+    void WriteBlockPayload(const WriteBlockRequest& req,
+                           const char* payload,
+                           size_t payload_len,
+                           WriteBlockResponse* resp) override
     {
         if (ch_ == nullptr) return;
         KVDataService_Stub stub(ch_.get());
         brpc::Controller cntl;
-        stub.ReadBlock(&cntl, &req, resp, nullptr);
+        WriteBlockRequest wire(req);
+        const bool use_attachment = (payload != nullptr && payload_len > 0);
+        if (use_attachment) {
+            wire.mutable_item()->clear_payload();
+        }
+        for (int attempt = 0; attempt < 12; ++attempt) {
+            cntl.Reset();
+            resp->Clear();
+            if (use_attachment) {
+                cntl.request_attachment().append(payload, payload_len);
+            }
+            stub.WriteBlock(&cntl, &wire, resp, nullptr);
+            if (!cntl.Failed()) {
+                return;
+            }
+            if (attempt < 11) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50 * std::min(attempt + 1, 24)));
+            }
+        }
+        auto* wr = resp->mutable_result();
+        wr->set_block_hash(req.has_item() ? req.item().block_hash() : std::string());
+        FillErr(wr->mutable_result(), cntl.ErrorText().c_str());
+    }
+    void ReadBlock(const ReadBlockRequest& req, ReadBlockResponse* resp) override
+    {
+        std::string payload;
+        ReadBlockPayload(req, resp, &payload);
+        if (!payload.empty() && resp->has_result() && resp->result().payload().empty()) {
+            resp->mutable_result()->set_payload(std::move(payload));
+        }
+    }
+    void ReadBlockPayload(const ReadBlockRequest& req,
+                          ReadBlockResponse* resp,
+                          std::string* payload) override
+    {
+        if (ch_ == nullptr) return;
+        KVDataService_Stub stub(ch_.get());
+        brpc::Controller cntl;
+        bool ok = false;
+        for (int attempt = 0; attempt < 12; ++attempt) {
+            cntl.Reset();
+            resp->Clear();
+            stub.ReadBlock(&cntl, &req, resp, nullptr);
+            if (!cntl.Failed()) {
+                ok = true;
+                break;
+            }
+            if (attempt < 11) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50 * std::min(attempt + 1, 24)));
+            }
+        }
+        if (!ok) {
+            auto* rr = resp->mutable_result();
+            rr->set_block_hash(req.has_item() ? req.item().block_hash() : std::string());
+            FillErr(rr->mutable_result(), cntl.ErrorText().c_str());
+            return;
+        }
+        if (payload == nullptr) return;
+        if (cntl.response_attachment().size() > 0) {
+            cntl.response_attachment().copy_to(payload);
+            if (resp->has_result()) resp->mutable_result()->clear_payload();
+        } else if (resp->has_result() && !resp->result().payload().empty()) {
+            *payload = std::move(*resp->mutable_result()->mutable_payload());
+            resp->mutable_result()->clear_payload();
+        }
     }
     void ReadFromSSD(const ReadFromSSDRequest& req, ReadFromSSDResponse* resp) override
     {
@@ -179,6 +356,12 @@ public:
         KVDataService_Stub stub(ch_.get());
         brpc::Controller cntl;
         stub.ReadFromSSD(&cntl, &req, resp, nullptr);
+        if (cntl.response_attachment().size() > 0 && resp->has_result() &&
+            resp->result().payload().empty()) {
+            std::string payload;
+            cntl.response_attachment().copy_to(&payload);
+            resp->mutable_result()->set_payload(std::move(payload));
+        }
     }
 
 private:
@@ -205,6 +388,16 @@ public:
     void BatchWriteBlock(const BatchWriteBlockRequest& req,
                          BatchWriteBlockResponse* resp) override
     {
+        std::vector<std::string> payloads;
+        payloads.reserve(req.items_size());
+        for (const auto& it : req.items()) payloads.push_back(it.payload());
+        BatchWriteBlockPayloads(req, payloads, resp);
+    }
+
+    void BatchWriteBlockPayloads(const BatchWriteBlockRequest& req,
+                                 const std::vector<std::string>& payloads,
+                                 BatchWriteBlockResponse* resp) override
+    {
         if (!IsHealthy()) {
             for (int i = 0; i < req.items_size(); ++i) {
                 auto* wr = resp->add_results();
@@ -218,12 +411,13 @@ public:
             auto* wr          = resp->add_results();
             wr->set_block_hash(it.block_hash());
             const size_t off = static_cast<size_t>(it.pool_offset());
-            const size_t psz = it.payload().size();
+            const std::string& payload = (i < static_cast<int>(payloads.size())) ? payloads[static_cast<size_t>(i)] : it.payload();
+            const size_t psz = payload.size();
             if (it.pool_offset() < 0 || off + psz > shm_->len) {
                 FillErr(wr->mutable_result(), "pool_offset/payload out of range");
                 continue;
             }
-            std::memcpy(static_cast<char*>(shm_->base) + off, it.payload().data(), psz);
+            if (psz > 0) std::memcpy(static_cast<char*>(shm_->base) + off, payload.data(), psz);
             wr->mutable_result()->set_success(true);
             wr->set_bytes_written(static_cast<int32_t>(psz));
         }
@@ -231,14 +425,27 @@ public:
 
     void BatchReadBlock(const BatchReadBlockRequest& req, BatchReadBlockResponse* resp) override
     {
+        std::vector<std::string> payloads;
+        BatchReadBlockPayloads(req, resp, &payloads);
+        for (int i = 0; i < resp->results_size() && i < static_cast<int>(payloads.size()); ++i) {
+            if (!payloads[i].empty()) resp->mutable_results(i)->set_payload(std::move(payloads[i]));
+        }
+    }
+
+    void BatchReadBlockPayloads(const BatchReadBlockRequest& req, BatchReadBlockResponse* resp,
+                                std::vector<std::string>* payloads) override
+    {
+        if (payloads != nullptr) payloads->clear();
         if (!IsHealthy()) {
             for (int i = 0; i < req.items_size(); ++i) {
                 auto* rr = resp->add_results();
                 rr->set_block_hash(req.items(i).block_hash());
                 FillErr(rr->mutable_result(), "local shm not mapped");
+                if (payloads != nullptr) payloads->push_back(std::string());
             }
             return;
         }
+        if (payloads != nullptr) payloads->reserve(req.items_size());
         for (int i = 0; i < req.items_size(); ++i) {
             const ReadItem& it = req.items(i);
             auto* rr          = resp->add_results();
@@ -247,10 +454,11 @@ public:
             const int bs     = it.block_size() > 0 ? it.block_size() : shm_->block_size;
             if (it.pool_offset() < 0 || off + static_cast<size_t>(bs) > shm_->len) {
                 FillErr(rr->mutable_result(), "pool_offset out of range");
+                if (payloads != nullptr) payloads->push_back(std::string());
                 continue;
             }
             const char* p = static_cast<const char*>(shm_->base) + off;
-            rr->set_payload(p, static_cast<size_t>(bs));
+            if (payloads != nullptr) payloads->emplace_back(p, static_cast<size_t>(bs));
             rr->mutable_result()->set_success(true);
             rr->set_compression(CompressionType::COMPRESSION_NONE);
             rr->set_original_size(bs);
@@ -282,20 +490,48 @@ public:
             return;
         }
         const WriteItem& it = req.item();
+        WriteBlockPayload(req, it.payload().data(), it.payload().size(), resp);
+    }
+
+    void WriteBlockPayload(const WriteBlockRequest& req,
+                           const char* payload,
+                           size_t payload_len,
+                           WriteBlockResponse* resp) override
+    {
+        if (!IsHealthy()) {
+            auto* wr = resp->mutable_result();
+            wr->set_block_hash(req.item().block_hash());
+            FillErr(wr->mutable_result(), "local shm not mapped");
+            return;
+        }
+        const WriteItem& it = req.item();
         auto* wr          = resp->mutable_result();
         wr->set_block_hash(it.block_hash());
         const size_t off = static_cast<size_t>(it.pool_offset());
-        const size_t psz = it.payload().size();
+        const size_t psz = payload_len;
         if (it.pool_offset() < 0 || off + psz > shm_->len) {
             FillErr(wr->mutable_result(), "pool_offset/payload out of range");
             return;
         }
-        std::memcpy(static_cast<char*>(shm_->base) + off, it.payload().data(), psz);
+        if (payload != nullptr && psz > 0) {
+            std::memcpy(static_cast<char*>(shm_->base) + off, payload, psz);
+        }
         wr->mutable_result()->set_success(true);
         wr->set_bytes_written(static_cast<int32_t>(psz));
     }
 
     void ReadBlock(const ReadBlockRequest& req, ReadBlockResponse* resp) override
+    {
+        std::string payload;
+        ReadBlockPayload(req, resp, &payload);
+        if (!payload.empty() && resp->has_result()) {
+            resp->mutable_result()->set_payload(std::move(payload));
+        }
+    }
+
+    void ReadBlockPayload(const ReadBlockRequest& req,
+                          ReadBlockResponse* resp,
+                          std::string* payload) override
     {
         if (!IsHealthy()) {
             auto* rr = resp->mutable_result();
@@ -312,8 +548,10 @@ public:
             FillErr(rr->mutable_result(), "pool_offset out of range");
             return;
         }
-        const char* p = static_cast<const char*>(shm_->base) + off;
-        rr->set_payload(p, static_cast<size_t>(bs));
+        const char* src = static_cast<const char*>(shm_->base) + off;
+        if (payload != nullptr) {
+            payload->assign(src, static_cast<size_t>(bs));
+        }
         rr->mutable_result()->set_success(true);
         rr->set_compression(CompressionType::COMPRESSION_NONE);
         rr->set_original_size(bs);

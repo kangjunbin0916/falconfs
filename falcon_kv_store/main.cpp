@@ -337,7 +337,8 @@ int main(int argc, char** argv) {
         /*base_offset=*/0,
         /*region_bytes=*/region_bytes,
         block_size,
-        store_epoch);
+        store_epoch,
+        shm_name);
 
     auto data_impl    = std::make_shared<falconfs::kv::KVDataServiceImpl>(store_engine);
     auto data_adapter = std::make_shared<falconfs::kv::KVDataBrpcServiceAdapter>(data_impl);
@@ -388,8 +389,16 @@ int main(int argc, char** argv) {
     for (std::size_t i = 0; i < dn_ports.size(); ++i) {
         const std::string ep = "127.0.0.1:" + std::to_string(dn_ports[i]);
         const int64_t base = static_cast<int64_t>(i) * slice_bytes;
-        if (!RegisterRegionOnDn(ep, store_brpc_endpoint, store_node_id, static_cast<int>(i), base,
-                                slice_bytes, block_size, store_epoch, shm_name, runtime_dir)) {
+        bool registered = false;
+        for (int attempt = 0; attempt < 120 && !registered; ++attempt) {
+            registered = RegisterRegionOnDn(ep, store_brpc_endpoint, store_node_id,
+                                            static_cast<int>(i), base, slice_bytes,
+                                            block_size, store_epoch, shm_name, runtime_dir);
+            if (!registered) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+        }
+        if (!registered) {
             fprintf(stderr, "[falcon_kv_store] RegisterStoreRegion failed for %s\n", ep.c_str());
             (void) ExecStoreUnregister(cn, store_node_id);
             PQfinish(cn);
@@ -413,7 +422,19 @@ int main(int argc, char** argv) {
                 PQfinish(c);
             }
             const int64_t now_ms = WallClockMillis();
-            for (int p : dn_ports) {
+            for (std::size_t i = 0; i < dn_ports.size(); ++i) {
+                const int p = dn_ports[i];
+                const int64_t base = static_cast<int64_t>(i) * slice_bytes;
+                (void) RegisterRegionOnDn("127.0.0.1:" + std::to_string(p),
+                                          store_brpc_endpoint,
+                                          store_node_id,
+                                          static_cast<int>(i),
+                                          base,
+                                          slice_bytes,
+                                          block_size,
+                                          store_epoch,
+                                          shm_name,
+                                          runtime_dir);
                 (void) HeartbeatDn("127.0.0.1:" + std::to_string(p), store_node_id, store_epoch, now_ms);
             }
         }

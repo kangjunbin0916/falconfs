@@ -12,6 +12,13 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 INSTALL_DIR="${FALCONFS_INSTALL_DIR:-/usr/local/falconfs}"
 DEPLOY_DIR="$INSTALL_DIR/deploy"
 
+# Regression runs invoke this script from non-login shells, where WSL may place
+# the distro's postgresql-common wrappers ahead of the locally built PostgreSQL.
+# Prefer the workspace install when present so pg_config/psql/postgres agree.
+if [ -x /usr/local/pgsql/bin/pg_config ]; then
+    export PATH="/usr/local/pgsql/bin:${PATH:-}"
+fi
+
 # Color definitions
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -54,6 +61,14 @@ kv_store_poolers_csv() {
 # v6.5: default KV store BRPC port (DN falcon_kv.store_spill_endpoint must match first store).
 KV_STORE_BRPC_PORT="${KV_STORE_BRPC_PORT:-18765}"
 export KV_STORE_BRPC_PORT
+
+# Falcon BRPC connection pool shared memory (MB) for CN/DN ``postgresql.conf``.
+# Larger values reduce pressure when many parallel KV metadata RPCs hit the pool.
+: "${FALCON_POOL_SHMEM_MB:=256}"
+if [ "${KV_THREE_DNS:-0}" = "1" ] && [ "${FALCON_POOL_SHMEM_MB}" = "256" ]; then
+    FALCON_POOL_SHMEM_MB=512
+fi
+export FALCON_POOL_SHMEM_MB
 
 # Client nodes (FUSE mounts)
 CLIENT1_RPC_PORT=56039
@@ -394,7 +409,7 @@ max_replication_slots = 8
 max_wal_senders = 8
 falcon_connection_pool.port = $CN_POOLER_PORT
 falcon_connection_pool.pool_size = 32
-falcon_connection_pool.shmem_size = 256
+falcon_connection_pool.shmem_size = $FALCON_POOL_SHMEM_MB
 falcon_connection_pool.batch_size = 1024
 falcon_connection_pool.wait_adjust = 1
 falcon_connection_pool.wait_min = 1
@@ -439,7 +454,7 @@ max_replication_slots = 8
 max_wal_senders = 8
 falcon_connection_pool.port = $DN1_POOLER_PORT
 falcon_connection_pool.pool_size = 32
-falcon_connection_pool.shmem_size = 256
+falcon_connection_pool.shmem_size = $FALCON_POOL_SHMEM_MB
 falcon_connection_pool.batch_size = 1024
 falcon_connection_pool.wait_adjust = 1
 falcon_connection_pool.wait_min = 1
@@ -485,7 +500,7 @@ max_replication_slots = 8
 max_wal_senders = 8
 falcon_connection_pool.port = $DN2_POOLER_PORT
 falcon_connection_pool.pool_size = 32
-falcon_connection_pool.shmem_size = 256
+falcon_connection_pool.shmem_size = $FALCON_POOL_SHMEM_MB
 falcon_connection_pool.batch_size = 1024
 falcon_connection_pool.wait_adjust = 1
 falcon_connection_pool.wait_min = 1
@@ -531,7 +546,7 @@ max_replication_slots = 8
 max_wal_senders = 8
 falcon_connection_pool.port = $DN3_POOLER_PORT
 falcon_connection_pool.pool_size = 32
-falcon_connection_pool.shmem_size = 256
+falcon_connection_pool.shmem_size = $FALCON_POOL_SHMEM_MB
 falcon_connection_pool.batch_size = 1024
 falcon_connection_pool.wait_adjust = 1
 falcon_connection_pool.wait_min = 1
@@ -653,6 +668,12 @@ EOF
         done
         local store_poolers
         store_poolers="$(kv_store_poolers_csv)"
+        if [ -z "${FALCON_KV_STORE_DRAM_BYTES:-}" ]; then
+            local __blk="${FALCON_KV_STORE_BLOCK_SIZE:-2097152}"
+            local __min_slots="${FALCON_KV_STORE_MIN_LOGICAL_SLOTS:-2048}"
+            export FALCON_KV_STORE_DRAM_BYTES=$(( __blk * __min_slots ))
+            log_info "FALCON_KV_STORE_DRAM_BYTES unset → ${__min_slots} logical slots × ${__blk} B = ${FALCON_KV_STORE_DRAM_BYTES} B (set FALCON_KV_STORE_DRAM_BYTES or FALCON_KV_STORE_MIN_LOGICAL_SLOTS to override)"
+        fi
         # Start one store at a time: each process registers on the CN then issues
         # RegisterStoreRegion to every DN. Parallel startups race on DN-side meta
         # and can cause later stores to unregister (leaving a single falcon_store_node row).
@@ -668,6 +689,7 @@ EOF
                 FALCON_KV_STORE_DN_POOLERS="$store_poolers" \
                 FALCON_KV_STORE_NODE_ID="$node_id" \
                 FALCON_KV_STORE_BLOCK_SIZE="${FALCON_KV_STORE_BLOCK_SIZE:-2097152}" \
+                FALCON_KV_STORE_DRAM_BYTES="${FALCON_KV_STORE_DRAM_BYTES:-}" \
                 FALCON_KV_STORE_ADVERTISE_HOST="127.0.0.1" \
                 FALCON_KV_STORE_SHM_NAME="falcon_kv_store_heap_${node_id}" \
                 FALCON_KV_STORE_RUNTIME_DIR="/tmp/falcon_kv_store_runtime/n${node_id}" \
@@ -1175,64 +1197,13 @@ run_kv_cluster_fault_test() {
             # Give the in-plugin recovery runner a moment to bump dn_epoch
             # and rehydrate the engine before BRPC clients hit it.
             sleep 3
-            # v6.5 P2: falcon_kv_store registers DRAM with each DN; after a DN PG
-            # restart the metadata engine is empty until RegisterStoreRegion runs
-            # again — recycle the store daemon so phase2 sees a healthy region.
+            # v6 §15.1: DN restart recovery assumes Store DRAM is intact. The
+            # live Store daemon periodically re-issues RegisterStoreRegion; wait
+            # for that re-registration instead of restarting the Store (which
+            # would turn this into the §15.2 Store-restart/lost-DRAM case).
             if [ "${STORE_COUNT:-1}" -gt 0 ]; then
-                log_step "  [T3] restarting falcon_kv_store daemon(s) for fresh DN1 region registration"
-                if [ -f /tmp/falcon_kv_store.pids ]; then
-                    while read -r pid; do
-                        if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
-                            kill -TERM "${pid}" 2>/dev/null || true
-                        fi
-                    done < /tmp/falcon_kv_store.pids
-                fi
-                rm -f /tmp/falcon_kv_store.pids
-                pkill -TERM falcon_kv_store 2>/dev/null || true
-                sleep 2
-                local kv_store_bin="$PROJECT_DIR/build/vllm_kv_cache/falcon_kv_store"
-                local base="${KV_STORE_BRPC_PORT:-18765}"
-                local sc="${STORE_COUNT:-1}"
-                local si pfree
-                for ((si = 0; si < sc; si++)); do
-                    pfree=$((base + si))
-                    if ! wait_for_tcp_port_free "$pfree" 40; then
-                        log_warn "  [T3] KV store port $pfree still busy after SIGTERM; SIGKILL falcon_kv_store"
-                        pkill -KILL falcon_kv_store 2>/dev/null || true
-                        sleep 2
-                        wait_for_tcp_port_free "$pfree" 15 || true
-                    fi
-                done
-                for ((si = 0; si < sc; si++)); do
-                    local nid=$((si + 1))
-                    mkdir -p "/tmp/falcon_kv_store_runtime/n${nid}" 2>/dev/null || true
-                done
-                local store_poolers
-                store_poolers="$(kv_store_poolers_csv)"
-                for ((si = 0; si < sc; si++)); do
-                    local p=$((base + si))
-                    local node_id=$((si + 1))
-                    local env_prefix=()
-                    if kv_three_dns_enabled; then
-                        env_prefix+=(NODE_NAME="v65mix${si}")
-                    fi
-                    nohup env "${env_prefix[@]}" FALCON_KV_STORE_CN_PGPORT="$CN_PORT" \
-                        FALCON_KV_STORE_BRPC_PORT="$p" \
-                        FALCON_KV_STORE_DN_POOLERS="$store_poolers" \
-                        FALCON_KV_STORE_NODE_ID="$node_id" \
-                        FALCON_KV_STORE_BLOCK_SIZE="${FALCON_KV_STORE_BLOCK_SIZE:-2097152}" \
-                        FALCON_KV_STORE_ADVERTISE_HOST="127.0.0.1" \
-                        FALCON_KV_STORE_SHM_NAME="falcon_kv_store_heap_${node_id}" \
-                        FALCON_KV_STORE_RUNTIME_DIR="/tmp/falcon_kv_store_runtime/n${node_id}" \
-                        "$kv_store_bin" >>"/tmp/falcon_kv_store_${si}.log" 2>&1 &
-                    echo $! >> /tmp/falcon_kv_store.pids
-                done
-                for ((si = 0; si < sc; si++)); do
-                    local p=$((base + si))
-                    if ! wait_for_listen_tcp "$p" 45; then
-                        log_step "  [T3] falcon_kv_store did not listen on $p after recycle"; rc=1
-                    fi
-                done
+                log_step "  [T3] waiting for live falcon_kv_store region re-registration"
+                sleep 12
             fi
             if ! "$fault_bin" --scenario=dn-restart-phase2 --endpoint "127.0.0.1:$DN1_POOLER_PORT" \
                  --state-file "$state_file"; then

@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -65,6 +67,29 @@ uint32_t ComputeChecksum(const std::string& payload) {
     return h;
 }
 
+bool EnvFlagEnabled(const char* key, bool default_value) {
+    const char* v = std::getenv(key);
+    if (v == nullptr || v[0] == '\0') return default_value;
+    if (std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+        std::strcmp(v, "TRUE") == 0 || std::strcmp(v, "yes") == 0 ||
+        std::strcmp(v, "YES") == 0 || std::strcmp(v, "on") == 0 ||
+        std::strcmp(v, "ON") == 0) {
+        return true;
+    }
+    if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
+        std::strcmp(v, "FALSE") == 0 || std::strcmp(v, "no") == 0 ||
+        std::strcmp(v, "NO") == 0 || std::strcmp(v, "off") == 0 ||
+        std::strcmp(v, "OFF") == 0) {
+        return false;
+    }
+    return default_value;
+}
+
+bool HotPathChecksumsEnabled() {
+    static const bool enabled = EnvFlagEnabled("FALCON_KV_STORE_COMPUTE_CHECKSUMS", false);
+    return enabled;
+}
+
 }  // namespace
 
 class KVStoreEngine::Impl {
@@ -73,17 +98,20 @@ public:
          int64_t base_offset,
          int64_t region_bytes,
          int32_t block_size,
-         int64_t store_epoch)
+         int64_t store_epoch,
+         std::string posix_shm_segment_name)
         : store_node_id_(store_node_id),
           base_offset_(base_offset),
           region_bytes_(region_bytes),
           block_size_(block_size),
           store_epoch_(store_epoch),
           dram_pool_(std::make_unique<DramPool>(static_cast<std::size_t>(region_bytes),
-                                                static_cast<std::size_t>(block_size))) {}
+                                                static_cast<std::size_t>(block_size),
+                                                /*try_huge_pages=*/false,
+                                                posix_shm_segment_name)) {}
 
     void SetSSDSpillManager(std::shared_ptr<SSDSpillManager> spill_manager) {
-        std::unique_lock<std::shared_mutex> lock(engine_mu_);
+        std::shared_lock<std::shared_mutex> lock(engine_mu_);
         spill_manager_ = std::move(spill_manager);
     }
 
@@ -120,7 +148,7 @@ public:
         (void)expected_version;
         (void)compression;
         (void)original_size;
-        std::unique_lock<std::shared_mutex> lock(engine_mu_);
+        std::shared_lock<std::shared_mutex> lock(engine_mu_);
         StoreWriteResult out;
         if (expected_store_epoch != store_epoch_) {
             out.result = MakeResult(false, ErrorCode::STALE_EPOCH, true, "stale store epoch");
@@ -138,7 +166,10 @@ public:
             out.result = MakeResult(false, ErrorCode::INVALID_ARGUMENT, false, "payload too large");
             return out;
         }
-        const uint32_t crc = ComputeChecksum(payload);
+        uint32_t crc = 0;
+        if (verify_checksum || HotPathChecksumsEnabled()) {
+            crc = ComputeChecksum(payload);
+        }
         if (verify_checksum && checksum_hint != crc) {
             out.result = MakeResult(false, ErrorCode::CHECKSUM_MISMATCH, false, "checksum mismatch");
             return out;
@@ -187,7 +218,7 @@ public:
         }
         out.result = MakeResult(true, ErrorCode::OK, false, "");
         out.payload = std::move(payload);
-        out.crc32 = ComputeChecksum(out.payload);
+        out.crc32 = HotPathChecksumsEnabled() ? ComputeChecksum(out.payload) : 0;
         out.compression = 0;
         out.original_size = block_size;
         return out;
@@ -427,8 +458,14 @@ KVStoreEngine::KVStoreEngine(int32_t store_node_id,
                              int64_t base_offset,
                              int64_t region_bytes,
                              int32_t block_size,
-                             int64_t store_epoch)
-    : impl_(std::make_unique<Impl>(store_node_id, base_offset, region_bytes, block_size, store_epoch)) {}
+                             int64_t store_epoch,
+                             std::string posix_shm_segment_name)
+    : impl_(std::make_unique<Impl>(store_node_id,
+                                    base_offset,
+                                    region_bytes,
+                                    block_size,
+                                    store_epoch,
+                                    std::move(posix_shm_segment_name))) {}
 
 KVStoreEngine::~KVStoreEngine() = default;
 KVStoreEngine::KVStoreEngine(KVStoreEngine&&) noexcept = default;

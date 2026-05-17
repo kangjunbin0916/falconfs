@@ -57,14 +57,15 @@ void SetThrottledMeta(ItemResultMeta* m) {
     m->set_error_message("store inflight queue full");
 }
 
-void ExecuteOneWrite(KVStoreEngine* engine,
-                     const WriteItem& item,
-                     bool verify_checksum,
-                     WriteResult* result) {
+void ExecuteOneWritePayload(KVStoreEngine* engine,
+                            const WriteItem& item,
+                            const std::string& payload,
+                            bool verify_checksum,
+                            WriteResult* result) {
     result->set_block_hash(item.block_hash());
     StoreWriteResult out = engine->Write(item.block_hash(),
                                          item.pool_offset(),
-                                         item.payload(),
+                                         payload,
                                          static_cast<int32_t>(item.compression()),
                                          item.original_size(),
                                          item.block_size(),
@@ -75,6 +76,13 @@ void ExecuteOneWrite(KVStoreEngine* engine,
     KVDataServiceImpl::FillResultMeta(out.result, result->mutable_result());
     result->set_bytes_written(out.bytes_written);
     result->set_crc32(out.crc32);
+}
+
+void ExecuteOneWrite(KVStoreEngine* engine,
+                     const WriteItem& item,
+                     bool verify_checksum,
+                     WriteResult* result) {
+    ExecuteOneWritePayload(engine, item, item.payload(), verify_checksum, result);
 }
 
 void ExecuteOneRead(KVStoreEngine* engine, const ReadItem& item, ReadResult* result) {
@@ -105,6 +113,12 @@ void ExecuteOneReadSSD(KVStoreEngine* engine, const SSDReadItem& item, SSDReadRe
 }  // namespace
 
 void KVDataServiceImpl::WriteBlock(const WriteBlockRequest& request, WriteBlockResponse* response) {
+    WriteBlockPayload(request, request.item().payload(), response);
+}
+
+void KVDataServiceImpl::WriteBlockPayload(const WriteBlockRequest& request,
+                                          const std::string& payload,
+                                          WriteBlockResponse* response) {
     constexpr int kOne = 1;
     if (!TryAdmitCount(kOne)) {
         auto* r = response->mutable_result();
@@ -114,7 +128,7 @@ void KVDataServiceImpl::WriteBlock(const WriteBlockRequest& request, WriteBlockR
         return;
     }
     const int64_t now_ms = NowMs();
-    ExecuteOneWrite(engine_.get(), request.item(), request.verify_checksum(), response->mutable_result());
+    ExecuteOneWritePayload(engine_.get(), request.item(), payload, request.verify_checksum(), response->mutable_result());
     response->set_server_time_ms(now_ms);
     ReleaseAdmission(kOne);
 }
@@ -159,6 +173,24 @@ void KVDataServiceImpl::BatchWriteBlock(const BatchWriteBlockRequest& request,
     for (const auto& item : request.items()) {
         auto* wr = response->add_results();
         ExecuteOneWrite(engine_.get(), item, request.verify_checksum(), wr);
+    }
+    response->set_server_time_ms(now_ms);
+    ReleaseAdmission(request.items_size());
+}
+
+void KVDataServiceImpl::BatchWriteBlockPayloads(const BatchWriteBlockRequest& request,
+                                                const std::vector<std::string>& payloads,
+                                                BatchWriteBlockResponse* response) {
+    if (!TryAdmit(request, response)) return;
+    response->clear_results();
+    const int64_t now_ms = NowMs();
+    for (int i = 0; i < request.items_size(); ++i) {
+        const auto& item = request.items(i);
+        const std::string& payload = (i < static_cast<int>(payloads.size()))
+                                         ? payloads[static_cast<size_t>(i)]
+                                         : item.payload();
+        auto* wr = response->add_results();
+        ExecuteOneWritePayload(engine_.get(), item, payload, request.verify_checksum(), wr);
     }
     response->set_server_time_ms(now_ms);
     ReleaseAdmission(request.items_size());

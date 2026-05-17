@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
@@ -19,13 +20,60 @@ from . import kv_data_service_pb2 as _kvdata
 from .dn_client import _result_meta_to_item_result
 from .reference import ErrorCode, ItemResult
 
-_store_endpoint_locks: Dict[str, threading.Lock] = {}
-_store_endpoint_locks_mu = threading.Lock()
+def _store_rpc_retry(fn, endpoint: str, req_bytes: bytes, timeout_ms: int) -> bytes:
+    """Store BRPC call with short backoff on transient ``E112`` / not-connected."""
+    last: BaseException | None = None
+    for i in range(12):
+        try:
+            return fn(endpoint, req_bytes, timeout_ms)
+        except RuntimeError as e:
+            last = e
+            msg = str(e)
+            if i == 11 or ("Not connected" not in msg and "E112" not in msg):
+                raise
+            time.sleep(0.05 * float(min(1 + i, 24)))
+    assert last is not None
+    raise last
 
 
-def _endpoint_wire_lock(endpoint: str) -> threading.Lock:
-    with _store_endpoint_locks_mu:
-        return _store_endpoint_locks.setdefault(endpoint, threading.Lock())
+
+def _facade_rpc_retry(fn, *args):
+    """Facade call retry for pooled BRPC channels warming up under parallel load."""
+    last: BaseException | None = None
+    for i in range(12):
+        try:
+            return fn(*args)
+        except RuntimeError as e:
+            last = e
+            msg = str(e)
+            if i == 11 or ("Not connected" not in msg and "E112" not in msg):
+                raise
+            time.sleep(0.05 * float(min(1 + i, 24)))
+    assert last is not None
+    raise last
+
+def _write_block_retry(endpoint: str, req_bytes: bytes, timeout_ms: int) -> bytes:
+    return _store_rpc_retry(falconfs_kv_brpc.write_block, endpoint, req_bytes, timeout_ms)
+
+
+def _read_block_retry(endpoint: str, req_bytes: bytes, timeout_ms: int) -> bytes:
+    return _store_rpc_retry(falconfs_kv_brpc.read_block, endpoint, req_bytes, timeout_ms)
+
+
+def _read_from_ssd_retry(endpoint: str, req_bytes: bytes, timeout_ms: int) -> bytes:
+    return _store_rpc_retry(falconfs_kv_brpc.read_from_ssd, endpoint, req_bytes, timeout_ms)
+
+
+def _batch_write_block_retry(endpoint: str, req_bytes: bytes, timeout_ms: int) -> bytes:
+    return _store_rpc_retry(falconfs_kv_brpc.batch_write_block, endpoint, req_bytes, timeout_ms)
+
+
+def _batch_read_block_retry(endpoint: str, req_bytes: bytes, timeout_ms: int) -> bytes:
+    return _store_rpc_retry(falconfs_kv_brpc.batch_read_block, endpoint, req_bytes, timeout_ms)
+
+
+def _batch_read_from_ssd_retry(endpoint: str, req_bytes: bytes, timeout_ms: int) -> bytes:
+    return _store_rpc_retry(falconfs_kv_brpc.batch_read_from_ssd, endpoint, req_bytes, timeout_ms)
 
 
 @dataclass(frozen=True)
@@ -56,12 +104,13 @@ class BrpcKVStore:
         self.endpoint = endpoint
         self.timeout_ms = timeout_ms
         self._req_seq = 0
+        self._req_lock = threading.Lock()
         self._use_facade_registry = use_facade_registry
-        self._ep_lock = _endpoint_wire_lock(endpoint)
 
     def _mk_request_id(self, tag: str) -> str:
-        self._req_seq += 1
-        return f"py_store_client_{tag}_{self._req_seq}"
+        with self._req_lock:
+            self._req_seq += 1
+            return f"py_store_client_{tag}_{self._req_seq}"
 
     def write(
         self,
@@ -74,33 +123,45 @@ class BrpcKVStore:
         *,
         block_hash: bytes = b"",
     ) -> ItemResult:
-        with self._ep_lock:
-            req = _kvdata.BatchWriteBlockRequest()
-            req.meta.request_id = self._mk_request_id("write")
-            it = req.items.add()
-            it.block_hash = block_hash
-            it.pool_offset = pool_offset
-            it.payload = payload
-            it.block_size = block_size
-            it.expected_store_epoch = expected_store_epoch
-            it.expected_version = expected_version
-            rsp = _kvdata.BatchWriteBlockResponse()
-            wire = b""
-            if self._use_facade_registry:
-                try:
-                    wire = falconfs_kv_brpc.facade_batch_write_block(
-                        int(store_node_id), req.SerializeToString()
-                    )
-                except Exception:
-                    wire = b""
-            if not wire:
-                wire = falconfs_kv_brpc.batch_write_block(
-                    self.endpoint, req.SerializeToString(), self.timeout_ms
+        req = _kvdata.WriteBlockRequest()
+        req.meta.request_id = self._mk_request_id("write")
+        it = req.item
+        it.block_hash = block_hash
+        it.pool_offset = pool_offset
+        it.payload = payload
+        it.block_size = block_size
+        it.expected_store_epoch = expected_store_epoch
+        it.expected_version = expected_version
+        rsp = _kvdata.WriteBlockResponse()
+        wire = b""
+        if self._use_facade_registry and hasattr(falconfs_kv_brpc, "facade_write_block_payload"):
+            try:
+                it.ClearField("payload")
+                wire = _facade_rpc_retry(
+                    falconfs_kv_brpc.facade_write_block_payload,
+                    int(store_node_id), req.SerializeToString(), payload
                 )
-            rsp.ParseFromString(wire)
-            if not rsp.results:
-                return ItemResult(False, ErrorCode.INTERNAL_ERROR, True, "empty response")
-            return _result_meta_to_item_result(rsp.results[0].result)
+            except Exception:
+                wire = b""
+            finally:
+                if not it.payload:
+                    it.payload = payload
+        if self._use_facade_registry and not wire:
+            try:
+                wire = _facade_rpc_retry(
+                    falconfs_kv_brpc.facade_write_block,
+                    int(store_node_id), req.SerializeToString()
+                )
+            except Exception:
+                wire = b""
+        if not wire:
+            wire = _write_block_retry(
+                self.endpoint, req.SerializeToString(), self.timeout_ms
+            )
+        rsp.ParseFromString(wire)
+        if not rsp.HasField("result"):
+            return ItemResult(False, ErrorCode.INTERNAL_ERROR, True, "empty response")
+        return _result_meta_to_item_result(rsp.result.result)
 
     def read(
         self,
@@ -112,33 +173,43 @@ class BrpcKVStore:
         *,
         block_hash: bytes = b"",
     ) -> Tuple[ItemResult, bytes]:
-        with self._ep_lock:
-            req = _kvdata.BatchReadBlockRequest()
-            req.meta.request_id = self._mk_request_id("read")
-            it = req.items.add()
-            it.block_hash = block_hash
-            it.pool_offset = pool_offset
-            it.block_size = block_size
-            it.expected_store_epoch = expected_store_epoch
-            it.expected_version = expected_version
-            rsp = _kvdata.BatchReadBlockResponse()
-            wire = b""
-            if self._use_facade_registry:
-                try:
-                    wire = falconfs_kv_brpc.facade_batch_read_block(
-                        int(store_node_id), req.SerializeToString()
-                    )
-                except Exception:
-                    wire = b""
-            if not wire:
-                wire = falconfs_kv_brpc.batch_read_block(
-                    self.endpoint, req.SerializeToString(), self.timeout_ms
+        req = _kvdata.ReadBlockRequest()
+        req.meta.request_id = self._mk_request_id("read")
+        it = req.item
+        it.block_hash = block_hash
+        it.pool_offset = pool_offset
+        it.block_size = block_size
+        it.expected_store_epoch = expected_store_epoch
+        it.expected_version = expected_version
+        rsp = _kvdata.ReadBlockResponse()
+        wire = b""
+        split_payload = b""
+        if self._use_facade_registry and hasattr(falconfs_kv_brpc, "facade_read_block_split"):
+            try:
+                wire, split_payload = _facade_rpc_retry(
+                    falconfs_kv_brpc.facade_read_block_split,
+                    int(store_node_id), req.SerializeToString()
                 )
-            rsp.ParseFromString(wire)
-            if not rsp.results:
-                return ItemResult(False, ErrorCode.INTERNAL_ERROR, True, "empty response"), b""
-            r = rsp.results[0]
-            return _result_meta_to_item_result(r.result), r.payload
+            except Exception:
+                wire = b""
+                split_payload = b""
+        if self._use_facade_registry and not wire:
+            try:
+                wire = _facade_rpc_retry(
+                    falconfs_kv_brpc.facade_read_block,
+                    int(store_node_id), req.SerializeToString()
+                )
+            except Exception:
+                wire = b""
+        if not wire:
+            wire = _read_block_retry(
+                self.endpoint, req.SerializeToString(), self.timeout_ms
+            )
+        rsp.ParseFromString(wire)
+        if not rsp.HasField("result"):
+            return ItemResult(False, ErrorCode.INTERNAL_ERROR, True, "empty response"), b""
+        r = rsp.result
+        return _result_meta_to_item_result(r.result), split_payload or r.payload
 
     def batch_write_blocks(
         self,
@@ -147,35 +218,87 @@ class BrpcKVStore:
     ) -> List[ItemResult]:
         if not blocks:
             return []
-        with self._ep_lock:
-            req = _kvdata.BatchWriteBlockRequest()
-            req.meta.request_id = self._mk_request_id("batch_write")
-            for b in blocks:
-                it = req.items.add()
-                it.block_hash = b.block_hash
-                it.pool_offset = b.pool_offset
-                it.payload = b.payload
-                it.block_size = b.block_size
-                it.expected_store_epoch = b.expected_store_epoch
-                it.expected_version = b.expected_version
-            rsp = _kvdata.BatchWriteBlockResponse()
-            wire = b""
-            if self._use_facade_registry:
-                try:
-                    wire = falconfs_kv_brpc.facade_batch_write_block(
+        req = _kvdata.BatchWriteBlockRequest()
+        req.meta.request_id = self._mk_request_id("batch_write")
+        payloads = []
+        for b in blocks:
+            it = req.items.add()
+            it.block_hash = b.block_hash
+            it.pool_offset = b.pool_offset
+            it.block_size = b.block_size
+            it.expected_store_epoch = b.expected_store_epoch
+            it.expected_version = b.expected_version
+            payloads.append(b.payload)
+        rsp = _kvdata.BatchWriteBlockResponse()
+        wire = b""
+        if self._use_facade_registry:
+            try:
+                if hasattr(falconfs_kv_brpc, "facade_batch_write_block_payloads"):
+                    wire = _facade_rpc_retry(
+                        falconfs_kv_brpc.facade_batch_write_block_payloads,
+                        int(store_node_id), req.SerializeToString(), payloads
+                    )
+                else:
+                    for it, payload in zip(req.items, payloads):
+                        it.payload = payload
+                    wire = _facade_rpc_retry(
+                        falconfs_kv_brpc.facade_batch_write_block,
                         int(store_node_id), req.SerializeToString()
                     )
-                except Exception:
-                    wire = b""
-            if not wire:
-                wire = falconfs_kv_brpc.batch_write_block(
-                    self.endpoint, req.SerializeToString(), self.timeout_ms
-                )
-            rsp.ParseFromString(wire)
-            out: List[ItemResult] = []
-            for r in rsp.results:
-                out.append(_result_meta_to_item_result(r.result))
-            return out
+            except Exception:
+                wire = b""
+        if not wire:
+            for it, payload in zip(req.items, payloads):
+                if not it.payload:
+                    it.payload = payload
+            wire = _batch_write_block_retry(
+                self.endpoint, req.SerializeToString(), self.timeout_ms
+            )
+        rsp.ParseFromString(wire)
+        out: List[ItemResult] = []
+        for r in rsp.results:
+            out.append(_result_meta_to_item_result(r.result))
+        return out
+
+    def batch_read_payloads_fast(
+        self,
+        store_node_id: int,
+        pool_offsets: Sequence[int],
+        store_epochs: Sequence[int],
+        block_hashes: Sequence[bytes],
+        block_size: int,
+    ) -> Tuple[List[bool], List[bytes]]:
+        if not pool_offsets:
+            return [], []
+        if (
+            self._use_facade_registry
+            and hasattr(falconfs_kv_brpc, "facade_batch_read_payloads_fast")
+        ):
+            return _facade_rpc_retry(
+                falconfs_kv_brpc.facade_batch_read_payloads_fast,
+                int(store_node_id),
+                list(pool_offsets),
+                list(store_epochs),
+                list(block_hashes),
+                int(block_size),
+            )
+        blocks = [
+            StoreBlockRead(
+                pool_offset=int(pool_offset),
+                block_hash=bytes(block_hash),
+                block_size=int(block_size),
+                expected_store_epoch=int(store_epoch),
+                expected_version=0,
+            )
+            for pool_offset, store_epoch, block_hash in zip(pool_offsets, store_epochs, block_hashes)
+        ]
+        results = self.batch_read_blocks(store_node_id, blocks)
+        ok_flags: List[bool] = []
+        payloads: List[bytes] = []
+        for result, payload in results:
+            ok_flags.append(result.success)
+            payloads.append(payload if result.success else b"")
+        return ok_flags, payloads
 
     def batch_read_blocks(
         self,
@@ -184,34 +307,63 @@ class BrpcKVStore:
     ) -> List[Tuple[ItemResult, bytes]]:
         if not blocks:
             return []
-        with self._ep_lock:
-            req = _kvdata.BatchReadBlockRequest()
-            req.meta.request_id = self._mk_request_id("batch_read")
-            for b in blocks:
-                it = req.items.add()
-                it.block_hash = b.block_hash
-                it.pool_offset = b.pool_offset
-                it.block_size = b.block_size
-                it.expected_store_epoch = b.expected_store_epoch
-                it.expected_version = b.expected_version
-            rsp = _kvdata.BatchReadBlockResponse()
-            wire = b""
-            if self._use_facade_registry:
-                try:
-                    wire = falconfs_kv_brpc.facade_batch_read_block(
-                        int(store_node_id), req.SerializeToString()
-                    )
-                except Exception:
-                    wire = b""
-            if not wire:
-                wire = falconfs_kv_brpc.batch_read_block(
-                    self.endpoint, req.SerializeToString(), self.timeout_ms
+        req = _kvdata.BatchReadBlockRequest()
+        req.meta.request_id = self._mk_request_id("batch_read")
+        for b in blocks:
+            it = req.items.add()
+            it.block_hash = b.block_hash
+            it.pool_offset = b.pool_offset
+            it.block_size = b.block_size
+            it.expected_store_epoch = b.expected_store_epoch
+            it.expected_version = b.expected_version
+        req_wire = req.SerializeToString()
+        if self._use_facade_registry and hasattr(falconfs_kv_brpc, "facade_batch_read_block_fast"):
+            try:
+                ok_flags, payloads = _facade_rpc_retry(
+                    falconfs_kv_brpc.facade_batch_read_block_fast,
+                    int(store_node_id), req_wire
                 )
-            rsp.ParseFromString(wire)
-            out: List[Tuple[ItemResult, bytes]] = []
-            for r in rsp.results:
-                out.append((_result_meta_to_item_result(r.result), r.payload))
-            return out
+                if len(ok_flags) == len(blocks) and len(payloads) == len(blocks):
+                    out: List[Tuple[ItemResult, bytes]] = []
+                    for ok, payload in zip(ok_flags, payloads):
+                        if ok:
+                            out.append((ItemResult(True, ErrorCode.OK, False, ""), payload))
+                        else:
+                            out.append((ItemResult(False, ErrorCode.INTERNAL_ERROR, True, "batch read failed"), b""))
+                    return out
+            except Exception:
+                pass
+
+        rsp = _kvdata.BatchReadBlockResponse()
+        wire = b""
+        split_payloads = None
+        if self._use_facade_registry:
+            try:
+                if hasattr(falconfs_kv_brpc, "facade_batch_read_block_split"):
+                    wire, split_payloads = _facade_rpc_retry(
+                        falconfs_kv_brpc.facade_batch_read_block_split,
+                        int(store_node_id), req_wire
+                    )
+                else:
+                    wire = _facade_rpc_retry(
+                        falconfs_kv_brpc.facade_batch_read_block,
+                        int(store_node_id), req_wire
+                    )
+            except Exception:
+                wire = b""
+                split_payloads = None
+        if not wire:
+            wire = _batch_read_block_retry(
+                self.endpoint, req_wire, self.timeout_ms
+            )
+        rsp.ParseFromString(wire)
+        out: List[Tuple[ItemResult, bytes]] = []
+        for i, r in enumerate(rsp.results):
+            payload = r.payload
+            if split_payloads is not None and i < len(split_payloads):
+                payload = split_payloads[i]
+            out.append((_result_meta_to_item_result(r.result), payload))
+        return out
 
     def read_from_ssd(
         self,
@@ -228,31 +380,41 @@ class BrpcKVStore:
         kept for API compatibility; the wire ``SSDReadItem`` only carries
         ``block_hash``, ``evicted_path``, and ``expected_version`` today.
         """
-        with self._ep_lock:
-            req = _kvdata.BatchReadFromSSDRequest()
-            req.meta.request_id = self._mk_request_id("read_ssd")
-            it = req.items.add()
-            it.block_hash = b""
-            it.evicted_path = evicted_path
-            it.expected_version = expected_version
-            rsp = _kvdata.BatchReadFromSSDResponse()
-            wire = b""
-            if self._use_facade_registry:
-                try:
-                    wire = falconfs_kv_brpc.facade_batch_read_from_ssd(
-                        int(store_node_id), req.SerializeToString()
-                    )
-                except Exception:
-                    wire = b""
-            if not wire:
-                wire = falconfs_kv_brpc.batch_read_from_ssd(
-                    self.endpoint, req.SerializeToString(), self.timeout_ms
+        req = _kvdata.ReadFromSSDRequest()
+        req.meta.request_id = self._mk_request_id("read_ssd")
+        it = req.item
+        it.block_hash = b""
+        it.evicted_path = evicted_path
+        it.expected_version = expected_version
+        rsp = _kvdata.ReadFromSSDResponse()
+        wire = b""
+        split_payload = b""
+        if self._use_facade_registry and hasattr(falconfs_kv_brpc, "facade_read_from_ssd_split"):
+            try:
+                wire, split_payload = _facade_rpc_retry(
+                    falconfs_kv_brpc.facade_read_from_ssd_split,
+                    int(store_node_id), req.SerializeToString()
                 )
-            rsp.ParseFromString(wire)
-            if not rsp.results:
-                return ItemResult(False, ErrorCode.INTERNAL_ERROR, True, "empty response"), b""
-            r = rsp.results[0]
-            return _result_meta_to_item_result(r.result), r.payload
+            except Exception:
+                wire = b""
+                split_payload = b""
+        if self._use_facade_registry and not wire:
+            try:
+                wire = _facade_rpc_retry(
+                    falconfs_kv_brpc.facade_read_from_ssd,
+                    int(store_node_id), req.SerializeToString()
+                )
+            except Exception:
+                wire = b""
+        if not wire:
+            wire = _read_from_ssd_retry(
+                self.endpoint, req.SerializeToString(), self.timeout_ms
+            )
+        rsp.ParseFromString(wire)
+        if not rsp.HasField("result"):
+            return ItemResult(False, ErrorCode.INTERNAL_ERROR, True, "empty response"), b""
+        r = rsp.result
+        return _result_meta_to_item_result(r.result), split_payload or r.payload
 
 
 class BrpcCluster:

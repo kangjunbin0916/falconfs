@@ -3737,3 +3737,156 @@ Append to §19:
 - §27 — concurrency table uses `std::shared_mutex` per stripe.
 - v6.6.1 changelog — top of doc; the three corrections.
 
+### 29.10 Measured performance follow-up optimizations
+
+The mixed-colocation E2E performance dashboard (§19.5) separates three layers:
+
+1. **End-to-end wall throughput** — complete `prepare_store` / `complete_store` /
+   `prepare_load` / `complete_load` phase time as seen by the OffloadingManager.
+2. **Python/OM data boundary** — request construction, Python protobuf
+   serialization/parse, future scheduling, and the native facade call.
+3. **C++ facade timing** — the cleanest SHM-vs-BRPC comparison, timed around
+   `LocalKVStoreShmFacade` / `RemoteKVStoreFacade` inside `falconfs_kv_brpc`.
+
+The observed shape is expected: same-host **local SHM** is much faster than
+same-machine **remote BRPC** at the C++ facade layer because remote BRPC still
+pays protobuf payload encoding, BRPC client/server scheduling, loopback TCP,
+Store service dispatch, response serialization, and extra memory copies for each
+2 MiB block. The remaining large gap between C++ facade timing and OM-level
+timing is a client-side orchestration problem. The following optimizations guide
+the next implementation moves.
+
+#### 29.10.1 Metadata fan-out must be real parallel fan-out
+
+`BatchLookupWithLease` is intentionally batched per DN, but a single vLLM batch
+usually spans multiple DNs. Therefore `_batch_lookup_impl` must dispatch one
+metadata RPC per DN **in parallel** through `_meta_stage_pool`, then merge
+results by key. It must not loop over DN groups serially.
+
+Target contract:
+
+```text
+groups = group_by_dn(keys)
+futures = {
+    _meta_stage_pool.submit(dn.lookup, dn_keys): dn_id
+    for dn_id, dn_keys in groups.items()
+}
+for future in as_completed(futures):
+    merge per-key lookup rows / leases into local_cache
+```
+
+Expected wall time for metadata lookup becomes:
+
+```text
+max_dn(BatchLookupWithLease(dn_keys)) + merge_overhead
+```
+
+not:
+
+```text
+sum_dn(BatchLookupWithLease(dn_keys))
+```
+
+This applies to lookup, allocate, update-status, free, renew, and promote
+metadata calls. Metadata remains batched because rows are tiny and per-RPC
+overhead dominates; only the **DN fan-out** is parallel.
+
+#### 29.10.2 Reuse metadata BRPC channels
+
+The Python extension must not construct a fresh `brpc::Channel` for each
+metadata RPC. `falconfs_kv_brpc` should maintain a small channel cache keyed by
+`endpoint` for metadata calls, mirroring the facade registry's long-lived Store
+channels. Channel construction, connection lookup, and first-use bookkeeping are
+visible at sub-millisecond metadata latencies and hide the true in-DRAM hash
+lookup cost.
+
+Target shape:
+
+```cpp
+std::shared_ptr<brpc::Channel> ResolveMetadataChannel(endpoint, timeout_ms);
+KVMetadataService_Stub stub(channel.get());
+stub.BatchLookupWithLease(&cntl, &req, &rsp, nullptr);
+```
+
+The cache must be thread-safe, preserve timeout semantics, and evict/rebuild a
+channel after transport failures. This is a client-side optimization; it does
+not change DN metadata service semantics.
+
+#### 29.10.3 Remove data-path endpoint locks from facade-registry mode
+
+The data stage pool is supposed to issue many independent per-block Store calls.
+Any Python-side lock held across `facade_read_block` / `facade_write_block`
+defeats that design. In facade-registry mode, the native registry already owns
+the resolved local/remote Store channel and the pybind wrapper releases the GIL,
+so `BrpcKVStore` must not serialize all store calls behind a per-endpoint lock.
+
+Required rule:
+
+- Keep a narrow lock only for request-id sequence generation if needed.
+- Do **not** hold `_ep_lock` while executing `facade_*` native calls.
+- For the legacy direct endpoint fallback (`batch_read_block(endpoint, ...)`),
+  only keep a wire lock if a concrete BRPC client bug requires it; otherwise
+  use the same no-lock path and rely on BRPC channel thread safety.
+
+This restores the invariant in §29.5.2: one data-stage task equals one truly
+concurrent unary Store call or one truly concurrent SHM facade call.
+
+#### 29.10.4 Keep data plane unary; benchmark only bounded micro-batches
+
+Large data batches are not automatically faster for 2 MiB KV blocks. A single
+batch RPC carrying many blocks can create one very large protobuf response,
+serialize on one call path, monopolize one BRPC worker/connection, and increase
+tail latency. Parallel unary calls can overlap payload copies, loopback transfer,
+Store service work, and Python waiting.
+
+Contract remains:
+
+- Metadata: **batch per DN** and fan out DNs in parallel.
+- Data: **parallel unary per block or per stripe**.
+- Multi-item `BatchWriteBlock` / `BatchReadBlock` remain compatibility wrappers,
+  not the primary performance path.
+
+If a future change tests micro-batching, it must be bounded and measured:
+
+```text
+blocks_per_rpc ∈ {1, 2, 4, 8}
+total_inflight_bytes bounded by client_data_parallelism_max * block_size
+compare p50/p95 latency, wall MB/s, C++ facade MB/s, and CPU copy cost
+```
+
+The default must stay unary until measurements prove a micro-batch size wins on
+the target deployment.
+
+#### 29.10.5 Reduce remote payload copy cost
+
+Remote BRPC for 2 MiB blocks is payload-copy dominated. After metadata fan-out,
+channel reuse, and lock removal are done, the next remote-data optimization is
+to reduce copies in the wire format:
+
+- Prefer BRPC attachment / `butil::IOBuf`-style payload transfer for block bytes
+  instead of embedding every 2 MiB payload in protobuf `bytes` when practical.
+- Keep metadata and checksums in protobuf; move only the large byte payload to
+  attachment.
+- Preserve the same logical `ReadBlock` / `WriteBlock` contract and checksum
+  semantics.
+
+This is a wire-encoding optimization, not a scheduling optimization, and should
+be validated only after the client-side serialization bottlenecks above are
+removed.
+
+#### 29.10.6 Instrumentation requirements
+
+Every performance test that exercises offloading must print and optionally
+persist the following fields:
+
+- End-to-end wall throughput for store and load phases.
+- Metadata per-batch latency: lookup, allocate, update-status, renew.
+- OM-level data timing split by local SHM vs remote BRPC.
+- C++ facade timing split by local SHM vs remote BRPC.
+- Counts and bytes for each path (`local_reads`, `remote_reads`,
+  `local_writes`, `remote_writes`).
+
+The mixed E2E dashboard is the reference format. It must make clear whether a
+number is **wall time**, **summed instrumented intervals**, or **C++ facade
+time**, because those answer different performance questions.
+

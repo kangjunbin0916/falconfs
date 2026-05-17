@@ -9,6 +9,8 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "kv_data_service.pb.h"
 #include "vllm_kv_cache/src/store/kv_store_engine.h"
@@ -21,10 +23,16 @@ public:
     explicit KVDataServiceImpl(std::shared_ptr<KVStoreEngine> engine);
 
     void WriteBlock(const WriteBlockRequest& request, WriteBlockResponse* response);
+    void WriteBlockPayload(const WriteBlockRequest& request,
+                           const std::string& payload,
+                           WriteBlockResponse* response);
     void ReadBlock(const ReadBlockRequest& request, ReadBlockResponse* response);
     void ReadFromSSD(const ReadFromSSDRequest& request, ReadFromSSDResponse* response);
 
     void BatchWriteBlock(const BatchWriteBlockRequest& request, BatchWriteBlockResponse* response);
+    void BatchWriteBlockPayloads(const BatchWriteBlockRequest& request,
+                                 const std::vector<std::string>& payloads,
+                                 BatchWriteBlockResponse* response);
     void BatchReadBlock(const BatchReadBlockRequest& request, BatchReadBlockResponse* response);
     void BatchReadFromSSD(const BatchReadFromSSDRequest& request, BatchReadFromSSDResponse* response);
 

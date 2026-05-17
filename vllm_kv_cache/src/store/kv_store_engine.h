@@ -50,7 +50,8 @@ public:
                   int64_t base_offset = 0,
                   int64_t region_bytes = 64LL * 65536LL,
                   int32_t block_size = 65536,
-                  int64_t store_epoch = 1);
+                  int64_t store_epoch = 1,
+                  std::string posix_shm_segment_name = {});
     ~KVStoreEngine();
 
     KVStoreEngine(const KVStoreEngine&) = delete;

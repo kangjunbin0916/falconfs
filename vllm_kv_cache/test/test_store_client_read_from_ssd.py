@@ -17,13 +17,12 @@ from falconfs_kv.store_client import BrpcKVStore  # noqa: E402
 class TestStoreClientReadFromSsd(unittest.TestCase):
     def test_read_from_ssd_fallback_uses_batch_brpc(self) -> None:
         store = BrpcKVStore("127.0.0.1:9", use_facade_registry=False)
-        ok_rsp = _kvdata.BatchReadFromSSDResponse()
-        ok_rsp.results.add()
-        ok_rsp.results[0].result.success = True
-        ok_rsp.results[0].payload = b"ssd-bytes"
+        ok_rsp = _kvdata.ReadFromSSDResponse()
+        ok_rsp.result.result.success = True
+        ok_rsp.result.payload = b"ssd-bytes"
 
         with mock.patch("falconfs_kv.store_client.falconfs_kv_brpc") as mbrpc:
-            mbrpc.batch_read_from_ssd.return_value = ok_rsp.SerializeToString()
+            mbrpc.read_from_ssd.return_value = ok_rsp.SerializeToString()
             ir, payload = store.read_from_ssd(
                 3,
                 "/tmp/falconfs/evicted/x.kv",
@@ -32,25 +31,24 @@ class TestStoreClientReadFromSsd(unittest.TestCase):
             )
         self.assertTrue(ir.success)
         self.assertEqual(payload, b"ssd-bytes")
-        mbrpc.batch_read_from_ssd.assert_called_once()
+        mbrpc.read_from_ssd.assert_called_once()
         mbrpc.facade_batch_read_from_ssd.assert_not_called()
-        args, _kwargs = mbrpc.batch_read_from_ssd.call_args
+        args, _kwargs = mbrpc.read_from_ssd.call_args
         self.assertEqual(args[0], "127.0.0.1:9")
         wire = args[1]
-        req = _kvdata.BatchReadFromSSDRequest()
+        req = _kvdata.ReadFromSSDRequest()
         req.ParseFromString(wire)
-        self.assertEqual(req.items[0].evicted_path, "/tmp/falconfs/evicted/x.kv")
-        self.assertEqual(req.items[0].expected_version, 42)
+        self.assertEqual(req.item.evicted_path, "/tmp/falconfs/evicted/x.kv")
+        self.assertEqual(req.item.expected_version, 42)
 
     def test_read_from_ssd_prefers_facade_when_enabled(self) -> None:
         store = BrpcKVStore("127.0.0.1:9", use_facade_registry=True)
-        ok_rsp = _kvdata.BatchReadFromSSDResponse()
-        ok_rsp.results.add()
-        ok_rsp.results[0].result.success = True
-        ok_rsp.results[0].payload = b"via-facade"
+        ok_rsp = _kvdata.ReadFromSSDResponse()
+        ok_rsp.result.result.success = True
+        ok_rsp.result.payload = b"via-facade"
 
         with mock.patch("falconfs_kv.store_client.falconfs_kv_brpc") as mbrpc:
-            mbrpc.facade_batch_read_from_ssd.return_value = ok_rsp.SerializeToString()
+            mbrpc.facade_read_from_ssd.return_value = ok_rsp.SerializeToString()
             ir, payload = store.read_from_ssd(
                 5,
                 "/ssd/a.kv",
@@ -59,25 +57,24 @@ class TestStoreClientReadFromSsd(unittest.TestCase):
             )
         self.assertTrue(ir.success)
         self.assertEqual(payload, b"via-facade")
-        mbrpc.facade_batch_read_from_ssd.assert_called_once_with(
+        mbrpc.facade_read_from_ssd.assert_called_once_with(
             5, mock.ANY
         )
-        mbrpc.batch_read_from_ssd.assert_not_called()
+        mbrpc.read_from_ssd.assert_not_called()
 
     def test_read_from_ssd_facade_exception_falls_back_to_brpc(self) -> None:
         store = BrpcKVStore("127.0.0.1:9", use_facade_registry=True)
-        ok_rsp = _kvdata.BatchReadFromSSDResponse()
-        ok_rsp.results.add()
-        ok_rsp.results[0].result.success = True
-        ok_rsp.results[0].payload = b"fallback"
+        ok_rsp = _kvdata.ReadFromSSDResponse()
+        ok_rsp.result.result.success = True
+        ok_rsp.result.payload = b"fallback"
 
         with mock.patch("falconfs_kv.store_client.falconfs_kv_brpc") as mbrpc:
-            mbrpc.facade_batch_read_from_ssd.side_effect = RuntimeError("no registry")
-            mbrpc.batch_read_from_ssd.return_value = ok_rsp.SerializeToString()
+            mbrpc.facade_read_from_ssd.side_effect = RuntimeError("no registry")
+            mbrpc.read_from_ssd.return_value = ok_rsp.SerializeToString()
             ir, payload = store.read_from_ssd(1, "/p", 0)
         self.assertTrue(ir.success)
         self.assertEqual(payload, b"fallback")
-        mbrpc.batch_read_from_ssd.assert_called_once()
+        mbrpc.read_from_ssd.assert_called_once()
 
 
 if __name__ == "__main__":

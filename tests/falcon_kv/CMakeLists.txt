@@ -63,6 +63,22 @@ gtest_discover_tests(FalconKVPrimitivesUT
     PROPERTIES LABELS "kv-unit"
 )
 
+# ==================== FalconKVStoreNativeMicrobench =================
+add_executable(FalconKVStoreNativeMicrobench
+    ${PROJECT_SOURCE_DIR}/tests/falcon_kv/kv_store_native_microbench.cpp
+)
+
+target_include_directories(FalconKVStoreNativeMicrobench PRIVATE
+    ${FALCON_KV_INCLUDE_DIRS}
+)
+
+target_link_libraries(FalconKVStoreNativeMicrobench
+    FalconKVProto
+    ${BRPC_LIBRARIES}
+    ${DYNAMIC_LIB}
+    pthread
+)
+
 # ==================== FalconKVMetadataBrpcE2E =================
 add_executable(FalconKVMetadataBrpcE2E
     ${PROJECT_SOURCE_DIR}/tests/falcon_kv/kv_metadata_brpc_e2e_client.cpp

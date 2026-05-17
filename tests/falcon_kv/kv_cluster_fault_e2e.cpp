@@ -579,16 +579,36 @@ int RunDnRestartPhase2(const std::string& endpoint, const std::string& state_fil
 
     // Fresh lookup must succeed (recovery rehydrated the row from the catalog)
     // and return a lease with dn_epoch > saved.
-    BatchLookupRequest lk;
-    lk.mutable_meta()->set_request_id("phase2_fresh_lookup");
-    auto* lit = lk.add_items();
-    lit->set_block_hash(s.block_hash);
-    lit->set_renew_lease_on_hit(true);
     BatchLookupResponse lr;
-    brpc::Controller lcntl;
-    stub.BatchLookupWithLease(&lcntl, &lk, &lr, nullptr);
-    if (lcntl.Failed() || lr.results_size() != 1) {
-        return Fail("phase2: fresh lookup rpc failed");
+    bool lookup_ok = false;
+    std::string last_lookup_err;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        BatchLookupRequest lk;
+        lk.mutable_meta()->set_request_id("phase2_fresh_lookup_" + std::to_string(attempt));
+        auto* lit = lk.add_items();
+        lit->set_block_hash(s.block_hash);
+        lit->set_renew_lease_on_hit(true);
+        lr.Clear();
+        brpc::Controller lcntl;
+        stub.BatchLookupWithLease(&lcntl, &lk, &lr, nullptr);
+        if (lcntl.Failed() || lr.results_size() != 1) {
+            last_lookup_err = "rpc failed";
+        } else if (lr.results(0).result().success()) {
+            lookup_ok = true;
+            break;
+        } else if (lr.results(0).result().error_code() == ErrorCode::CAS_CONFLICT &&
+                   lr.results(0).result().retryable()) {
+            last_lookup_err = lr.results(0).result().error_message();
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            continue;
+        } else {
+            last_lookup_err = lr.results(0).result().error_message() +
+                              " code=" + std::to_string(lr.results(0).result().error_code());
+            break;
+        }
+    }
+    if (!lookup_ok) {
+        return Fail("phase2: fresh lookup failed err=" + last_lookup_err);
     }
     const auto& lres = lr.results(0);
     if (!lres.result().success()) {

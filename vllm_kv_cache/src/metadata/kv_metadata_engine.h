@@ -157,7 +157,6 @@ public:
     void SetDnEpochFromCatalog(int64_t epoch);
 
     EngineLookupResult Lookup(const std::string& block_hash, bool renew_lease_on_hit, int64_t now_ms);
-
     // v6.4 Pass-1: DRAM-resident metadata only. When `needs_catalog` is set, the
     // caller must run the catalog sub-batch in a PostgreSQL backend process.
     EngineLookupResult LookupDramCacheOnly(const std::string& block_hash,

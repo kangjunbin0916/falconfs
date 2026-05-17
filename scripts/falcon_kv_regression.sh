@@ -258,6 +258,8 @@ if not m.mixed_topology_available():
 "; then
             return 1
         fi
+        export FALCON_MIX_E2E_QUICK="${FALCON_MIX_E2E_QUICK:-0}"
+        log_step "  full profile: FALCON_MIX_E2E_QUICK=${FALCON_MIX_E2E_QUICK} (0 = larger mixed E2E defaults)"
     fi
     # All Python tests directly under vllm_kv_cache/test/ are
     # unittest.TestCase-based; avoid a pytest dependency. The vllm/

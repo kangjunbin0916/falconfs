@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+import zlib
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -31,15 +32,6 @@ from .reference import (
     now_ms_now,
 )
 
-_dn_endpoint_locks: Dict[str, threading.Lock] = {}
-_dn_endpoint_mu = threading.Lock()
-
-
-def _dn_wire_lock(endpoint: str) -> threading.Lock:
-    with _dn_endpoint_mu:
-        return _dn_endpoint_locks.setdefault(endpoint, threading.Lock())
-
-
 def _default_preferred_store_id() -> int:
     """Align Python clients with v6.5 mixed-colocation harness (NODE_NAME=v65mixK -> store K+1).
 
@@ -54,6 +46,55 @@ def _default_preferred_store_id() -> int:
         return int(raw)
     except ValueError:
         return 1
+
+
+def _preferred_store_ids_for_allocation() -> List[int]:
+    """Return preferred Store ids for allocation.
+
+    Colocated clients keep v6 locality affinity by default. All-remote clients
+    stripe across discovered Stores so large remote batches do not funnel through
+    one Store. Operators can force striping with FALCON_KV_STRIPE_PREFERRED_STORES
+    or provide an explicit FALCON_KV_PREFERRED_STORE_IDS list.
+    """
+    raw = os.environ.get("FALCON_KV_PREFERRED_STORE_IDS", "").strip()
+    ids: List[int] = []
+    if raw:
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                sid = int(part)
+            except ValueError:
+                continue
+            if sid > 0 and sid not in ids:
+                ids.append(sid)
+        if ids:
+            return ids
+
+    stripe_raw = os.environ.get("FALCON_KV_STRIPE_PREFERRED_STORES", "").strip().lower()
+    force_stripe = stripe_raw in ("1", "true", "yes", "on")
+    # NODE_NAME=v65mixK means this client is colocated with Store K+1. Preserve
+    # that SHM-first affinity unless the caller explicitly asks to stripe.
+    if os.environ.get("NODE_NAME", "").strip() and not force_stripe:
+        return [_default_preferred_store_id()]
+
+    try:
+        loc = falconfs_kv_brpc.store_locality()
+        ids = sorted({int(k) for k in dict(loc).keys() if int(k) > 0})
+    except Exception:
+        ids = []
+    if not ids:
+        ids = [_default_preferred_store_id()]
+    return ids
+
+
+def _preferred_store_id_for_block(block_hash, store_ids: List[int]) -> int:
+    if not store_ids:
+        return _default_preferred_store_id()
+    if len(store_ids) == 1:
+        return store_ids[0]
+    return store_ids[zlib.crc32(_to_bytes(block_hash)) % len(store_ids)]
 
 
 # ---------------------------------------------------------------------------
@@ -165,33 +206,32 @@ class _BrpcLeaseManager:
         requested_ttl_ms: int = 5000,
     ) -> Tuple[ItemResult, Optional[LeaseInfo]]:
         del now_ms  # server-side now is authoritative
-        with self._parent._ep_lock:
-            req = _kvmeta.BatchRenewLeaseRequest()
-            req.meta.request_id = self._parent._mk_request_id("renew")
-            req.meta.client_id = self._parent.client_id
-            req.requested_ttl_ms = requested_ttl_ms
-            item = req.items.add()
-            item.block_hash = _to_bytes(block_hash)
-            item.lease_token = lease_token
-            item.expected_dn_epoch = expected_dn_epoch
-            item.expected_store_epoch = expected_store_epoch
-            resp = _kvmeta.BatchRenewLeaseResponse()
-            resp.ParseFromString(
-                falconfs_kv_brpc.batch_renew_lease(
-                    self._parent.endpoint, req.SerializeToString(), self._parent.timeout_ms
-                )
+        req = _kvmeta.BatchRenewLeaseRequest()
+        req.meta.request_id = self._parent._mk_request_id("renew")
+        req.meta.client_id = self._parent.client_id
+        req.requested_ttl_ms = requested_ttl_ms
+        item = req.items.add()
+        item.block_hash = _to_bytes(block_hash)
+        item.lease_token = lease_token
+        item.expected_dn_epoch = expected_dn_epoch
+        item.expected_store_epoch = expected_store_epoch
+        resp = _kvmeta.BatchRenewLeaseResponse()
+        resp.ParseFromString(
+            falconfs_kv_brpc.batch_renew_lease(
+                self._parent.endpoint, req.SerializeToString(), self._parent.timeout_ms
             )
-            if not resp.results:
-                return (
-                    ItemResult(False, ErrorCode.INTERNAL_ERROR, True, "empty response"),
-                    None,
-                )
-            r = resp.results[0]
-            item_result = _result_meta_to_item_result(r.result)
-            lease = (
-                _proto_to_lease(r.lease) if r.HasField("lease") and item_result.success else None
+        )
+        if not resp.results:
+            return (
+                ItemResult(False, ErrorCode.INTERNAL_ERROR, True, "empty response"),
+                None,
             )
-            return item_result, lease
+        r = resp.results[0]
+        item_result = _result_meta_to_item_result(r.result)
+        lease = (
+            _proto_to_lease(r.lease) if r.HasField("lease") and item_result.success else None
+        )
+        return item_result, lease
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +255,7 @@ class BrpcMetadataService:
         self.block_size = block_size
         self.lease_manager = _BrpcLeaseManager(self)
         self._req_seq = 0
-        self._ep_lock = _dn_wire_lock(endpoint)
+        self._req_lock = threading.Lock()
 
     # OffloadingManager keeps a Python-side `rows` mirror via `local_cache`,
     # so the cluster does not need a public `rows` dict; we expose an empty
@@ -225,8 +265,9 @@ class BrpcMetadataService:
     # -- Helpers --
 
     def _mk_request_id(self, tag: str) -> str:
-        self._req_seq += 1
-        return f"py_dn_client_{tag}_{self.dn_id}_{self._req_seq}"
+        with self._req_lock:
+            self._req_seq += 1
+            return f"py_dn_client_{tag}_{self.dn_id}_{self._req_seq}"
 
     # -- Public API mirroring MetadataService --
 
@@ -244,38 +285,37 @@ class BrpcMetadataService:
         if not items:
             return results
 
-        with self._ep_lock:
-            req = _kvmeta.BatchAllocateRequest()
-            req.meta.request_id = request_id or self._mk_request_id("alloc")
-            req.meta.client_id = client_id if client_id is not None else self.client_id
-            req.deduplicate_in_request = True
-            pref = _default_preferred_store_id()
-            for h in items:
-                it = req.items.add()
-                it.block_hash = _to_bytes(h)
-                it.block_size = self.block_size
-                it.preferred_store_id = pref
-                it.allow_fallback_store = True
-                if allocate_hint is not None:
-                    it.allocate_hint = allocate_hint
-            rsp = _kvmeta.BatchAllocateResponse()
-            rsp.ParseFromString(
-                falconfs_kv_brpc.batch_allocate_with_lease(
-                    self.endpoint, req.SerializeToString(), self.timeout_ms
-                )
+        req = _kvmeta.BatchAllocateRequest()
+        req.meta.request_id = request_id or self._mk_request_id("alloc")
+        req.meta.client_id = client_id if client_id is not None else self.client_id
+        req.deduplicate_in_request = True
+        preferred_store_ids = _preferred_store_ids_for_allocation()
+        for h in items:
+            it = req.items.add()
+            it.block_hash = _to_bytes(h)
+            it.block_size = self.block_size
+            it.preferred_store_id = _preferred_store_id_for_block(h, preferred_store_ids)
+            it.allow_fallback_store = True
+            if allocate_hint is not None:
+                it.allocate_hint = allocate_hint
+        rsp = _kvmeta.BatchAllocateResponse()
+        rsp.ParseFromString(
+            falconfs_kv_brpc.batch_allocate_with_lease(
+                self.endpoint, req.SerializeToString(), self.timeout_ms
             )
-            for it, r in zip(items, rsp.results):
-                ir = _result_meta_to_item_result(r.result)
-                row = None
-                lease = None
-                if ir.success:
-                    row = _proto_to_blockmeta(_to_str(it),
-                                              int(_kvcommon.BLOCK_STATUS_ALLOCATED),
-                                              r.location, r.version)
-                    if r.HasField("lease"):
-                        lease = _proto_to_lease(r.lease)
-                results[_to_str(it)] = (ir, row, lease)
-            return results
+        )
+        for it, r in zip(items, rsp.results):
+            ir = _result_meta_to_item_result(r.result)
+            row = None
+            lease = None
+            if ir.success:
+                row = _proto_to_blockmeta(_to_str(it),
+                                          int(_kvcommon.BLOCK_STATUS_ALLOCATED),
+                                          r.location, r.version)
+                if r.HasField("lease"):
+                    lease = _proto_to_lease(r.lease)
+            results[_to_str(it)] = (ir, row, lease)
+        return results
 
     def lookup(
         self,
@@ -288,30 +328,29 @@ class BrpcMetadataService:
         results: Dict[str, Tuple[ItemResult, Optional[BlockMeta], Optional[LeaseInfo]]] = {}
         if not items:
             return results
-        with self._ep_lock:
-            req = _kvmeta.BatchLookupRequest()
-            req.meta.request_id = self._mk_request_id("lookup")
-            req.meta.client_id = self.client_id
-            for h in items:
-                it = req.items.add()
-                it.block_hash = _to_bytes(h)
-                it.renew_lease_on_hit = renew_lease_on_hit
-            rsp = _kvmeta.BatchLookupResponse()
-            rsp.ParseFromString(
-                falconfs_kv_brpc.batch_lookup_with_lease(
-                    self.endpoint, req.SerializeToString(), self.timeout_ms
-                )
+        req = _kvmeta.BatchLookupRequest()
+        req.meta.request_id = self._mk_request_id("lookup")
+        req.meta.client_id = self.client_id
+        for h in items:
+            it = req.items.add()
+            it.block_hash = _to_bytes(h)
+            it.renew_lease_on_hit = renew_lease_on_hit
+        rsp = _kvmeta.BatchLookupResponse()
+        rsp.ParseFromString(
+            falconfs_kv_brpc.batch_lookup_with_lease(
+                self.endpoint, req.SerializeToString(), self.timeout_ms
             )
-            for h, r in zip(items, rsp.results):
-                ir = _result_meta_to_item_result(r.result)
-                row = None
-                lease = None
-                if ir.success and r.HasField("location"):
-                    row = _proto_to_blockmeta(_to_str(h), int(r.status), r.location, r.version)
-                    if r.HasField("lease"):
-                        lease = _proto_to_lease(r.lease)
-                results[_to_str(h)] = (ir, row, lease)
-            return results
+        )
+        for h, r in zip(items, rsp.results):
+            ir = _result_meta_to_item_result(r.result)
+            row = None
+            lease = None
+            if ir.success and r.HasField("location"):
+                row = _proto_to_blockmeta(_to_str(h), int(r.status), r.location, r.version)
+                if r.HasField("lease"):
+                    lease = _proto_to_lease(r.lease)
+            results[_to_str(h)] = (ir, row, lease)
+        return results
 
     def update_status(
         self,
@@ -325,40 +364,39 @@ class BrpcMetadataService:
         now_ms: Optional[int] = None,
     ) -> Tuple[ItemResult, Optional[BlockMeta]]:
         del now_ms
-        with self._ep_lock:
-            req = _kvmeta.BatchUpdateStatusRequest()
-            req.meta.request_id = request_id or self._mk_request_id("upd")
-            req.meta.client_id = client_id if client_id is not None else self.client_id
-            it = req.items.add()
-            it.block_hash = _to_bytes(block_hash)
-            it.expected_from_status = _REF_TO_PROTO_STATUS[expected_from]
-            it.to_status = _REF_TO_PROTO_STATUS[to_status]
-            it.expected_version = expected_version
-            if evicted_path:
-                it.evicted_path = evicted_path
-            rsp = _kvmeta.BatchUpdateStatusResponse()
-            rsp.ParseFromString(
-                falconfs_kv_brpc.batch_update_block_status(
-                    self.endpoint, req.SerializeToString(), self.timeout_ms
-                )
+        req = _kvmeta.BatchUpdateStatusRequest()
+        req.meta.request_id = request_id or self._mk_request_id("upd")
+        req.meta.client_id = client_id if client_id is not None else self.client_id
+        it = req.items.add()
+        it.block_hash = _to_bytes(block_hash)
+        it.expected_from_status = _REF_TO_PROTO_STATUS[expected_from]
+        it.to_status = _REF_TO_PROTO_STATUS[to_status]
+        it.expected_version = expected_version
+        if evicted_path:
+            it.evicted_path = evicted_path
+        rsp = _kvmeta.BatchUpdateStatusResponse()
+        rsp.ParseFromString(
+            falconfs_kv_brpc.batch_update_block_status(
+                self.endpoint, req.SerializeToString(), self.timeout_ms
             )
-            if not rsp.results:
-                return (ItemResult(False, ErrorCode.INTERNAL_ERROR, True, "empty response"), None)
-            r = rsp.results[0]
-            ir = _result_meta_to_item_result(r.result)
-            if not ir.success:
-                return ir, None
-            # Reconstruct BlockMeta with the post-update version + status.
-            loc = BlockLocation(0, 0, "", 1)  # location unchanged by status update
-            row = BlockMeta(
-                block_hash=_to_str(block_hash),
-                kv_group_idx=0,
-                layer_mask=0,
-                status=_PROTO_TO_REF_STATUS.get(int(r.current_status), to_status),
-                location=loc,
-                version=r.new_version,
-            )
-            return ir, row
+        )
+        if not rsp.results:
+            return (ItemResult(False, ErrorCode.INTERNAL_ERROR, True, "empty response"), None)
+        r = rsp.results[0]
+        ir = _result_meta_to_item_result(r.result)
+        if not ir.success:
+            return ir, None
+        # Reconstruct BlockMeta with the post-update version + status.
+        loc = BlockLocation(0, 0, "", 1)  # location unchanged by status update
+        row = BlockMeta(
+            block_hash=_to_str(block_hash),
+            kv_group_idx=0,
+            layer_mask=0,
+            status=_PROTO_TO_REF_STATUS.get(int(r.current_status), to_status),
+            location=loc,
+            version=r.new_version,
+        )
+        return ir, row
 
     def batch_update_status(
         self,
@@ -371,45 +409,83 @@ class BrpcMetadataService:
         del now_ms
         if not updates:
             return []
-        with self._ep_lock:
-            req = _kvmeta.BatchUpdateStatusRequest()
-            req.meta.request_id = request_id or self._mk_request_id("batch_upd")
-            req.meta.client_id = client_id if client_id is not None else self.client_id
-            for block_hash, expected_from, to_status, expected_version, evicted_path in updates:
-                it = req.items.add()
-                it.block_hash = _to_bytes(block_hash)
-                it.expected_from_status = _REF_TO_PROTO_STATUS[expected_from]
-                it.to_status = _REF_TO_PROTO_STATUS[to_status]
-                it.expected_version = expected_version
-                if evicted_path:
-                    it.evicted_path = evicted_path
-            rsp = _kvmeta.BatchUpdateStatusResponse()
-            rsp.ParseFromString(
-                falconfs_kv_brpc.batch_update_block_status(
-                    self.endpoint, req.SerializeToString(), self.timeout_ms
-                )
+        req = _kvmeta.BatchUpdateStatusRequest()
+        req.meta.request_id = request_id or self._mk_request_id("batch_upd")
+        req.meta.client_id = client_id if client_id is not None else self.client_id
+        for block_hash, expected_from, to_status, expected_version, evicted_path in updates:
+            it = req.items.add()
+            it.block_hash = _to_bytes(block_hash)
+            it.expected_from_status = _REF_TO_PROTO_STATUS[expected_from]
+            it.to_status = _REF_TO_PROTO_STATUS[to_status]
+            it.expected_version = expected_version
+            if evicted_path:
+                it.evicted_path = evicted_path
+        rsp = _kvmeta.BatchUpdateStatusResponse()
+        rsp.ParseFromString(
+            falconfs_kv_brpc.batch_update_block_status(
+                self.endpoint, req.SerializeToString(), self.timeout_ms
             )
-            out: List[Tuple[ItemResult, Optional[BlockMeta]]] = []
-            for i, (block_hash, _ef, to_status, _ev, _ep) in enumerate(updates):
-                if i >= len(rsp.results):
-                    out.append((ItemResult(False, ErrorCode.INTERNAL_ERROR, True, "missing result"), None))
-                    continue
-                r = rsp.results[i]
-                ir = _result_meta_to_item_result(r.result)
-                if not ir.success:
-                    out.append((ir, None))
-                    continue
-                loc = BlockLocation(0, 0, "", 1)
-                row = BlockMeta(
-                    block_hash=block_hash,
-                    kv_group_idx=0,
-                    layer_mask=0,
-                    status=_PROTO_TO_REF_STATUS.get(int(r.current_status), to_status),
-                    location=loc,
-                    version=r.new_version,
+        )
+        out: List[Tuple[ItemResult, Optional[BlockMeta]]] = []
+        for i, (block_hash, _ef, to_status, _ev, _ep) in enumerate(updates):
+            if i >= len(rsp.results):
+                out.append((ItemResult(False, ErrorCode.INTERNAL_ERROR, True, "missing result"), None))
+                continue
+            r = rsp.results[i]
+            ir = _result_meta_to_item_result(r.result)
+            if not ir.success:
+                out.append((ir, None))
+                continue
+            loc = BlockLocation(0, 0, "", 1)
+            row = BlockMeta(
+                block_hash=block_hash,
+                kv_group_idx=0,
+                layer_mask=0,
+                status=_PROTO_TO_REF_STATUS.get(int(r.current_status), to_status),
+                location=loc,
+                version=r.new_version,
+            )
+            out.append((ir, row))
+        return out
+
+    def renew_many(
+        self,
+        renewals: List[Tuple[str, int, int, int]],
+        *,
+        requested_ttl_ms: int = 5000,
+    ) -> Dict[str, Tuple[ItemResult, Optional[LeaseInfo]]]:
+        """Batch lease renewals for one DN in one metadata RPC."""
+        if not renewals:
+            return {}
+        req = _kvmeta.BatchRenewLeaseRequest()
+        req.meta.request_id = self._mk_request_id("batch_renew")
+        req.meta.client_id = self.client_id
+        req.requested_ttl_ms = requested_ttl_ms
+        for block_hash, lease_token, expected_dn_epoch, expected_store_epoch in renewals:
+            it = req.items.add()
+            it.block_hash = _to_bytes(block_hash)
+            it.lease_token = lease_token
+            it.expected_dn_epoch = expected_dn_epoch
+            it.expected_store_epoch = expected_store_epoch
+        rsp = _kvmeta.BatchRenewLeaseResponse()
+        rsp.ParseFromString(
+            falconfs_kv_brpc.batch_renew_lease(
+                self.endpoint, req.SerializeToString(), self.timeout_ms
+            )
+        )
+        out: Dict[str, Tuple[ItemResult, Optional[LeaseInfo]]] = {}
+        for i, (block_hash, _token, _dn_epoch, _store_epoch) in enumerate(renewals):
+            if i >= len(rsp.results):
+                out[block_hash] = (
+                    ItemResult(False, ErrorCode.INTERNAL_ERROR, True, "missing result"),
+                    None,
                 )
-                out.append((ir, row))
-            return out
+                continue
+            r = rsp.results[i]
+            ir = _result_meta_to_item_result(r.result)
+            lease = _proto_to_lease(r.lease) if ir.success and r.HasField("lease") else None
+            out[block_hash] = (ir, lease)
+        return out
 
     def free_allocated(
         self,
@@ -421,22 +497,56 @@ class BrpcMetadataService:
         now_ms: Optional[int] = None,
     ) -> Tuple[ItemResult, Optional[int]]:
         del now_ms
-        with self._ep_lock:
-            req = _kvmeta.BatchFreeAllocatedRequest()
-            req.meta.request_id = request_id or self._mk_request_id("free")
-            req.meta.client_id = client_id if client_id is not None else self.client_id
+        req = _kvmeta.BatchFreeAllocatedRequest()
+        req.meta.request_id = request_id or self._mk_request_id("free")
+        req.meta.client_id = client_id if client_id is not None else self.client_id
+        it = req.items.add()
+        it.block_hash = _to_bytes(block_hash)
+        it.expected_version = expected_version
+        it.force = force
+        rsp = _kvmeta.BatchFreeAllocatedResponse()
+        rsp.ParseFromString(
+            falconfs_kv_brpc.batch_free_allocated(
+                self.endpoint, req.SerializeToString(), self.timeout_ms
+            )
+        )
+        if not rsp.results:
+            return (ItemResult(False, ErrorCode.INTERNAL_ERROR, True, "empty response"), None)
+        r = rsp.results[0]
+        ir = _result_meta_to_item_result(r.result)
+        return ir, (r.new_version if ir.success else None)
+
+    def batch_free_allocated(
+        self,
+        frees: List[Tuple[str, int, bool]],
+        *,
+        request_id: Optional[str] = None,
+        client_id: Optional[int] = None,
+        now_ms: Optional[int] = None,
+    ) -> List[Tuple[ItemResult, Optional[int]]]:
+        del now_ms
+        if not frees:
+            return []
+        req = _kvmeta.BatchFreeAllocatedRequest()
+        req.meta.request_id = request_id or self._mk_request_id("batch_free")
+        req.meta.client_id = client_id if client_id is not None else self.client_id
+        for block_hash, expected_version, force in frees:
             it = req.items.add()
             it.block_hash = _to_bytes(block_hash)
             it.expected_version = expected_version
             it.force = force
-            rsp = _kvmeta.BatchFreeAllocatedResponse()
-            rsp.ParseFromString(
-                falconfs_kv_brpc.batch_free_allocated(
-                    self.endpoint, req.SerializeToString(), self.timeout_ms
-                )
+        rsp = _kvmeta.BatchFreeAllocatedResponse()
+        rsp.ParseFromString(
+            falconfs_kv_brpc.batch_free_allocated(
+                self.endpoint, req.SerializeToString(), self.timeout_ms
             )
-            if not rsp.results:
-                return (ItemResult(False, ErrorCode.INTERNAL_ERROR, True, "empty response"), None)
-            r = rsp.results[0]
+        )
+        out: List[Tuple[ItemResult, Optional[int]]] = []
+        for i, _free in enumerate(frees):
+            if i >= len(rsp.results):
+                out.append((ItemResult(False, ErrorCode.INTERNAL_ERROR, True, "missing result"), None))
+                continue
+            r = rsp.results[i]
             ir = _result_meta_to_item_result(r.result)
-            return ir, (r.new_version if ir.success else None)
+            out.append((ir, r.new_version if ir.success else None))
+        return out

@@ -60,10 +60,11 @@ public:
         r.block_size    = pr.block_size();
         r.store_epoch   = pr.store_epoch();
 
+        const bool had_region = engine_->HasRegion(r.store_node_id);
         EngineResultMeta meta = engine_->RegisterStoreRegion(r);
         FillFromEngineMeta(meta, resp->mutable_result());
         resp->set_dn_epoch(engine_->DnEpoch());
-        if (meta.success && after_region_registered_) {
+        if (meta.success && !had_region && after_region_registered_) {
             after_region_registered_();
         }
     }
