@@ -525,6 +525,146 @@ uint32_t FalconKVBlockScanForRecovery(KVCatalogRecoveryRow *out_rows,
     return produced;
 }
 
+void FalconKVBlockReconcileStoreRestart(int32_t store_node_id,
+                                        int64_t now_ms,
+                                        KVCatalogStoreRestartResponse *out)
+{
+    if (out == NULL)
+        return;
+    memset(out, 0, sizeof(*out));
+
+    Relation rel = table_open(KvblockRelationId(), RowExclusiveLock);
+    CatalogIndexState istate = CatalogOpenIndexes(rel);
+    TupleDesc tupdesc = RelationGetDescr(rel);
+    SysScanDesc scan = systable_beginscan(rel, InvalidOid, false /*indexOK*/,
+                                          GetActiveSnapshot(), 0, NULL);
+    HeapTuple t;
+    while ((t = systable_getnext(scan)) != NULL) {
+        Datum datums[Natts_falcon_kvblock_table];
+        bool  isnulls[Natts_falcon_kvblock_table];
+        heap_deform_tuple(t, tupdesc, datums, isnulls);
+        int32 row_store = DatumGetInt32(datums[Anum_falcon_kvblock_table_store_node_id - 1]);
+        if (row_store != store_node_id)
+            continue;
+
+        ++out->scanned_rows;
+        int32 status = (int32) DatumGetInt16(datums[Anum_falcon_kvblock_table_status - 1]);
+        bool has_evicted_path = false;
+        if (!isnulls[Anum_falcon_kvblock_table_evicted_path - 1]) {
+            text *path = DatumGetTextP(datums[Anum_falcon_kvblock_table_evicted_path - 1]);
+            has_evicted_path = VARSIZE_ANY_EXHDR(path) > 0;
+        }
+
+        if (status == KV_CATALOG_STATUS_EVICTED && has_evicted_path) {
+            ++out->preserved_evicted_rows;
+            continue;
+        }
+
+        simple_heap_delete(rel, &t->t_self);
+        ++out->deleted_rows;
+    }
+    systable_endscan(scan);
+    CommandCounterIncrement();
+    CatalogCloseIndexes(istate);
+    table_close(rel, RowExclusiveLock);
+    (void) now_ms;
+}
+
+
+uint32_t FalconKVBlockScanStoreEvicted(int32_t store_node_id,
+                                       KVCatalogStoreEvictedRow *out_rows,
+                                       uint32_t max_rows)
+{
+    if (out_rows == NULL || max_rows == 0)
+        return 0;
+    uint32_t produced = 0;
+    Relation rel = table_open(KvblockRelationId(), AccessShareLock);
+    TupleDesc tupdesc = RelationGetDescr(rel);
+    SysScanDesc scan = systable_beginscan(rel, InvalidOid, false /*indexOK*/,
+                                          GetActiveSnapshot(), 0, NULL);
+    HeapTuple t;
+    while (produced < max_rows && (t = systable_getnext(scan)) != NULL) {
+        Datum datums[Natts_falcon_kvblock_table];
+        bool  isnulls[Natts_falcon_kvblock_table];
+        heap_deform_tuple(t, tupdesc, datums, isnulls);
+        int32 row_store = DatumGetInt32(datums[Anum_falcon_kvblock_table_store_node_id - 1]);
+        int32 status = (int32) DatumGetInt16(datums[Anum_falcon_kvblock_table_status - 1]);
+        if (row_store != store_node_id || status != KV_CATALOG_STATUS_EVICTED)
+            continue;
+        if (isnulls[Anum_falcon_kvblock_table_evicted_path - 1])
+            continue;
+        text *path = DatumGetTextP(datums[Anum_falcon_kvblock_table_evicted_path - 1]);
+        if (VARSIZE_ANY_EXHDR(path) <= 0)
+            continue;
+
+        Datum hash_d = datums[Anum_falcon_kvblock_table_block_hash - 1];
+        bytea *hash = DatumGetByteaP(hash_d);
+        int hash_len = VARSIZE_ANY_EXHDR(hash);
+        if (hash_len > KV_CATALOG_BLOCK_HASH_MAX_LEN)
+            hash_len = KV_CATALOG_BLOCK_HASH_MAX_LEN;
+        KVCatalogStoreEvictedRow *row = &out_rows[produced];
+        memset(row, 0, sizeof(*row));
+        row->block_hash_len = (uint16_t) hash_len;
+        memcpy(row->block_hash, VARDATA_ANY(hash), hash_len);
+        row->version = DatumGetInt64(datums[Anum_falcon_kvblock_table_version - 1]);
+        CopyEvictedPathField(datums, isnulls, row->evicted_path, &row->evicted_path_len);
+        ++produced;
+    }
+    systable_endscan(scan);
+    table_close(rel, AccessShareLock);
+    return produced;
+}
+
+void FalconKVBlockDeleteInvalidEvicted(const char *req_buf, uint64_t req_size,
+                                       char *resp_buf, uint64_t resp_size)
+{
+    if (req_size < sizeof(uint32_t) || resp_size < sizeof(uint32_t))
+        FALCON_ELOG_ERROR(ARGUMENT_ERROR, "kvblock invalid evicted delete: buffer too small");
+    uint32_t count = 0;
+    memcpy(&count, req_buf, sizeof(uint32_t));
+    const uint64_t expect_req = sizeof(uint32_t) +
+        (uint64_t) count * sizeof(KVCatalogDeleteInvalidEvictedItem);
+    const uint64_t expect_resp = KVCatalogResponseSize(KV_CATALOG_METHOD_DELETE_STORE_EVICTED_INVALID, count);
+    if (req_size < expect_req || resp_size < expect_resp)
+        FALCON_ELOG_ERROR(ARGUMENT_ERROR, "kvblock invalid evicted delete: count/size mismatch");
+    memcpy(resp_buf, &count, sizeof(uint32_t));
+    if (count == 0)
+        return;
+
+    const KVCatalogDeleteInvalidEvictedItem *items =
+        (const KVCatalogDeleteInvalidEvictedItem *)(req_buf + sizeof(uint32_t));
+    KVCatalogDeleteInvalidEvictedResult *results =
+        (KVCatalogDeleteInvalidEvictedResult *)(resp_buf + sizeof(uint32_t));
+    memset(results, 0, (size_t) count * sizeof(KVCatalogDeleteInvalidEvictedResult));
+
+    Relation rel = table_open(KvblockRelationId(), RowExclusiveLock);
+    for (uint32_t i = 0; i < count; ++i) {
+        Datum datums[Natts_falcon_kvblock_table];
+        bool  isnulls[Natts_falcon_kvblock_table];
+        memset(isnulls, 0, sizeof(isnulls));
+        HeapTuple cur = NULL;
+        bool found = FetchRowByHash(rel, items[i].block_hash, items[i].block_hash_len,
+                                    &cur, datums, isnulls);
+        if (!found) {
+            results[i].deleted = 1;
+            continue;
+        }
+        int32 status = (int32) DatumGetInt16(datums[Anum_falcon_kvblock_table_status - 1]);
+        int64 version = DatumGetInt64(datums[Anum_falcon_kvblock_table_version - 1]);
+        if (status != KV_CATALOG_STATUS_EVICTED ||
+            (items[i].expected_version > 0 && version != items[i].expected_version)) {
+            results[i].conflict = 1;
+            heap_freetuple(cur);
+            continue;
+        }
+        simple_heap_delete(rel, &cur->t_self);
+        heap_freetuple(cur);
+        results[i].deleted = 1;
+    }
+    CommandCounterIncrement();
+    table_close(rel, RowExclusiveLock);
+}
+
 /* The dn_epoch row is keyed by shard_id. Scan sequentially since the table is
  * tiny (one row per shard). Returns false if the table is missing
  * (pre-migration deployments). */

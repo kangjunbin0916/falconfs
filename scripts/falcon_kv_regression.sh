@@ -70,6 +70,24 @@ log_info() { echo -e "${GREEN}[ OK ]${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_err()  { echo -e "${RED}${BOLD}[FAIL]${NC} $*"; }
 
+collect_runtime_logs() {
+    local dst="$LOG_DIR/runtime"
+    mkdir -p "$dst"
+    local copied=0
+    local f
+    for f in /tmp/falcon_*.log /tmp/falcon_kv_store_*.log; do
+        if [ -f "$f" ]; then
+            cp -f "$f" "$dst/" 2>/dev/null && copied=1
+        fi
+    done
+    if [ -f /tmp/falcon_kv_store.pids ]; then
+        cp -f /tmp/falcon_kv_store.pids "$dst/" 2>/dev/null || true
+    fi
+    if [ "$copied" = "1" ]; then
+        log_info "Runtime logs copied to $dst"
+    fi
+}
+
 # Suite results: NAME|STATUS|DURATION_S|LOG
 SUITE_RESULTS=()
 SUITE_FAILED=""
@@ -78,6 +96,7 @@ START_EPOCH="$(date +%s)"
 
 cleanup() {
     local rc=$?
+    collect_runtime_logs
     if [ -n "$SUITE_FAILED" ] && [ "$STOP_ON_FAILURE" = "0" ]; then
         log_warn "Failure detected ($SUITE_FAILED); STOP_ON_FAILURE=0 keeping cluster up"
     elif [ "$SKIP_CLUSTER" = "0" ]; then
@@ -240,6 +259,12 @@ suite_kv_cluster_promote_test() {
 suite_python_unittest() {
     cd "$PROJECT_DIR"
     export PYTHONPATH="$PROJECT_DIR/vllm_kv_cache/python:$PROJECT_DIR/vllm_kv_cache/test:${PYTHONPATH:-}"
+    # Keep Python OffloadingManager block sizing aligned with the running store.
+    # Regression runs often lower FALCON_KV_STORE_BLOCK_SIZE to fit local DRAM.
+    if [ -z "${FALCON_MIX_KV_BLOCK_BYTES:-}" ] && [ -n "${FALCON_KV_STORE_BLOCK_SIZE:-}" ]; then
+        export FALCON_MIX_KV_BLOCK_BYTES="$FALCON_KV_STORE_BLOCK_SIZE"
+        log_step "  python profile: FALCON_MIX_KV_BLOCK_BYTES=${FALCON_MIX_KV_BLOCK_BYTES} (from FALCON_KV_STORE_BLOCK_SIZE)"
+    fi
     if [ "$PROFILE" = "full" ]; then
         log_step "  full profile: require vLLM mixed-cluster topology (3 DNs + 4 stores) for Python E2E"
         if ! $PYTHON_BIN -c "
@@ -259,7 +284,12 @@ if not m.mixed_topology_available():
             return 1
         fi
         export FALCON_MIX_E2E_QUICK="${FALCON_MIX_E2E_QUICK:-0}"
-        log_step "  full profile: FALCON_MIX_E2E_QUICK=${FALCON_MIX_E2E_QUICK} (0 = larger mixed E2E defaults)"
+        # Keep the full Python mixed E2E bounded for the documented local 1 MiB /
+        # 512-slot profile. Callers with larger pools can override these.
+        export FALCON_MIX_THROUGHPUT_KEYS="${FALCON_MIX_THROUGHPUT_KEYS:-384}"
+        export FALCON_MIX_PHASE_KEYS="${FALCON_MIX_PHASE_KEYS:-512}"
+        export FALCON_MIX_PHASE_CHUNK_KEYS="${FALCON_MIX_PHASE_CHUNK_KEYS:-128}"
+        log_step "  full profile: FALCON_MIX_E2E_QUICK=${FALCON_MIX_E2E_QUICK} phase_keys=${FALCON_MIX_PHASE_KEYS} throughput_keys=${FALCON_MIX_THROUGHPUT_KEYS}"
     fi
     # All Python tests directly under vllm_kv_cache/test/ are
     # unittest.TestCase-based; avoid a pytest dependency. The vllm/
@@ -277,6 +307,42 @@ if not m.mixed_topology_available():
     fi
     echo "Running unittest modules: ${modules[*]}"
     $PYTHON_BIN -m unittest -v "${modules[@]}"
+}
+
+suite_cluster_restart_for_python() {
+    bash "$DRIVER" restart
+}
+
+suite_kv_store_microbench_info() {
+    cd "$PROJECT_DIR"
+    export PYTHONPATH="$PROJECT_DIR/vllm_kv_cache/python:$PROJECT_DIR/vllm_kv_cache/test:${PYTHONPATH:-}"
+    local block_bytes="${FALCON_KV_MICRO_BLOCK_BYTES:-${FALCON_MIX_KV_BLOCK_BYTES:-${FALCON_KV_STORE_BLOCK_SIZE:-1048576}}}"
+    local blocks="${FALCON_KV_MICRO_BLOCKS:-32}"
+    local par_default=$(( $(nproc) * 2 ))
+    if [ "$par_default" -gt 64 ]; then par_default=64; fi
+    local parallelism="${FALCON_KV_MICRO_PARALLELISM:-$par_default}"
+    if [ -z "${FALCON_KV_MICRO_STORES:-}" ]; then
+        local count="${STORE_COUNT:-2}"
+        local stores=""
+        local i
+        # Build the list without relying on seq availability in minimal shells.
+        for ((i=1; i<=count; ++i)); do
+            if [ -n "$stores" ]; then stores="$stores,$i"; else stores="$i"; fi
+        done
+        export FALCON_KV_MICRO_STORES="$stores"
+    fi
+    export FALCON_KV_MICRO_JSON="${FALCON_KV_MICRO_JSON:-$PROJECT_DIR/logs/falcon_kv_store_microbench_latest.json}"
+    log_step "  microbench info: stores=${FALCON_KV_MICRO_STORES} blocks=${blocks} block_bytes=${block_bytes} parallelism=${parallelism}"
+    if ! "$PYTHON_BIN" vllm_kv_cache/test/kv_store_microbench.py \
+        --mode facade \
+        --allocation metadata \
+        --blocks "$blocks" \
+        --block-bytes "$block_bytes" \
+        --parallelism "$parallelism" \
+        --copy-bound-iters "${FALCON_KV_MICRO_COPY_BOUND_ITERS:-64}"; then
+        log_warn "kv_store_microbench informational run failed; continuing without a performance gate"
+    fi
+    return 0
 }
 
 suite_cluster_down() {
@@ -323,13 +389,34 @@ main() {
     run_suite 8 kv_fault_test         suite_kv_fault_test         || exit 8
     run_suite 9 kv_cluster_fault_test suite_kv_cluster_fault_test || exit 9
 
-    local py_order=10
+    local restart_order=10
+    local microbench_order=11
+    local py_order=12
     if [ "$PROFILE" = "full" ]; then
         run_suite 10 kv_cluster_failover_test suite_kv_cluster_failover_test || exit 10
         run_suite 11 kv_topology_test suite_kv_topology_test || exit 11
         run_suite 12 kv_mixed_colocation_test suite_kv_mixed_colocation_test || exit 12
         run_suite 13 kv_cluster_promote_test suite_kv_cluster_promote_test || exit 13
-        py_order=14
+        restart_order=14
+        microbench_order=15
+        py_order=16
+    fi
+
+    # Fault/failover/promote drills intentionally perturb epochs and live-region
+    # state. Python BRPC/offloading tests assume a clean topology, so refresh the
+    # harness cluster before entering those end-to-end tests.
+    if [ "$SKIP_CLUSTER" = "1" ]; then
+        log_warn "[${restart_order}] cluster_restart_for_python SKIPPED (SKIP_CLUSTER=1)"
+        log_warn "[${microbench_order}] kv_store_microbench_info SKIPPED (SKIP_CLUSTER=1)"
+    else
+        run_suite "$restart_order" cluster_restart_for_python suite_cluster_restart_for_python || exit "$restart_order"
+        if [ -f /tmp/falcon_kv_store_env.sh ]; then
+            set -a
+            # shellcheck disable=SC1090
+            . /tmp/falcon_kv_store_env.sh
+            set +a
+        fi
+        run_suite "$microbench_order" kv_store_microbench_info suite_kv_store_microbench_info || exit "$microbench_order"
     fi
 
     run_suite "$py_order" python_unittest suite_python_unittest || exit "$py_order"

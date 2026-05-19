@@ -107,4 +107,108 @@ TEST(KVMetadataRecovery, ApplyScanShardForRecoveryResponseSetsEpochAndRows) {
     EXPECT_EQ(lke.row->status, kStored);
 }
 
+
+TEST(KVMetadataRecovery, LargeDnRecoveryStressRestoresRowsAndBitmap) {
+    InMemoryKVMetaTableAccessor acc;
+    constexpr int kRows = 384;
+    constexpr int kBlockSize = 65536;
+    AccessorInsertSpec spec;
+    spec.store_node_id = 1;
+
+    int expected_allocated = 0;
+    int expected_stored = 0;
+    int expected_evicted = 0;
+    int expected_evicting = 0;
+    for (int i = 0; i < kRows; ++i) {
+        const std::string hash = "stress-" + std::to_string(i);
+        spec.pool_offset = static_cast<int64_t>(i) * kBlockSize;
+        ASSERT_TRUE(acc.InsertAllocated(/*shard=*/1, hash, spec, /*now_ms=*/10 + i));
+        switch (i % 4) {
+        case 0:
+            ++expected_allocated;
+            break;
+        case 1:
+            ASSERT_TRUE(acc.CASStatusUpdate(1, hash, kAllocated, kStored, 1, "", 20 + i).success);
+            ++expected_stored;
+            break;
+        case 2:
+            ASSERT_TRUE(acc.CASStatusUpdate(1, hash, kAllocated, kEvicting, 1, "", 20 + i).success);
+            ++expected_evicting;
+            break;
+        default:
+            ASSERT_TRUE(acc.CASStatusUpdate(1, hash, kAllocated, kEvicted, 1,
+                                            "/tmp/evicted/" + hash, 20 + i).success);
+            ++expected_evicted;
+            break;
+        }
+    }
+
+    KVMetadataEngine engine(/*store_node_id=*/1,
+                            /*dn_id=*/1,
+                            /*region_bytes=*/static_cast<int64_t>(kRows + 8) * kBlockSize,
+                            /*block_size=*/kBlockSize,
+                            /*dn_epoch=*/7,
+                            /*store_epoch=*/1);
+
+    MetadataRecoveryStats stats = RecoverMetadataFromAccessor(&acc, &engine, /*shard_id=*/1,
+                                                              /*now_ms=*/100000);
+    EXPECT_EQ(stats.bumped_dn_epoch, 2);
+    EXPECT_EQ(stats.recovered_rows, kRows);
+    EXPECT_EQ(stats.restored_allocated_rows, expected_allocated);
+    EXPECT_EQ(stats.restored_stored_rows, expected_stored + expected_evicting);
+    EXPECT_EQ(stats.reconciled_evicting_rows, expected_evicting);
+    EXPECT_EQ(stats.restored_evicted_rows, expected_evicted);
+    EXPECT_EQ(stats.bitmap_marked, expected_allocated + expected_stored + expected_evicting);
+
+    EngineLookupResult allocated = engine.Lookup("stress-0", /*renew=*/false, /*now_ms=*/101000);
+    ASSERT_TRUE(allocated.result.success);
+    EXPECT_EQ(allocated.row->status, kAllocated);
+
+    EngineLookupResult stored = engine.Lookup("stress-1", /*renew=*/false, /*now_ms=*/101000);
+    ASSERT_TRUE(stored.result.success);
+    EXPECT_EQ(stored.row->status, kStored);
+
+    EngineLookupResult reconciled = engine.Lookup("stress-2", /*renew=*/false, /*now_ms=*/101000);
+    ASSERT_TRUE(reconciled.result.success);
+    EXPECT_EQ(reconciled.row->status, kStored);
+}
+
+TEST(KVMetadataRecovery, LateStoreRegistrationParksAndReplaysRows) {
+    InMemoryKVMetaTableAccessor acc;
+    constexpr int kBlockSize = 65536;
+    AccessorInsertSpec spec;
+    spec.store_node_id = 2;
+    spec.pool_offset = 0;
+    ASSERT_TRUE(acc.InsertAllocated(/*shard=*/1, "late-store-row", spec, /*now_ms=*/10));
+    ASSERT_TRUE(acc.CASStatusUpdate(1, "late-store-row", kAllocated, kStored, 1, "", 20).success);
+
+    KVMetadataEngine engine(/*store_node_id=*/1,
+                            /*dn_id=*/1,
+                            /*region_bytes=*/8LL * kBlockSize,
+                            /*block_size=*/kBlockSize,
+                            /*dn_epoch=*/3,
+                            /*store_epoch=*/1);
+
+    MetadataRecoveryStats first = RecoverMetadataFromAccessor(&acc, &engine, /*shard_id=*/1,
+                                                              /*now_ms=*/1000);
+    EXPECT_EQ(first.recovered_rows, 1);
+    EXPECT_EQ(first.restored_stored_rows, 1);
+    EXPECT_FALSE(engine.HasRegion(2));
+
+    EngineStoreRegion region;
+    region.store_node_id = 2;
+    region.base_offset = 0;
+    region.region_bytes = 8LL * kBlockSize;
+    region.block_size = kBlockSize;
+    region.store_epoch = 1;
+    ASSERT_TRUE(engine.RegisterStoreRegion(region).success);
+
+    EngineLookupResult replayed = engine.Lookup("late-store-row", /*renew=*/false,
+                                                /*now_ms=*/2000);
+    ASSERT_TRUE(replayed.result.success);
+    ASSERT_TRUE(replayed.row.has_value());
+    EXPECT_EQ(replayed.row->status, kStored);
+    EXPECT_EQ(replayed.row->location.store_node_id, 2);
+}
+
 }  // namespace falconfs::kv

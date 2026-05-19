@@ -421,7 +421,7 @@ python3 vllm_kv_cache/test/vllm/benchmark_vllm_kv.py
 - [ ] A3 Leases are ownerless; `LEASE_TOKEN_MISMATCH` and `LEASE_EXPIRED` are distinct, retryable after lookup.
 - [ ] A4 Stale `dn_epoch`/`store_epoch` requests are fenced with `STALE_EPOCH` (retryable after refresh).
 - [ ] A5 DN restart rebuilds bitmap/LRU/lease and bumps `dn_epoch`; old lease tokens rejected.
-- [ ] A6 Store restart with new epoch quarantines region until reconciliation; old `store_epoch` rejected.
+- [x] A6 Store restart with new epoch quarantines region until reconciliation; old `store_epoch` rejected; DRAM-only rows deleted; `EVICTED` rows with valid `evicted_path` preserved after Store validation; invalid/missing SSD paths deleted.
 - [ ] A7 Two-phase eviction: success path frees bitmap, rollback path restores `STORED` and LRU.
 - [ ] A8 `complete_store(success=False)` and partial-data cases free or schedule cleanup of failed keys.
 - [ ] A9 Probe-only `lookup()` is side-effect-free; reads must use `prepare_load()`.

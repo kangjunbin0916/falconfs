@@ -5,6 +5,7 @@
 #include "brpc_comm_adapter/kv_recovery_runner.h"
 
 #include <arpa/inet.h>
+#include <brpc/channel.h>
 #include <libpq-fe.h>
 
 #include <chrono>
@@ -17,6 +18,7 @@
 #include <vector>
 
 #include "connection_pool/kv_catalog_wire.h"
+#include "kv_store_admin_service.pb.h"
 #include "vllm_kv_cache/src/metadata/kv_meta_table_accessor.h"
 #include "vllm_kv_cache/src/metadata/kv_metadata_engine.h"
 #include "vllm_kv_cache/src/metadata/kv_metadata_recovery.h"
@@ -255,6 +257,131 @@ KVRecoveryStats KVRecoveryRunner::ReplayRecoverOnly()
     stats.ok                = true;
     stats.recovered_rows    = r.recovered_rows;
     stats.reconciled_evicting = r.reconciled_evicting_rows;
+    return stats;
+}
+
+KVStoreRestartReconcileStats KVRecoveryRunner::ReconcileStoreRestart(int32_t store_node_id,
+                                                                       const std::string& store_endpoint)
+{
+    KVStoreRestartReconcileStats stats;
+    PGconn *conn = OpenRecoveryConnection(pg_port_);
+    if (conn == nullptr) {
+        return stats;
+    }
+
+    KVCatalogStoreRestartRequest req{};
+    req.store_node_id = store_node_id;
+    req.now_ms = NowMs();
+    std::string payload(reinterpret_cast<const char *>(&req), sizeof(req));
+    std::string resp = CallRecovery(conn, KV_CATALOG_METHOD_RECONCILE_STORE_RESTART, payload);
+
+    if (resp.size() < sizeof(KVCatalogStoreRestartResponse)) {
+        PQfinish(conn);
+        return stats;
+    }
+    KVCatalogStoreRestartResponse wire{};
+    std::memcpy(&wire, resp.data(), sizeof(wire));
+    stats.ok = true;
+    stats.scanned_rows = wire.scanned_rows;
+    stats.deleted_rows = wire.deleted_rows;
+    stats.preserved_evicted_rows = wire.preserved_evicted_rows;
+
+    if (wire.preserved_evicted_rows <= 0 || store_endpoint.empty()) {
+        PQfinish(conn);
+        return stats;
+    }
+
+    KVCatalogStoreEvictedScanRequest scan_req{};
+    scan_req.store_node_id = store_node_id;
+    scan_req.max_rows = 1024;
+    std::string scan_payload(reinterpret_cast<const char *>(&scan_req), sizeof(scan_req));
+    std::string scan_resp = CallRecovery(conn, KV_CATALOG_METHOD_SCAN_STORE_EVICTED, scan_payload);
+    if (scan_resp.size() < sizeof(uint32_t)) {
+        stats.validation_failed_rows += wire.preserved_evicted_rows;
+        PQfinish(conn);
+        return stats;
+    }
+    uint32_t row_count = 0;
+    std::memcpy(&row_count, scan_resp.data(), sizeof(uint32_t));
+    const char *cursor = scan_resp.data() + sizeof(uint32_t);
+    const char *end = scan_resp.data() + scan_resp.size();
+
+    brpc::Channel channel;
+    brpc::ChannelOptions opts;
+    opts.protocol = "baidu_std";
+    opts.connection_type = "pooled";
+    opts.timeout_ms = 5000;
+    opts.connect_timeout_ms = 1000;
+    opts.max_retry = 0;
+    if (channel.Init(store_endpoint.c_str(), &opts) != 0) {
+        stats.validation_failed_rows += row_count;
+        PQfinish(conn);
+        return stats;
+    }
+    falconfs::kv::KVStoreAdminService_Stub stub(&channel);
+    falconfs::kv::ValidateEvictedPathsRequest vreq;
+    vreq.mutable_meta()->set_request_id("store_restart_validate:" + std::to_string(store_node_id));
+    vreq.set_store_node_id(store_node_id);
+
+    std::vector<KVCatalogStoreEvictedRow> rows;
+    rows.reserve(row_count);
+    for (uint32_t i = 0; i < row_count; ++i) {
+        if (cursor + sizeof(KVCatalogStoreEvictedRow) > end) break;
+        KVCatalogStoreEvictedRow row{};
+        std::memcpy(&row, cursor, sizeof(row));
+        cursor += sizeof(row);
+        rows.push_back(row);
+        auto *item = vreq.add_items();
+        item->set_block_hash(row.block_hash, row.block_hash_len);
+        item->set_evicted_path(row.evicted_path, row.evicted_path_len);
+    }
+    if (rows.empty()) {
+        PQfinish(conn);
+        return stats;
+    }
+
+    falconfs::kv::ValidateEvictedPathsResponse vresp;
+    brpc::Controller cntl;
+    stub.ValidateEvictedPaths(&cntl, &vreq, &vresp, nullptr);
+    if (cntl.Failed() || !vresp.result().success() ||
+        vresp.results_size() != static_cast<int>(rows.size())) {
+        stats.validation_failed_rows += static_cast<int64_t>(rows.size());
+        PQfinish(conn);
+        return stats;
+    }
+
+    std::vector<KVCatalogDeleteInvalidEvictedItem> invalid;
+    for (int i = 0; i < vresp.results_size(); ++i) {
+        if (vresp.results(i).valid()) {
+            ++stats.validated_evicted_rows;
+            continue;
+        }
+        KVCatalogDeleteInvalidEvictedItem item{};
+        item.block_hash_len = rows[static_cast<size_t>(i)].block_hash_len;
+        std::memcpy(item.block_hash, rows[static_cast<size_t>(i)].block_hash, item.block_hash_len);
+        item.expected_version = rows[static_cast<size_t>(i)].version;
+        invalid.push_back(item);
+    }
+    if (!invalid.empty()) {
+        std::string del_payload;
+        uint32_t count = static_cast<uint32_t>(invalid.size());
+        del_payload.resize(sizeof(uint32_t) + invalid.size() * sizeof(KVCatalogDeleteInvalidEvictedItem));
+        std::memcpy(del_payload.data(), &count, sizeof(uint32_t));
+        std::memcpy(del_payload.data() + sizeof(uint32_t), invalid.data(),
+                    invalid.size() * sizeof(KVCatalogDeleteInvalidEvictedItem));
+        std::string del_resp = CallRecovery(conn, KV_CATALOG_METHOD_DELETE_STORE_EVICTED_INVALID,
+                                            del_payload);
+        if (del_resp.size() >= sizeof(uint32_t)) {
+            uint32_t del_count = 0;
+            std::memcpy(&del_count, del_resp.data(), sizeof(uint32_t));
+            const auto *results = reinterpret_cast<const KVCatalogDeleteInvalidEvictedResult *>(
+                del_resp.data() + sizeof(uint32_t));
+            for (uint32_t i = 0; i < del_count && i < invalid.size(); ++i) {
+                if (results[i].deleted) ++stats.invalid_deleted_rows;
+            }
+        }
+    }
+    PQfinish(conn);
     return stats;
 }
 

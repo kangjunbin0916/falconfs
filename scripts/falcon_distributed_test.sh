@@ -641,6 +641,18 @@ EOF
     done
 
     sleep 3
+
+    local pooler_ports=("$CN_POOLER_PORT" "$DN1_POOLER_PORT" "$DN2_POOLER_PORT")
+    if kv_three_dns_enabled; then
+        pooler_ports+=("$DN3_POOLER_PORT")
+    fi
+    for pooler_port in "${pooler_ports[@]}"; do
+        if ! wait_for_listen_tcp "$pooler_port" 45; then
+            log_error "Falcon BRPC pooler did not listen on TCP port $pooler_port within 45s"
+            exit 1
+        fi
+    done
+
     mirror_kv_dn_membership_rows_to_cn || {
         log_error "CN falcon_dn_node seed failed"
         exit 1
@@ -1211,6 +1223,14 @@ run_kv_cluster_fault_test() {
             fi
         fi
         rm -f "$state_file"
+    fi
+
+    # Store restart reconciliation (§15.2). Run late because it registers a
+    # synthetic Store region on the DN to isolate catalog cleanup behavior.
+    log_step "  [T9] Store restart catalog reconcile"
+    if ! "$fault_bin" --scenario=store-restart-reconcile --endpoint "127.0.0.1:$DN1_POOLER_PORT" \
+         --pg-port "$DN1_PORT"; then
+        log_step "  [T9] FAILED"; rc=1
     fi
 
     # Best-effort post-drill catalog cleanup (some tests intentionally leak

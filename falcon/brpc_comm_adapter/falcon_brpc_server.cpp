@@ -354,7 +354,21 @@ class FalconBrpcServer {
         falcon::kv_proto::BrpcKVMetadataServiceImpl kvMetadataBrpcService(m_jobDispatchFunc);
         auto kvStoreAdminImpl = falconfs::kv::CreateKVStoreAdminBrpcServiceImplForDn(
             m_kvMetadataEngine,
-            [&recoveryRunner]() { (void) recoveryRunner.ReplayRecoverOnly(); });
+            [&recoveryRunner]() { (void) recoveryRunner.ReplayRecoverOnly(); },
+            [&recoveryRunner](int32_t store_node_id, const std::string& store_endpoint) {
+                auto stats = recoveryRunner.ReconcileStoreRestart(store_node_id, store_endpoint);
+                fprintf(stderr,
+                        "[FalconBrpcServer] Store restart reconcile store=%d ok=%d scanned=%ld deleted=%ld preserved=%ld validated=%ld invalid_deleted=%ld validation_failed=%ld\n",
+                        store_node_id,
+                        stats.ok ? 1 : 0,
+                        (long) stats.scanned_rows,
+                        (long) stats.deleted_rows,
+                        (long) stats.preserved_evicted_rows,
+                        (long) stats.validated_evicted_rows,
+                        (long) stats.invalid_deleted_rows,
+                        (long) stats.validation_failed_rows);
+                fflush(stderr);
+            });
         falconfs::kv::KVStoreAdminBrpcServiceAdapter kvStoreAdminBrpcService(kvStoreAdminImpl);
 
         if (m_server.AddService(&kvMetadataBrpcService, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {

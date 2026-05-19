@@ -779,6 +779,180 @@ def _om_perf_phases(mgr: Any) -> Dict[str, Any]:
         "complete_store": dict(bd.get("complete_store") or {}),
         "prepare_load": dict(bd.get("prepare_load") or {}),
         "complete_load": dict(bd.get("complete_load") or {}),
+        "metadata_channel_cache": dict(bd.get("metadata_channel_cache") or {}),
+        "promote_on_read": dict(bd.get("promote_on_read") or {}),
+        "adaptive_batching": dict(bd.get("adaptive_batching") or {}),
+        "zero_copy_read": dict(bd.get("zero_copy_read") or {}),
+    }
+
+
+def _load_json_file(path: Path) -> Any:
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return None
+
+
+def _extract_two_phase_throughput(obj: Any) -> Dict[str, Optional[float]]:
+    events = obj if isinstance(obj, list) else [obj] if isinstance(obj, dict) else []
+    for ev in reversed(events):
+        if not isinstance(ev, dict):
+            continue
+        tee = ev.get("throughput_end_to_end")
+        if isinstance(tee, dict):
+            return {
+                "store_mb_s": float(tee.get("mb_s_phase_store") or 0.0) or None,
+                "load_mb_s": float(tee.get("mb_s_phase_load") or 0.0) or None,
+            }
+    return {"store_mb_s": None, "load_mb_s": None}
+
+
+def _percent_change(cur: Optional[float], base: Optional[float]) -> Optional[float]:
+    if cur is None or base is None or base <= 0:
+        return None
+    return round(100.0 * (cur - base) / base, 3)
+
+
+def _percent_of(cur: Optional[float], upper: Optional[float]) -> Optional[float]:
+    if cur is None or upper is None or upper <= 0:
+        return None
+    return round(100.0 * cur / upper, 3)
+
+
+def _phase_mb_s(section: Dict[str, Any], phase: str) -> Optional[float]:
+    blk = section.get(phase) if isinstance(section.get(phase), dict) else {}
+    val = blk.get("wall_mb_s") if isinstance(blk, dict) else None
+    try:
+        return float(val) if val is not None else None
+    except Exception:
+        return None
+
+
+def _microbench_bounds_snapshot() -> Dict[str, Any]:
+    default_path = ROOT.parent / "logs" / "falcon_kv_store_microbench_latest.json"
+    path = Path(os.environ.get("FALCON_MIX_MICROBENCH_JSON", str(default_path)))
+    obj = _load_json_file(path)
+    if not isinstance(obj, dict):
+        return {"available": False, "path": str(path)}
+    out: Dict[str, Any] = {
+        "available": True,
+        "path": str(path),
+        "mode": obj.get("mode"),
+        "path_mode": obj.get("path_mode"),
+        "allocation": obj.get("allocation"),
+        "stores": obj.get("stores"),
+        "blocks": obj.get("blocks"),
+        "block_bytes": obj.get("block_bytes"),
+        "parallelism": obj.get("parallelism"),
+        "batch_size": obj.get("batch_size"),
+        "verification": obj.get("verification"),
+        "payloads_preallocated": obj.get("payloads_preallocated"),
+        "locality_assertions": obj.get("locality_assertions"),
+    }
+    for key in ("local_shm_upper_bound", "remote_brpc_upper_bound", "native_memcpy_bound", "mixed_facade_bound"):
+        val = obj.get(key)
+        if isinstance(val, dict):
+            out[key] = val
+    # Backward compatibility for older one-section microbench JSON.
+    if not any(key in out for key in ("local_shm_upper_bound", "remote_brpc_upper_bound", "mixed_facade_bound")):
+        write = obj.get("write") if isinstance(obj.get("write"), dict) else {}
+        read = obj.get("read") if isinstance(obj.get("read"), dict) else {}
+        section = {
+            "path_mode": obj.get("path_mode", "legacy"),
+            "write": write,
+            "read": read,
+            "parallelism": obj.get("parallelism"),
+            "block_bytes": obj.get("block_bytes"),
+        }
+        loc = obj.get("store_locality") if isinstance(obj.get("store_locality"), dict) else {}
+        vals = list(loc.values())
+        if vals and all(bool(v) for v in vals):
+            out["local_shm_upper_bound"] = section
+        elif vals and not any(bool(v) for v in vals):
+            out["remote_brpc_upper_bound"] = section
+        else:
+            out["mixed_facade_bound"] = section
+    return out
+
+
+def _microbench_upper_bound_snapshot() -> Dict[str, Any]:
+    bounds = _microbench_bounds_snapshot()
+    if not bounds.get("available"):
+        return bounds
+    section = None
+    for key in ("mixed_facade_bound", "local_shm_upper_bound", "remote_brpc_upper_bound"):
+        if isinstance(bounds.get(key), dict):
+            section = bounds[key]
+            break
+    section = section if isinstance(section, dict) else {}
+    return {
+        "available": True,
+        "path": bounds.get("path"),
+        "mode": bounds.get("mode"),
+        "path_mode": bounds.get("path_mode") or section.get("path_mode"),
+        "allocation": bounds.get("allocation"),
+        "stores": bounds.get("stores"),
+        "blocks": bounds.get("blocks"),
+        "block_bytes": bounds.get("block_bytes"),
+        "parallelism": bounds.get("parallelism"),
+        "batch_size": bounds.get("batch_size"),
+        "write_wall_mb_s": _phase_mb_s(section, "write"),
+        "read_wall_mb_s": _phase_mb_s(section, "read"),
+    }
+
+
+def _path_upper_bound_comparison(ev: Dict[str, Any], bounds: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    bounds = bounds or _microbench_bounds_snapshot()
+    perf = ev.get("path_throughput_latency") if isinstance(ev.get("path_throughput_latency"), dict) else {}
+    store = perf.get("store_write") if isinstance(perf.get("store_write"), dict) else {}
+    load = perf.get("load_read") if isinstance(perf.get("load_read"), dict) else {}
+    local_bound = bounds.get("local_shm_upper_bound") if isinstance(bounds.get("local_shm_upper_bound"), dict) else {}
+    remote_bound = bounds.get("remote_brpc_upper_bound") if isinstance(bounds.get("remote_brpc_upper_bound"), dict) else {}
+
+    def path_mb_s(phase: Dict[str, Any], label: str) -> Optional[float]:
+        row = phase.get(label) if isinstance(phase.get(label), dict) else {}
+        try:
+            return float(row.get("instrumented_mb_s") or 0.0) or None
+        except Exception:
+            return None
+
+    return {
+        "available": bool(bounds.get("available")),
+        "microbench_path": bounds.get("path"),
+        "local_store_pct_of_local_shm_upper": _percent_of(path_mb_s(store, "local_shm"), _phase_mb_s(local_bound, "write")),
+        "local_load_pct_of_local_shm_upper": _percent_of(path_mb_s(load, "local_shm"), _phase_mb_s(local_bound, "read")),
+        "remote_store_pct_of_remote_brpc_upper": _percent_of(path_mb_s(store, "remote_brpc"), _phase_mb_s(remote_bound, "write")),
+        "remote_load_pct_of_remote_brpc_upper": _percent_of(path_mb_s(load, "remote_brpc"), _phase_mb_s(remote_bound, "read")),
+        "note": "Local paths compare against local_shm_upper_bound; remote paths compare against remote_brpc_upper_bound when those sections are available.",
+    }
+
+
+def _baseline_comparison_for_event(ev: Dict[str, Any]) -> Dict[str, Any]:
+    tee = ev.get("throughput_end_to_end") if isinstance(ev.get("throughput_end_to_end"), dict) else {}
+    current_store = float(tee.get("mb_s_phase_store") or 0.0) or None
+    current_load = float(tee.get("mb_s_phase_load") or 0.0) or None
+    baseline_path = Path(os.environ.get(
+        "FALCON_MIX_BASELINE_JSON",
+        str(ROOT.parent / "logs" / "falcon_mix_metrics_baseline.json"),
+    ))
+    baseline = _extract_two_phase_throughput(_load_json_file(baseline_path))
+    bounds = _microbench_bounds_snapshot()
+    upper = _microbench_upper_bound_snapshot()
+    upper_store = upper.get("write_wall_mb_s") if upper.get("available") else None
+    upper_load = upper.get("read_wall_mb_s") if upper.get("available") else None
+    return {
+        "current_store_mb_s": current_store,
+        "current_load_mb_s": current_load,
+        "saved_baseline_path": str(baseline_path),
+        "saved_baseline_store_mb_s": baseline.get("store_mb_s"),
+        "saved_baseline_load_mb_s": baseline.get("load_mb_s"),
+        "store_pct_change_from_baseline": _percent_change(current_store, baseline.get("store_mb_s")),
+        "load_pct_change_from_baseline": _percent_change(current_load, baseline.get("load_mb_s")),
+        "store_pct_of_upper_bound": _percent_of(current_store, upper_store),
+        "load_pct_of_upper_bound": _percent_of(current_load, upper_load),
+        "path_upper_bound_comparison": _path_upper_bound_comparison(ev, bounds),
     }
 
 
@@ -1484,6 +1658,8 @@ def _format_mixed_human_report(ev: Dict[str, Any]) -> str:
                 "data_write_remote_rpcs",
                 "write_batching_enabled",
                 "write_batch_max_blocks",
+                "write_batch_local_max_blocks",
+                "write_batch_remote_max_blocks",
                 "adaptive_batching_enabled",
                 "n_reads",
                 "data_read_rpcs",
@@ -1503,6 +1679,10 @@ def _format_mixed_human_report(ev: Dict[str, Any]) -> str:
             if isinstance(mad, dict) and mad:
                 parts.append("meta_allocate_by_dn_s=" + json.dumps(mad, sort_keys=True))
             lines.append(f"  [{phase}] " + " ".join(parts))
+        for section in ("metadata_channel_cache", "promote_on_read", "adaptive_batching"):
+            blk = om.get(section)
+            if isinstance(blk, dict) and blk:
+                lines.append(f"  [{section}] " + json.dumps(blk, sort_keys=True))
 
     ipc = ev.get("facade_ipc_data_path")
     ipc_ok = isinstance(ipc, dict) and "shared_memory_local_reads" in ipc
@@ -1535,6 +1715,19 @@ def _format_mixed_human_report(ev: Dict[str, Any]) -> str:
     cxx = ev.get("cxx_facade_latency_throughput")
     if isinstance(cxx, dict) and cxx:
         lines.append("cxx_facade_latency_throughput: " + json.dumps(cxx, sort_keys=True))
+    for key in ("local_shm_upper_bound", "remote_brpc_upper_bound", "native_memcpy_bound", "mixed_facade_bound"):
+        blk = ev.get(key)
+        if isinstance(blk, dict) and blk:
+            lines.append(f"{key}: " + json.dumps(blk, sort_keys=True))
+    puc = ev.get("path_upper_bound_comparison")
+    if isinstance(puc, dict) and puc:
+        lines.append("path_upper_bound_comparison: " + json.dumps(puc, sort_keys=True))
+    mbu = ev.get("microbench_upper_bound")
+    if isinstance(mbu, dict) and mbu:
+        lines.append("microbench_upper_bound_legacy: " + json.dumps(mbu, sort_keys=True))
+    bc = ev.get("baseline_comparison")
+    if isinstance(bc, dict) and bc:
+        lines.append("baseline_comparison: " + json.dumps(bc, sort_keys=True))
     latm = ev.get("latency_breakdown_meta_local_remote_s") or ev.get("latency_breakdown_meta_local_remote_est_s")
     if isinstance(latm, dict) and latm:
         lines.append(
@@ -1644,6 +1837,24 @@ class OffloadingManagerClusterMixedE2E(unittest.TestCase):
             event.setdefault("read_throughput_mb_s", event.get("mb_s_prepare_load"))
         event.setdefault("local_remote_io_ratio", _derive_local_remote_io_ratio(event))
         event.setdefault("path_throughput_latency", _derive_path_throughput_latency(event))
+        if "throughput_end_to_end" in event and isinstance(event.get("throughput_end_to_end"), dict):
+            bounds = _microbench_bounds_snapshot()
+            event.setdefault("microbench_bounds", bounds)
+            for key in ("local_shm_upper_bound", "remote_brpc_upper_bound", "native_memcpy_bound", "mixed_facade_bound"):
+                if isinstance(bounds.get(key), dict):
+                    event.setdefault(key, bounds[key])
+            event.setdefault("microbench_upper_bound", _microbench_upper_bound_snapshot())
+            event.setdefault("path_upper_bound_comparison", _path_upper_bound_comparison(event, bounds))
+            event.setdefault("baseline_comparison", _baseline_comparison_for_event(event))
+        event.setdefault(
+            "recovery_stress",
+            {
+                "large_dn_recovery_unit": "KVMetadataRecovery.LargeDnRecoveryStressRestoresRowsAndBitmap",
+                "late_store_registration_unit": "KVMetadataRecovery.LateStoreRegistrationParksAndReplaysRows",
+                "store_restart_validation_cluster": "kv-cluster-fault-test store-restart-reconcile",
+                "profile": os.environ.get("REGRESSION_PROFILE", ""),
+            },
+        )
         event.setdefault(
             "hot_path_integrity_policy",
             {
@@ -1964,6 +2175,80 @@ class OffloadingManagerClusterMixedE2E(unittest.TestCase):
         finally:
             self.mgr.set_om_perf_enabled(_om_perf_enabled())
             self._cleanup(keys)
+
+    def test_y_flagged_adaptive_zero_copy_small_e2e(self) -> None:
+        """Small mixed-cluster E2E with adaptive batching and zero-copy reads enabled."""
+        from falconfs_kv.offloading_manager import FalconFSOffloadingManager  # noqa: WPS433
+
+        old_env = {
+            k: os.environ.get(k)
+            for k in (
+                "FALCON_KV_CLIENT_ADAPTIVE_BATCHING",
+                "FALCON_KV_CLIENT_ZERO_COPY_READS",
+            )
+        }
+        os.environ["FALCON_KV_CLIENT_ADAPTIVE_BATCHING"] = "1"
+        os.environ["FALCON_KV_CLIENT_ZERO_COPY_READS"] = "1"
+        mgr = FalconFSOffloadingManager(
+            client_id=5151,
+            client_hostname=self._client_hostname,
+            mode="cluster",
+            block_size=self._kv_block_bytes,
+            timeout_ms=45000,
+            cn_conninfo=self.cn_conninfo,
+        )
+        mgr.set_om_perf_enabled(True)
+        keys = [self._key(f"flagged{i}") for i in range(24)]
+        try:
+            payload = {k: _mixed_payload(self._kv_block_bytes, variant=i) for i, k in enumerate(keys)}
+            spec = mgr.prepare_store(keys, None)
+            self.assertIsNotNone(spec)
+            mgr.complete_store(keys, payload, None, success=True)
+            ld = mgr.prepare_load(keys, None)
+            for k in keys:
+                self.assertEqual(bytes(ld.data[k]), payload[k])
+            bd = mgr.perf_breakdown()
+            zc = bd.get("zero_copy_read") or {}
+            ab = bd.get("adaptive_batching") or {}
+            self.assertTrue(zc.get("enabled"), zc)
+            self.assertGreaterEqual(int(zc.get("zero_copy_blocks", 0)), len(keys))
+            self.assertTrue(ab.get("enabled"), ab)
+            mgr.complete_load(keys, None)
+            type(self)._record(
+                {
+                    "test": "flagged_adaptive_zero_copy_small_e2e",
+                    "keys": len(keys),
+                    "kv_block_bytes": self._kv_block_bytes,
+                    "om_perf_breakdown": _om_perf_phases(mgr),
+                    "store_locality": _store_locality_snapshot(),
+                    "facade_ipc_stats": _facade_ipc_snapshot(),
+                }
+            )
+        finally:
+            for k in keys:
+                loc = mgr.local_cache.get(k)
+                if loc is None:
+                    continue
+                cluster = mgr._clusters.get(loc.dn_id)
+                if cluster is None:
+                    continue
+                try:
+                    cluster.metadata.free_allocated(
+                        k,
+                        expected_version=loc.version,
+                        force=True,
+                        request_id=f"{self._prefix}_cleanup_{k}",
+                        client_id=mgr.client_id,
+                    )
+                except Exception:
+                    pass
+            mgr._data_stage_pool.shutdown(wait=False, cancel_futures=True)
+            mgr._meta_stage_pool.shutdown(wait=False, cancel_futures=True)
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
     def test_z_two_phase_throughput_store_then_load(self) -> None:
         """Store phase then load phase; throughput + OM breakdown + SHM vs BRPC facade counts.

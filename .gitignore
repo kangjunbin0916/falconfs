@@ -25,6 +25,7 @@ build
 # Trailing slash keeps build.sh out of the ignore set.
 build*/
 log/falcon.*
+logs/
 stats.out
 
 cloud_native/docker_build/cn/metadb

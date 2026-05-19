@@ -352,4 +352,64 @@ TEST(KVMetadataEngine, LookupEvictedCatalogHitAfterDropSlot) {
     EXPECT_TRUE(lk.cacheable);
 }
 
+
+TEST(KVMetadataEngine, StoreEpochRestartClearsStaleDramRuntime) {
+    KVMetadataEngine engine(/*store_node_id=*/1, /*dn_id=*/1,
+                            /*region_bytes=*/4 * 65536LL, /*block_size=*/65536,
+                            /*dn_epoch=*/1, /*store_epoch=*/1);
+
+    EngineAllocateResult alloc = engine.Allocate("restart-block", 65536, 1000);
+    ASSERT_TRUE(alloc.result.success);
+    ASSERT_TRUE(alloc.lease.has_value());
+    ASSERT_TRUE(engine.UpdateStatus("restart-block",
+                                    static_cast<int32_t>(BlockStatus::BLOCK_STATUS_ALLOCATED),
+                                    static_cast<int32_t>(BlockStatus::BLOCK_STATUS_STORED),
+                                    /*expected_version=*/1,
+                                    "",
+                                    false,
+                                    1010)
+                    .result.success);
+
+    EngineLookupResult before = engine.LookupDramCacheOnly("restart-block", true, 1020);
+    ASSERT_TRUE(before.result.success);
+    ASSERT_TRUE(before.row.has_value());
+    ASSERT_TRUE(before.lease.has_value());
+    EXPECT_EQ(before.row->location.store_epoch, 1);
+
+    EngineStoreRegion restarted;
+    restarted.store_node_id = 1;
+    restarted.base_offset = 0;
+    restarted.region_bytes = 4 * 65536LL;
+    restarted.block_size = 65536;
+    restarted.store_epoch = 2;
+    ASSERT_TRUE(engine.RegisterStoreRegion(restarted).success);
+
+    EngineStoreRegion stale_region = restarted;
+    stale_region.store_epoch = 1;
+    EngineResultMeta stale_register = engine.RegisterStoreRegion(stale_region);
+    EXPECT_FALSE(stale_register.success);
+    EXPECT_EQ(stale_register.error_code, static_cast<int32_t>(ErrorCode::STALE_EPOCH));
+
+    EngineLookupResult after = engine.LookupDramCacheOnly("restart-block", true, 1030);
+    EXPECT_TRUE(after.result.success);
+    EXPECT_FALSE(after.row.has_value());
+    EXPECT_TRUE(after.needs_catalog);
+
+    EngineRenewLeaseResult stale = engine.RenewLease(
+        "restart-block",
+        before.lease->lease_token,
+        before.lease->dn_epoch,
+        before.lease->store_epoch,
+        /*requested_ttl_ms=*/1000,
+        /*now_ms=*/1040);
+    EXPECT_FALSE(stale.result.success);
+    EXPECT_EQ(stale.result.error_code, static_cast<int32_t>(ErrorCode::LEASE_EXPIRED));
+
+    EngineAllocateResult fresh = engine.Allocate("fresh-after-restart", 65536, 1050);
+    ASSERT_TRUE(fresh.result.success);
+    ASSERT_TRUE(fresh.row.has_value());
+    EXPECT_EQ(fresh.row->location.store_epoch, 2);
+    EXPECT_EQ(fresh.row->location.pool_offset, 0);
+}
+
 }  // namespace falconfs::kv

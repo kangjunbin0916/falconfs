@@ -29,8 +29,13 @@
 //                              a fresh BatchLookupWithLease must return a new
 //                              lease whose dn_epoch is greater than the saved
 //                              one.
+//   - store-restart-reconcile: §15.2  Register a synthetic Store region,
+//                              write a STORED catalog row, bump store_epoch,
+//                              and verify restart reconciliation deletes the
+//                              DRAM-only row from the durable catalog.
 
 #include <brpc/channel.h>
+#include <brpc/server.h>
 
 #include <chrono>
 #include <cstdint>
@@ -45,6 +50,7 @@
 
 #include "kv_common.pb.h"
 #include "kv_metadata_service.pb.h"
+#include "kv_store_admin_service.pb.h"
 #include "tests/falcon_kv/kv_e2e_block_size.h"
 
 namespace {
@@ -658,6 +664,329 @@ int RunDnRestartPhase2(const std::string& endpoint, const std::string& state_fil
     return 0;
 }
 
+
+// ─────────── Store restart reconciliation (§15.2) ───────────
+
+class SyntheticStoreAdminService final : public falconfs::kv::KVStoreAdminService {
+public:
+    explicit SyntheticStoreAdminService(std::string valid_path)
+        : valid_path_(std::move(valid_path)) {}
+
+    void RegisterStoreRegion(::google::protobuf::RpcController*,
+                             const falconfs::kv::RegisterStoreRegionRequest*,
+                             falconfs::kv::RegisterStoreRegionResponse* response,
+                             ::google::protobuf::Closure* done) override {
+        response->mutable_result()->set_success(false);
+        response->mutable_result()->set_error_code(falconfs::kv::INTERNAL_ERROR);
+        if (done) done->Run();
+    }
+
+    void Heartbeat(::google::protobuf::RpcController*,
+                   const falconfs::kv::HeartbeatRequest*,
+                   falconfs::kv::HeartbeatResponse* response,
+                   ::google::protobuf::Closure* done) override {
+        response->mutable_result()->set_success(false);
+        response->mutable_result()->set_error_code(falconfs::kv::INTERNAL_ERROR);
+        if (done) done->Run();
+    }
+
+    void SpillBlockToSSD(::google::protobuf::RpcController*,
+                         const falconfs::kv::SpillBlockToSSDRequest*,
+                         falconfs::kv::SpillBlockToSSDResponse* response,
+                         ::google::protobuf::Closure* done) override {
+        response->mutable_result()->set_success(false);
+        response->mutable_result()->set_error_code(falconfs::kv::INTERNAL_ERROR);
+        if (done) done->Run();
+    }
+
+    void ValidateEvictedPaths(::google::protobuf::RpcController*,
+                              const falconfs::kv::ValidateEvictedPathsRequest* request,
+                              falconfs::kv::ValidateEvictedPathsResponse* response,
+                              ::google::protobuf::Closure* done) override {
+        response->mutable_result()->set_success(true);
+        response->mutable_result()->set_error_code(falconfs::kv::OK);
+        int64_t valid = 0;
+        int64_t invalid = 0;
+        for (const auto& item : request->items()) {
+            auto* r = response->add_results();
+            r->set_block_hash(item.block_hash());
+            const bool ok = (item.evicted_path() == valid_path_);
+            r->set_valid(ok);
+            r->mutable_result()->set_success(ok);
+            r->mutable_result()->set_error_code(ok ? falconfs::kv::OK : falconfs::kv::NOT_FOUND);
+            if (!ok) {
+                r->mutable_result()->set_error_message("synthetic missing SSD object");
+                ++invalid;
+            } else {
+                ++valid;
+            }
+        }
+        response->set_valid_count(valid);
+        response->set_invalid_count(invalid);
+        if (done) done->Run();
+    }
+
+private:
+    std::string valid_path_;
+};
+
+int RunStoreRestartReconcile(const std::string& endpoint, int pg_port) {
+    using namespace falconfs::kv;
+    brpc::Channel channel;
+    if (!InitChannel(endpoint, 60000, &channel)) {
+        return Fail("store-restart-reconcile: channel init failed");
+    }
+    KVStoreAdminService_Stub admin(&channel);
+    KVMetadataService_Stub meta(&channel);
+
+    const int32_t fake_store_id = 9001;
+    const int block_size = falconfs::kv::test::E2eKvBlockSize();
+    const std::string run_id = "fault_store_restart_" + std::to_string(NowNs());
+    const std::string allocated_hash = run_id + "_allocated";
+    const std::string stored_hash = run_id + "_stored";
+    const std::string evicted_with_path_hash = run_id + "_evicted_path";
+    const std::string evicted_missing_path_hash = run_id + "_evicted_missing";
+    const std::string evicted_empty_path_hash = run_id + "_evicted_empty";
+    const std::string kept_evicted_path = "/tmp/falcon_store_restart_reconcile/kept.kv";
+    const std::string missing_evicted_path = "/tmp/falcon_store_restart_reconcile/missing.kv";
+
+    SyntheticStoreAdminService synthetic_store_admin(kept_evicted_path);
+    brpc::Server synthetic_store_server;
+    if (synthetic_store_server.AddService(&synthetic_store_admin, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
+        return Fail("store-restart-reconcile: synthetic Store admin service add failed");
+    }
+    brpc::ServerOptions synthetic_options;
+    butil::EndPoint synthetic_point;
+    if (butil::str2endpoint("127.0.0.1", 0, &synthetic_point) != 0 ||
+        synthetic_store_server.Start(synthetic_point, &synthetic_options) != 0) {
+        return Fail("store-restart-reconcile: synthetic Store admin server start failed");
+    }
+    const std::string synthetic_store_endpoint =
+        std::string("127.0.0.1:") + std::to_string(synthetic_store_server.listen_address().port);
+
+    auto block_hash_hex = [](const std::string& h) -> std::string {
+        static const char* kHex = "0123456789abcdef";
+        std::string out;
+        out.reserve(h.size() * 2);
+        for (unsigned char c : h) {
+            out.push_back(kHex[c >> 4]);
+            out.push_back(kHex[c & 0x0f]);
+        }
+        return out;
+    };
+
+    auto force_catalog_evicted_empty_path = [&](const std::string& h) -> bool {
+        if (pg_port <= 0) {
+            std::cerr << "store-restart-reconcile: --pg-port is required for "
+                         "empty-path EVICTED fault injection" << std::endl;
+            return false;
+        }
+        std::ostringstream sql;
+        sql << "UPDATE pg_catalog.falcon_kvblock_table "
+            << "SET status=4, evicted_path='', version=version+1, updated_at_ms=0 "
+            << "WHERE block_hash=decode('" << block_hash_hex(h) << "','hex');";
+        std::ostringstream cmd;
+        cmd << "psql -v ON_ERROR_STOP=1 -d postgres -h 127.0.0.1 -p " << pg_port
+            << " -c \"" << sql.str() << "\" >/dev/null";
+        int rc = std::system(cmd.str().c_str());
+        if (rc != 0) {
+            std::cerr << "store-restart-reconcile: SQL fault injection failed for " << h
+                      << " rc=" << rc << std::endl;
+            return false;
+        }
+        return true;
+    };
+
+    auto register_region = [&](int64_t store_epoch) -> bool {
+        RegisterStoreRegionRequest req;
+        req.mutable_meta()->set_request_id(run_id + "_reg_" + std::to_string(store_epoch));
+        auto* r = req.mutable_region();
+        r->set_store_node_id(fake_store_id);
+        r->set_region_index(0);
+        r->set_base_offset(0);
+        r->set_region_bytes(8LL * block_size);
+        r->set_block_size(block_size);
+        r->set_store_epoch(store_epoch);
+        r->set_shm_name("/falcon_fake_store_restart_reconcile");
+        r->set_runtime_dir("/tmp");
+        req.set_store_brpc_endpoint(synthetic_store_endpoint);
+
+        RegisterStoreRegionResponse resp;
+        brpc::Controller cntl;
+        admin.RegisterStoreRegion(&cntl, &req, &resp, nullptr);
+        if (cntl.Failed()) {
+            std::cerr << "store-restart-reconcile: register rpc failed: "
+                      << cntl.ErrorText() << std::endl;
+            return false;
+        }
+        if (!resp.result().success()) {
+            std::cerr << "store-restart-reconcile: register failed: "
+                      << resp.result().error_message() << std::endl;
+            return false;
+        }
+        return true;
+    };
+
+    if (!register_region(1)) {
+        return Fail("store-restart-reconcile: initial region registration failed");
+    }
+
+    auto allocate_one = [&](const std::string& h) -> int64_t {
+        BatchAllocateRequest a;
+        a.mutable_meta()->set_request_id(run_id + "_alloc_" + h);
+        a.mutable_meta()->set_client_id(0);
+        auto* ait = a.add_items();
+        ait->set_block_hash(h);
+        ait->set_block_size(block_size);
+        ait->set_preferred_store_id(fake_store_id);
+        ait->set_allow_fallback_store(false);
+        BatchAllocateResponse ar;
+        brpc::Controller acntl;
+        meta.BatchAllocateWithLease(&acntl, &a, &ar, nullptr);
+        if (acntl.Failed() || ar.results_size() != 1 || !ar.results(0).result().success()) {
+            std::cerr << "store-restart-reconcile: allocate failed for " << h << std::endl;
+            return -1;
+        }
+        if (ar.results(0).location().store_node_id() != fake_store_id) {
+            std::cerr << "store-restart-reconcile: allocator did not use synthetic store for "
+                      << h << std::endl;
+            return -1;
+        }
+        return ar.results(0).version();
+    };
+
+    auto update_one = [&](const std::string& h,
+                          BlockStatus from,
+                          BlockStatus to,
+                          int64_t expected_version,
+                          const std::string& evicted_path) -> int64_t {
+        BatchUpdateStatusRequest u;
+        u.mutable_meta()->set_request_id(run_id + "_upd_" + h);
+        u.mutable_meta()->set_client_id(0);
+        auto* uit = u.add_items();
+        uit->set_block_hash(h);
+        uit->set_expected_from_status(from);
+        uit->set_to_status(to);
+        uit->set_expected_version(expected_version);
+        uit->set_evicted_path(evicted_path);
+        BatchUpdateStatusResponse ur;
+        brpc::Controller ucntl;
+        meta.BatchUpdateBlockStatus(&ucntl, &u, &ur, nullptr);
+        if (ucntl.Failed() || ur.results_size() != 1 || !ur.results(0).result().success()) {
+            std::cerr << "store-restart-reconcile: update failed for " << h << std::endl;
+            return -1;
+        }
+        return ur.results(0).new_version();
+    };
+
+    const int64_t allocated_v1 = allocate_one(allocated_hash);
+    const int64_t stored_v1 = allocate_one(stored_hash);
+    const int64_t evicted_path_v1 = allocate_one(evicted_with_path_hash);
+    const int64_t evicted_missing_v1 = allocate_one(evicted_missing_path_hash);
+    const int64_t evicted_empty_v1 = allocate_one(evicted_empty_path_hash);
+    if (allocated_v1 < 0 || stored_v1 < 0 || evicted_path_v1 < 0 ||
+        evicted_missing_v1 < 0 || evicted_empty_v1 < 0) {
+        return Fail("store-restart-reconcile: pre-restart allocation setup failed");
+    }
+
+    const int64_t stored_v2 = update_one(stored_hash,
+                                         BLOCK_STATUS_ALLOCATED,
+                                         BLOCK_STATUS_STORED,
+                                         stored_v1,
+                                         "");
+    const int64_t evicted_path_v2 = update_one(evicted_with_path_hash,
+                                               BLOCK_STATUS_ALLOCATED,
+                                               BLOCK_STATUS_STORED,
+                                               evicted_path_v1,
+                                               "");
+    const int64_t evicted_missing_v2 = update_one(evicted_missing_path_hash,
+                                                  BLOCK_STATUS_ALLOCATED,
+                                                  BLOCK_STATUS_STORED,
+                                                  evicted_missing_v1,
+                                                  "");
+    const int64_t evicted_empty_v2 = update_one(evicted_empty_path_hash,
+                                                BLOCK_STATUS_ALLOCATED,
+                                                BLOCK_STATUS_STORED,
+                                                evicted_empty_v1,
+                                                "");
+    if (stored_v2 < 0 || evicted_path_v2 < 0 ||
+        evicted_missing_v2 < 0 || evicted_empty_v2 < 0) {
+        return Fail("store-restart-reconcile: STORED setup failed");
+    }
+
+    const int64_t evicted_path_v3 = update_one(evicted_with_path_hash,
+                                               BLOCK_STATUS_STORED,
+                                               BLOCK_STATUS_EVICTED,
+                                               evicted_path_v2,
+                                               kept_evicted_path);
+    const int64_t evicted_missing_v3 = update_one(evicted_missing_path_hash,
+                                                  BLOCK_STATUS_STORED,
+                                                  BLOCK_STATUS_EVICTED,
+                                                  evicted_missing_v2,
+                                                  missing_evicted_path);
+    if (evicted_path_v3 < 0 || evicted_missing_v3 < 0) {
+        return Fail("store-restart-reconcile: EVICTED setup failed");
+    }
+    if (!force_catalog_evicted_empty_path(evicted_empty_path_hash)) {
+        return Fail("store-restart-reconcile: EVICTED empty-path setup failed");
+    }
+
+    if (!register_region(2)) {
+        return Fail("store-restart-reconcile: restart region registration failed");
+    }
+
+    BatchLookupRequest l;
+    l.mutable_meta()->set_request_id(run_id + "_lookup_after_restart");
+    for (const auto& h : {allocated_hash, stored_hash, evicted_with_path_hash,
+                          evicted_missing_path_hash, evicted_empty_path_hash}) {
+        auto* lit = l.add_items();
+        lit->set_block_hash(h);
+        lit->set_renew_lease_on_hit(false);
+    }
+    BatchLookupResponse lr;
+    brpc::Controller lcntl;
+    meta.BatchLookupWithLease(&lcntl, &l, &lr, nullptr);
+    if (lcntl.Failed() || lr.results_size() != 5) {
+        return Fail("store-restart-reconcile: lookup after restart failed");
+    }
+
+    auto expect_not_found = [&](int idx, const char* label) -> bool {
+        if (lr.results(idx).result().success()) {
+            std::cerr << "store-restart-reconcile: " << label
+                      << " row survived Store restart" << std::endl;
+            return false;
+        }
+        if (lr.results(idx).result().error_code() != ErrorCode::NOT_FOUND) {
+            std::cerr << "store-restart-reconcile: " << label
+                      << " expected NOT_FOUND, got code="
+                      << lr.results(idx).result().error_code() << std::endl;
+            return false;
+        }
+        return true;
+    };
+    if (!expect_not_found(0, "ALLOCATED") ||
+        !expect_not_found(1, "STORED") ||
+        !expect_not_found(3, "EVICTED-missing-path") ||
+        !expect_not_found(4, "EVICTED-empty-path")) {
+        return Fail("store-restart-reconcile: deleted-row assertions failed");
+    }
+
+    const auto& preserved = lr.results(2);
+    if (!preserved.result().success() ||
+        preserved.status() != BLOCK_STATUS_EVICTED ||
+        !preserved.evicted_catalog_hit() ||
+        preserved.location().evicted_path() != kept_evicted_path) {
+        return Fail("store-restart-reconcile: EVICTED row with SSD path was not preserved");
+    }
+
+    std::cout << "STORE_RESTART_RECONCILE_OK fake_store_id=" << fake_store_id
+              << " deleted=ALLOCATED,STORED,EVICTED_EMPTY_PATH,EVICTED_MISSING_PATH"
+              << " preserved=EVICTED_WITH_VALID_PATH"
+              << " validation_endpoint=" << synthetic_store_endpoint
+              << " endpoint=" << endpoint << std::endl;
+    return 0;
+}
+
 void PrintUsage(const char* argv0) {
     std::cerr <<
         "Usage: " << argv0 << " --scenario=<NAME> [options]\n"
@@ -667,7 +996,8 @@ void PrintUsage(const char* argv0) {
         "  stale-store-epoch    --endpoint HOST:PORT\n"
         "  eviction-rollback    --endpoint HOST:PORT [--wait-ms N]\n"
         "  dn-restart-phase1    --endpoint HOST:PORT --state-file PATH\n"
-        "  dn-restart-phase2    --endpoint HOST:PORT --state-file PATH\n";
+        "  dn-restart-phase2    --endpoint HOST:PORT --state-file PATH\n"
+        "  store-restart-reconcile --endpoint HOST:PORT --pg-port PORT\n";
 }
 
 }  // namespace
@@ -677,6 +1007,7 @@ int main(int argc, char** argv) {
     std::string endpoint = "127.0.0.1:55530";
     std::string state_file;
     int wait_ms = 1500;
+    int pg_port = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a(argv[i]);
         if (a == "--help" || a == "-h") {
@@ -693,6 +1024,8 @@ int main(int argc, char** argv) {
             state_file = argv[++i];
         } else if (a == "--wait-ms" && i + 1 < argc) {
             wait_ms = std::atoi(argv[++i]);
+        } else if (a == "--pg-port" && i + 1 < argc) {
+            pg_port = std::atoi(argv[++i]);
         } else {
             PrintUsage(argv[0]);
             return Fail("unknown arg: " + a);
@@ -709,6 +1042,7 @@ int main(int argc, char** argv) {
     if (scenario == "eviction-rollback") return RunEvictionRollback(endpoint, wait_ms);
     if (scenario == "dn-restart-phase1") return RunDnRestartPhase1(endpoint, state_file);
     if (scenario == "dn-restart-phase2") return RunDnRestartPhase2(endpoint, state_file);
+    if (scenario == "store-restart-reconcile") return RunStoreRestartReconcile(endpoint, pg_port);
     PrintUsage(argv[0]);
     return Fail("unknown scenario: " + scenario);
 }

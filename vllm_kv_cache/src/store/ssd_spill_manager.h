@@ -41,6 +41,10 @@ public:
     // True if `evicted_path` is rooted under `ssd_root_` and contains no `..`.
     bool ValidatePath(const std::string& evicted_path) const;
 
+    // Validates path safety plus Store-local file existence/readability.
+    bool ValidateExistingFile(const std::string& evicted_path,
+                              std::string* error_message = nullptr) const;
+
     // Computes the canonical path for a given block hash + version (without
     // creating the file). Useful for tests and metadata.
     std::string ComputePath(int32_t store_node_id,

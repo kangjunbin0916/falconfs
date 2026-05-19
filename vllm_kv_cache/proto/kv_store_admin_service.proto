@@ -86,6 +86,30 @@ message SpillBlockToSSDResponse {
   uint32 crc32 = 3;
 }
 
+message ValidateEvictedPathItem {
+  bytes block_hash = 1;
+  string evicted_path = 2;
+}
+
+message ValidateEvictedPathsRequest {
+  CommonRequestMeta meta = 1;
+  int32 store_node_id = 2;
+  repeated ValidateEvictedPathItem items = 3;
+}
+
+message ValidateEvictedPathResult {
+  bytes block_hash = 1;
+  ItemResultMeta result = 2;
+  bool valid = 3;
+}
+
+message ValidateEvictedPathsResponse {
+  ItemResultMeta result = 1;
+  repeated ValidateEvictedPathResult results = 2;
+  int64 valid_count = 3;
+  int64 invalid_count = 4;
+}
+
 // Service hosted on each DN bgworker AND mirrored on each falcon_kv_store
 // daemon. Per design §5.4:
 //   - DN-hosted side accepts RegisterStoreRegion and Heartbeat from Stores.
@@ -97,4 +121,5 @@ service KVStoreAdminService {
   rpc RegisterStoreRegion(RegisterStoreRegionRequest) returns (RegisterStoreRegionResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc SpillBlockToSSD(SpillBlockToSSDRequest) returns (SpillBlockToSSDResponse);
+  rpc ValidateEvictedPaths(ValidateEvictedPathsRequest) returns (ValidateEvictedPathsResponse);
 }

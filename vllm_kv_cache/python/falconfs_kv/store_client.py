@@ -13,7 +13,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 from . import falconfs_kv_brpc
 from . import kv_data_service_pb2 as _kvdata
@@ -81,7 +81,7 @@ class StoreBlockWrite:
     """One logical KV block for a batched ``BatchWriteBlock`` RPC."""
 
     pool_offset: int
-    payload: bytes
+    payload: Any
     block_hash: bytes
     block_size: int
     expected_store_epoch: int
@@ -116,7 +116,7 @@ class BrpcKVStore:
         self,
         store_node_id: int,
         pool_offset: int,
-        payload: bytes,
+        payload: Any,
         expected_store_epoch: int,
         block_size: int,
         expected_version: int = 0,
@@ -128,7 +128,6 @@ class BrpcKVStore:
         it = req.item
         it.block_hash = block_hash
         it.pool_offset = pool_offset
-        it.payload = payload
         it.block_size = block_size
         it.expected_store_epoch = expected_store_epoch
         it.expected_version = expected_version
@@ -144,10 +143,10 @@ class BrpcKVStore:
             except Exception:
                 wire = b""
             finally:
-                if not it.payload:
-                    it.payload = payload
+                pass
         if self._use_facade_registry and not wire:
             try:
+                it.payload = bytes(payload)
                 wire = _facade_rpc_retry(
                     falconfs_kv_brpc.facade_write_block,
                     int(store_node_id), req.SerializeToString()
@@ -155,6 +154,7 @@ class BrpcKVStore:
             except Exception:
                 wire = b""
         if not wire:
+            it.payload = bytes(payload)
             wire = _write_block_retry(
                 self.endpoint, req.SerializeToString(), self.timeout_ms
             )
@@ -240,7 +240,7 @@ class BrpcKVStore:
                     )
                 else:
                     for it, payload in zip(req.items, payloads):
-                        it.payload = payload
+                        it.payload = bytes(payload)
                     wire = _facade_rpc_retry(
                         falconfs_kv_brpc.facade_batch_write_block,
                         int(store_node_id), req.SerializeToString()
@@ -250,7 +250,7 @@ class BrpcKVStore:
         if not wire:
             for it, payload in zip(req.items, payloads):
                 if not it.payload:
-                    it.payload = payload
+                    it.payload = bytes(payload)
             wire = _batch_write_block_retry(
                 self.endpoint, req.SerializeToString(), self.timeout_ms
             )
@@ -259,6 +259,33 @@ class BrpcKVStore:
         for r in rsp.results:
             out.append(_result_meta_to_item_result(r.result))
         return out
+
+    def batch_read_payload_views(
+        self,
+        store_node_id: int,
+        pool_offsets: Sequence[int],
+        store_epochs: Sequence[int],
+        block_hashes: Sequence[bytes],
+        block_size: int,
+    ) -> Tuple[List[bool], List[Any], List[str]]:
+        if not pool_offsets:
+            return [], [], []
+        if (
+            self._use_facade_registry
+            and hasattr(falconfs_kv_brpc, "facade_batch_read_payload_views")
+        ):
+            return _facade_rpc_retry(
+                falconfs_kv_brpc.facade_batch_read_payload_views,
+                int(store_node_id),
+                list(pool_offsets),
+                list(store_epochs),
+                list(block_hashes),
+                int(block_size),
+            )
+        ok, payloads = self.batch_read_payloads_fast(
+            store_node_id, pool_offsets, store_epochs, block_hashes, block_size
+        )
+        return ok, payloads, ["bytes_fallback"] * len(payloads)
 
     def batch_read_payloads_fast(
         self,

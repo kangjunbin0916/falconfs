@@ -70,6 +70,18 @@ void FalconKVBlockBatchPromoteFromEvicted(const char *req_buf, uint64_t req_size
 uint32_t FalconKVBlockScanForRecovery(KVCatalogRecoveryRow *out_rows,
                                       uint32_t out_rows_capacity);
 
+/* v6 §15.2 Store restart reconciliation: Store DRAM is volatile, so rows that
+ * point only to the restarted Store's DRAM are deleted. Existing EVICTED rows
+ * with an SSD path are preserved because they can still answer SSD reads. */
+void FalconKVBlockReconcileStoreRestart(int32_t store_node_id,
+                                        int64_t now_ms,
+                                        KVCatalogStoreRestartResponse *out);
+uint32_t FalconKVBlockScanStoreEvicted(int32_t store_node_id,
+                                       KVCatalogStoreEvictedRow *out_rows,
+                                       uint32_t max_rows);
+void FalconKVBlockDeleteInvalidEvicted(const char *req_buf, uint64_t req_size,
+                                       char *resp_buf, uint64_t resp_size);
+
 /* v6 \u00a715.4 dn_epoch fencing. The `falcon_kvblock_dn_epoch` table holds one
  * (shard_id, dn_epoch) row; absent rows are treated as `dn_epoch = 1` and
  * inserted lazily on first bump. */

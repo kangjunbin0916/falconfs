@@ -31,6 +31,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -54,6 +55,10 @@ struct CachedMetadataChannel {
 
 std::mutex g_metadata_channel_mu;
 std::unordered_map<std::string, CachedMetadataChannel> g_metadata_channels;
+std::atomic<uint64_t> g_metadata_channel_cache_hits{0};
+std::atomic<uint64_t> g_metadata_channel_cache_misses{0};
+std::atomic<uint64_t> g_metadata_channel_evictions{0};
+std::atomic<uint64_t> g_metadata_channel_failures{0};
 
 // Facade BatchRead/BatchWrite counters (local SHM vs remote BRPC) for regression tests.
 std::atomic<uint64_t> g_facade_ipc_local_reads{0};
@@ -74,6 +79,96 @@ std::atomic<uint64_t> g_facade_perf_remote_write_ops{0};
 std::atomic<uint64_t> g_facade_perf_remote_write_bytes{0};
 std::atomic<uint64_t> g_facade_perf_remote_write_ns{0};
 std::atomic<uint64_t> g_native_read_req_seq{0};
+
+struct FalconKVReadBufferObject {
+    PyObject_HEAD
+    std::string* payload;
+    std::shared_ptr<void>* owner;
+    const char* data;
+    size_t size;
+};
+
+static int FalconKVReadBufferGetBuffer(PyObject* exporter, Py_buffer* view, int flags)
+{
+    auto* self = reinterpret_cast<FalconKVReadBufferObject*>(exporter);
+    if (self == nullptr || self->data == nullptr) {
+        PyErr_SetString(PyExc_BufferError, "released FalconKV read buffer");
+        return -1;
+    }
+    return PyBuffer_FillInfo(view, exporter,
+                             const_cast<char*>(self->data),
+                             static_cast<Py_ssize_t>(self->size),
+                             1, flags);
+}
+
+static void FalconKVReadBufferDealloc(FalconKVReadBufferObject* self)
+{
+    delete self->payload;
+    delete self->owner;
+    Py_TYPE(self)->tp_free(reinterpret_cast<PyObject*>(self));
+}
+
+static PyBufferProcs FalconKVReadBufferProcs = {
+    FalconKVReadBufferGetBuffer,
+    nullptr,
+};
+
+static PyTypeObject FalconKVReadBufferType = {
+    PyVarObject_HEAD_INIT(nullptr, 0)
+};
+
+static bool InitFalconKVReadBufferType()
+{
+    FalconKVReadBufferType.tp_name = "falconfs_kv_brpc.ReadBuffer";
+    FalconKVReadBufferType.tp_basicsize = sizeof(FalconKVReadBufferObject);
+    FalconKVReadBufferType.tp_itemsize = 0;
+    FalconKVReadBufferType.tp_dealloc = reinterpret_cast<destructor>(FalconKVReadBufferDealloc);
+    FalconKVReadBufferType.tp_flags = Py_TPFLAGS_DEFAULT;
+    FalconKVReadBufferType.tp_doc = "Read-only FalconFS KV native read buffer";
+    FalconKVReadBufferType.tp_as_buffer = &FalconKVReadBufferProcs;
+    FalconKVReadBufferType.tp_new = PyType_GenericNew;
+    return PyType_Ready(&FalconKVReadBufferType) == 0;
+}
+
+static PyObject* MakeReadOnlyMemoryView(std::string&& payload)
+{
+    auto* owner = PyObject_New(FalconKVReadBufferObject, &FalconKVReadBufferType);
+    if (owner == nullptr) return nullptr;
+    owner->payload = nullptr;
+    owner->owner = nullptr;
+    owner->data = nullptr;
+    owner->size = 0;
+    owner->payload = new (std::nothrow) std::string(std::move(payload));
+    if (owner->payload == nullptr) {
+        Py_DECREF(reinterpret_cast<PyObject*>(owner));
+        PyErr_NoMemory();
+        return nullptr;
+    }
+    owner->data = owner->payload->data();
+    owner->size = owner->payload->size();
+    PyObject* view = PyMemoryView_FromObject(reinterpret_cast<PyObject*>(owner));
+    Py_DECREF(reinterpret_cast<PyObject*>(owner));
+    return view;
+}
+
+static PyObject* MakeReadOnlyMemoryView(const char* data, size_t size, std::shared_ptr<void> owner_ref)
+{
+    auto* owner = PyObject_New(FalconKVReadBufferObject, &FalconKVReadBufferType);
+    if (owner == nullptr) return nullptr;
+    owner->payload = nullptr;
+    owner->owner = nullptr;
+    owner->data = data;
+    owner->size = size;
+    owner->owner = new (std::nothrow) std::shared_ptr<void>(std::move(owner_ref));
+    if (owner->owner == nullptr) {
+        Py_DECREF(reinterpret_cast<PyObject*>(owner));
+        PyErr_NoMemory();
+        return nullptr;
+    }
+    PyObject* view = PyMemoryView_FromObject(reinterpret_cast<PyObject*>(owner));
+    Py_DECREF(reinterpret_cast<PyObject*>(owner));
+    return view;
+}
 
 
 static bool ReadU64LEBytes(const std::string& in, size_t* pos, uint64_t* v)
@@ -221,10 +316,12 @@ std::shared_ptr<brpc::Channel> ResolveMetadataChannel(const std::string& endpoin
         if (it != g_metadata_channels.end() &&
             it->second.timeout_ms == normalized_timeout &&
             it->second.channel) {
+            g_metadata_channel_cache_hits.fetch_add(1, std::memory_order_relaxed);
             return it->second.channel;
         }
     }
 
+    g_metadata_channel_cache_misses.fetch_add(1, std::memory_order_relaxed);
     auto channel = std::make_shared<brpc::Channel>();
     if (!InitChannel(endpoint.c_str(), normalized_timeout, channel.get())) {
         if (error != nullptr) {
@@ -252,7 +349,17 @@ void EvictMetadataChannel(const std::string& endpoint,
     auto it = g_metadata_channels.find(endpoint);
     if (it != g_metadata_channels.end() && it->second.channel == channel) {
         g_metadata_channels.erase(it);
+        g_metadata_channel_evictions.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+bool PyDictSetU64(PyObject* d, const char* key, uint64_t value)
+{
+    PyObject* v = PyLong_FromUnsignedLongLong(static_cast<unsigned long long>(value));
+    if (v == nullptr) return false;
+    const int rc = PyDict_SetItemString(d, key, v);
+    Py_DECREF(v);
+    return rc == 0;
 }
 
 PyObject* WrapRpcError(const std::string& where, const std::string& detail)
@@ -311,6 +418,7 @@ PyObject* DoMetadataCall(PyObject* args, const char* method_name, CallFn&& call_
         Py_END_ALLOW_THREADS;
     }
     if (cntl.Failed()) {
+        g_metadata_channel_failures.fetch_add(1, std::memory_order_relaxed);
         EvictMetadataChannel(endpoint, channel);
         return WrapRpcError(method_name, cntl.ErrorText());
     }
@@ -393,6 +501,39 @@ PyObject* DoDataCall(PyObject* args, const char* method_name, CallFn&& call_fn)
         return WrapRpcError(method_name, "SerializeToString failed");
     }
     return PyBytes_FromStringAndSize(out.data(), static_cast<Py_ssize_t>(out.size()));
+}
+
+PyObject* PyMetadataChannelStatsReset(PyObject* /*self*/, PyObject* /*args*/)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_metadata_channel_mu);
+        g_metadata_channels.clear();
+    }
+    g_metadata_channel_cache_hits.store(0, std::memory_order_relaxed);
+    g_metadata_channel_cache_misses.store(0, std::memory_order_relaxed);
+    g_metadata_channel_evictions.store(0, std::memory_order_relaxed);
+    g_metadata_channel_failures.store(0, std::memory_order_relaxed);
+    Py_RETURN_NONE;
+}
+
+PyObject* PyMetadataChannelStats(PyObject* /*self*/, PyObject* /*args*/)
+{
+    size_t cache_size = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_metadata_channel_mu);
+        cache_size = g_metadata_channels.size();
+    }
+    PyObject* d = PyDict_New();
+    if (d == nullptr) return nullptr;
+    if (!PyDictSetU64(d, "cache_size", static_cast<uint64_t>(cache_size)) ||
+        !PyDictSetU64(d, "hits", g_metadata_channel_cache_hits.load(std::memory_order_relaxed)) ||
+        !PyDictSetU64(d, "misses", g_metadata_channel_cache_misses.load(std::memory_order_relaxed)) ||
+        !PyDictSetU64(d, "evictions", g_metadata_channel_evictions.load(std::memory_order_relaxed)) ||
+        !PyDictSetU64(d, "failures", g_metadata_channel_failures.load(std::memory_order_relaxed))) {
+        Py_DECREF(d);
+        return nullptr;
+    }
+    return d;
 }
 
 // Metadata methods.
@@ -1030,6 +1171,131 @@ PyObject* PyFacadeBatchReadPayloadsFast(PyObject* /*self*/, PyObject* args)
     return tuple;
 }
 
+PyObject* PyFacadeBatchReadPayloadViews(PyObject* /*self*/, PyObject* args)
+{
+    using namespace falconfs::kv;
+    int store_node_id = 0;
+    PyObject* offsets_obj = nullptr;
+    PyObject* epochs_obj = nullptr;
+    PyObject* hashes_obj = nullptr;
+    long long block_size_ll = 0;
+    if (!PyArg_ParseTuple(args, "iOOOL", &store_node_id, &offsets_obj, &epochs_obj,
+                          &hashes_obj, &block_size_ll)) {
+        return nullptr;
+    }
+    if (block_size_ll <= 0) {
+        return WrapRpcError("facade_batch_read_payload_views", "block_size must be positive");
+    }
+
+    PyObject* offsets = PySequence_Fast(offsets_obj, "offsets must be a sequence");
+    PyObject* epochs = PySequence_Fast(epochs_obj, "epochs must be a sequence");
+    PyObject* hashes = PySequence_Fast(hashes_obj, "block_hashes must be a sequence");
+    if (offsets == nullptr || epochs == nullptr || hashes == nullptr) {
+        Py_XDECREF(offsets);
+        Py_XDECREF(epochs);
+        Py_XDECREF(hashes);
+        return nullptr;
+    }
+    const Py_ssize_t n = PySequence_Fast_GET_SIZE(offsets);
+    if (PySequence_Fast_GET_SIZE(epochs) != n || PySequence_Fast_GET_SIZE(hashes) != n) {
+        Py_DECREF(offsets);
+        Py_DECREF(epochs);
+        Py_DECREF(hashes);
+        return WrapRpcError("facade_batch_read_payload_views", "input sequence length mismatch");
+    }
+
+    BatchReadBlockRequest req;
+    req.mutable_meta()->set_request_id(
+        "py_native_batch_read_view_" + std::to_string(g_native_read_req_seq.fetch_add(1)));
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        const long long pool_offset = PyLong_AsLongLong(PySequence_Fast_GET_ITEM(offsets, i));
+        if (PyErr_Occurred()) { Py_DECREF(offsets); Py_DECREF(epochs); Py_DECREF(hashes); return nullptr; }
+        const long long store_epoch = PyLong_AsLongLong(PySequence_Fast_GET_ITEM(epochs, i));
+        if (PyErr_Occurred()) { Py_DECREF(offsets); Py_DECREF(epochs); Py_DECREF(hashes); return nullptr; }
+        PyObject* hash_obj = PySequence_Fast_GET_ITEM(hashes, i);
+        const char* hash_buf = nullptr;
+        Py_ssize_t hash_len = 0;
+        if (PyBytes_AsStringAndSize(hash_obj, const_cast<char**>(&hash_buf), &hash_len) != 0) {
+            Py_DECREF(offsets); Py_DECREF(epochs); Py_DECREF(hashes); return nullptr;
+        }
+        ReadItem* it = req.add_items();
+        it->set_block_hash(hash_buf, static_cast<size_t>(hash_len));
+        it->set_pool_offset(pool_offset);
+        it->set_block_size(static_cast<int32_t>(block_size_ll));
+        it->set_expected_store_epoch(store_epoch);
+        it->set_expected_version(0);
+    }
+    Py_DECREF(offsets);
+    Py_DECREF(epochs);
+    Py_DECREF(hashes);
+
+    std::shared_ptr<IKVStoreFacade> facade;
+    {
+        std::lock_guard<std::mutex> lk(g_registry_mu);
+        if (!g_registry) return WrapRpcError("facade_batch_read_payload_views", "registry not started");
+        facade = g_registry->Resolve(store_node_id);
+    }
+    if (!facade) return WrapRpcError("facade_batch_read_payload_views", "unknown store_node_id");
+
+    BatchReadBlockResponse rsp;
+    std::vector<KVStoreReadPayloadView> views;
+    const bool is_local = facade->IsLocal();
+    auto t0 = std::chrono::steady_clock::now();
+    {
+        Py_BEGIN_ALLOW_THREADS;
+        facade->BatchReadBlockPayloadViews(req, &rsp, &views);
+        Py_END_ALLOW_THREADS;
+    }
+    auto t1 = std::chrono::steady_clock::now();
+
+    uint64_t bytes = 0;
+    for (const auto& view : views) bytes += static_cast<uint64_t>(view.size);
+    const uint64_t elapsed_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+    BumpFacadePerfCounters(/*is_write=*/false, is_local, elapsed_ns,
+                           bytes > 0 ? bytes : FacadeRequestBytes(req));
+    for (int i = 0; i < std::max(1, req.items_size()); ++i) BumpFacadeIpcCounters(false, is_local);
+
+    PyObject* ok_list = PyList_New(static_cast<Py_ssize_t>(rsp.results_size()));
+    PyObject* payload_list = PyList_New(static_cast<Py_ssize_t>(views.size()));
+    PyObject* kind_list = PyList_New(static_cast<Py_ssize_t>(views.size()));
+    if (ok_list == nullptr || payload_list == nullptr || kind_list == nullptr) {
+        Py_XDECREF(ok_list); Py_XDECREF(payload_list); Py_XDECREF(kind_list); return nullptr;
+    }
+    for (Py_ssize_t i = 0; i < static_cast<Py_ssize_t>(rsp.results_size()); ++i) {
+        const bool ok = rsp.results(static_cast<int>(i)).has_result() &&
+                        rsp.results(static_cast<int>(i)).result().success();
+        PyObject* b = PyBool_FromLong(ok ? 1 : 0);
+        if (b == nullptr) { Py_DECREF(ok_list); Py_DECREF(payload_list); Py_DECREF(kind_list); return nullptr; }
+        PyList_SET_ITEM(ok_list, i, b);
+    }
+    for (Py_ssize_t i = 0; i < static_cast<Py_ssize_t>(views.size()); ++i) {
+        auto& payload_view = views[static_cast<size_t>(i)];
+        PyObject* view = nullptr;
+        if (payload_view.owner && payload_view.data != nullptr) {
+            view = MakeReadOnlyMemoryView(payload_view.data, payload_view.size, payload_view.owner);
+        } else {
+            view = MakeReadOnlyMemoryView(std::move(payload_view.owned_payload));
+        }
+        const std::string& kind = payload_view.kind.empty()
+            ? (is_local ? std::string("local_native_buffer") : std::string("remote_attachment_buffer"))
+            : payload_view.kind;
+        PyObject* kind_obj = PyUnicode_FromString(kind.c_str());
+        if (view == nullptr || kind_obj == nullptr) {
+            Py_XDECREF(view); Py_XDECREF(kind_obj);
+            Py_DECREF(ok_list); Py_DECREF(payload_list); Py_DECREF(kind_list); return nullptr;
+        }
+        PyList_SET_ITEM(payload_list, i, view);
+        PyList_SET_ITEM(kind_list, i, kind_obj);
+    }
+    PyObject* tuple = PyTuple_New(3);
+    if (tuple == nullptr) { Py_DECREF(ok_list); Py_DECREF(payload_list); Py_DECREF(kind_list); return nullptr; }
+    PyTuple_SET_ITEM(tuple, 0, ok_list);
+    PyTuple_SET_ITEM(tuple, 1, payload_list);
+    PyTuple_SET_ITEM(tuple, 2, kind_list);
+    return tuple;
+}
+
 PyObject* PyFacadeBatchWriteBlockPayloads(PyObject* /*self*/, PyObject* args)
 {
     using namespace falconfs::kv;
@@ -1047,39 +1313,60 @@ PyObject* PyFacadeBatchWriteBlockPayloads(PyObject* /*self*/, PyObject* args)
     if (!req.ParseFromArray(request_buf, static_cast<int>(request_len))) {
         return WrapRpcError("facade_batch_write_block_payloads", "ParseFromString failed");
     }
-    std::vector<std::string> payloads;
     const Py_ssize_t n = PySequence_Size(payload_list);
     if (n != req.items_size()) {
         return WrapRpcError("facade_batch_write_block_payloads", "payload count mismatch");
     }
+
+    std::vector<Py_buffer> py_buffers(static_cast<size_t>(n));
+    std::vector<KVStoreWritePayloadView> payloads;
     payloads.reserve(static_cast<size_t>(n));
+    uint64_t bytes = 0;
     for (Py_ssize_t i = 0; i < n; ++i) {
+        py_buffers[static_cast<size_t>(i)].obj = nullptr;
         PyObject* item = PySequence_GetItem(payload_list, i);
-        if (item == nullptr) return nullptr;
-        char* buf = nullptr;
-        Py_ssize_t len = 0;
-        if (PyBytes_AsStringAndSize(item, &buf, &len) != 0) { Py_DECREF(item); return nullptr; }
-        payloads.emplace_back(buf, static_cast<size_t>(len));
+        if (item == nullptr) {
+            for (Py_ssize_t j = 0; j < i; ++j) {
+                if (py_buffers[static_cast<size_t>(j)].obj != nullptr) PyBuffer_Release(&py_buffers[static_cast<size_t>(j)]);
+            }
+            return nullptr;
+        }
+        if (PyObject_GetBuffer(item, &py_buffers[static_cast<size_t>(i)], PyBUF_SIMPLE) != 0) {
+            Py_DECREF(item);
+            for (Py_ssize_t j = 0; j < i; ++j) {
+                if (py_buffers[static_cast<size_t>(j)].obj != nullptr) PyBuffer_Release(&py_buffers[static_cast<size_t>(j)]);
+            }
+            return nullptr;
+        }
         Py_DECREF(item);
+        const Py_buffer& view = py_buffers[static_cast<size_t>(i)];
+        payloads.push_back({static_cast<const char*>(view.buf), static_cast<size_t>(std::max<Py_ssize_t>(0, view.len))});
+        bytes += static_cast<uint64_t>(std::max<Py_ssize_t>(0, view.len));
     }
+
     std::shared_ptr<IKVStoreFacade> facade;
     {
         std::lock_guard<std::mutex> lk(g_registry_mu);
-        if (!g_registry) return WrapRpcError("facade_batch_write_block_payloads", "registry not started");
+        if (!g_registry) {
+            for (auto& b : py_buffers) if (b.obj != nullptr) PyBuffer_Release(&b);
+            return WrapRpcError("facade_batch_write_block_payloads", "registry not started");
+        }
         facade = g_registry->Resolve(store_node_id);
     }
-    if (!facade) return WrapRpcError("facade_batch_write_block_payloads", "unknown store_node_id");
+    if (!facade) {
+        for (auto& b : py_buffers) if (b.obj != nullptr) PyBuffer_Release(&b);
+        return WrapRpcError("facade_batch_write_block_payloads", "unknown store_node_id");
+    }
     BatchWriteBlockResponse rsp;
     const bool is_local = facade->IsLocal();
-    uint64_t bytes = 0;
-    for (const auto& p : payloads) bytes += static_cast<uint64_t>(p.size());
     auto t0 = std::chrono::steady_clock::now();
     {
         Py_BEGIN_ALLOW_THREADS;
-        facade->BatchWriteBlockPayloads(req, payloads, &rsp);
+        facade->BatchWriteBlockPayloadViews(req, payloads, &rsp);
         Py_END_ALLOW_THREADS;
     }
     auto t1 = std::chrono::steady_clock::now();
+    for (auto& b : py_buffers) if (b.obj != nullptr) PyBuffer_Release(&b);
     const uint64_t elapsed_ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
     BumpFacadePerfCounters(/*is_write=*/true, is_local, elapsed_ns, bytes);
@@ -1278,7 +1565,47 @@ PyObject* PyFacadeReadFromSSDSplit(PyObject* /*self*/, PyObject* args)
            ReadFromSSDResponse* rsp) { facade->ReadFromSSD(req, rsp); });
 }
 
+
+PyObject* PyNativeMemcpyBound(PyObject* /*self*/, PyObject* args)
+{
+    Py_ssize_t block_bytes = 0;
+    int iters = 256;
+    if (!PyArg_ParseTuple(args, "n|i", &block_bytes, &iters)) return nullptr;
+    if (block_bytes <= 0 || iters <= 0) {
+        PyErr_SetString(PyExc_ValueError, "block_bytes and iters must be positive");
+        return nullptr;
+    }
+    std::vector<char> src(static_cast<size_t>(block_bytes));
+    std::vector<char> dst(static_cast<size_t>(block_bytes));
+    for (Py_ssize_t i = 0; i < block_bytes; ++i) src[static_cast<size_t>(i)] = static_cast<char>(i & 0xff);
+    const int warmup = std::min(16, iters);
+    for (int i = 0; i < warmup; ++i) std::memcpy(dst.data(), src.data(), static_cast<size_t>(block_bytes));
+    auto t0 = std::chrono::steady_clock::now();
+    {
+        Py_BEGIN_ALLOW_THREADS;
+        for (int i = 0; i < iters; ++i) {
+            std::memcpy(dst.data(), src.data(), static_cast<size_t>(block_bytes));
+        }
+        Py_END_ALLOW_THREADS;
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    const double elapsed = std::max(1e-12, std::chrono::duration<double>(t1 - t0).count());
+    const double bytes_total = static_cast<double>(block_bytes) * static_cast<double>(iters);
+    const int checksum = static_cast<unsigned char>(dst[static_cast<size_t>(block_bytes - 1)]);
+    return Py_BuildValue("{s:d,s:d,s:d,s:i}",
+                         "copy_ms_per_block", 1000.0 * elapsed / std::max(1, iters),
+                         "copy_mb_s", (bytes_total / 1.0e6) / elapsed,
+                         "wall_s", elapsed,
+                         "checksum", checksum);
+}
+
 PyMethodDef kModuleMethods[] = {
+    {"native_memcpy_bound", PyNativeMemcpyBound, METH_VARARGS,
+     "Measures native C++ memcpy throughput without BRPC or Python allocation in the timed window."},
+    {"metadata_channel_stats_reset", PyMetadataChannelStatsReset, METH_NOARGS,
+     "Clears cached metadata BRPC channels and metadata channel reuse counters."},
+    {"metadata_channel_stats", PyMetadataChannelStats, METH_NOARGS,
+     "Returns metadata BRPC channel cache size/hits/misses/evictions."},
     {"batch_lookup_with_lease", PyBatchLookupWithLease, METH_VARARGS,
      "Calls KVMetadataService.BatchLookupWithLease over BRPC.\n"
      "Args: endpoint:str, request_bytes:bytes, timeout_ms:int=30000\n"
@@ -1331,6 +1658,8 @@ PyMethodDef kModuleMethods[] = {
      "Calls facade BatchReadBlock and returns (success_flags, payloads) without protobuf response serialization."},
     {"facade_batch_read_payloads_fast", PyFacadeBatchReadPayloadsFast, METH_VARARGS,
      "Builds a BatchReadBlock request in C++ and returns (success_flags, payloads)."},
+    {"facade_batch_read_payload_views", PyFacadeBatchReadPayloadViews, METH_VARARGS,
+     "Builds a BatchReadBlock request in C++ and returns read-only memoryview payloads."},
     {"facade_batch_write_block_payloads", PyFacadeBatchWriteBlockPayloads, METH_VARARGS,
      "Calls facade BatchWriteBlock with payload attachment frames."},
     {"facade_batch_read_from_ssd", PyFacadeBatchReadFromSSD, METH_VARARGS,
@@ -1372,5 +1701,14 @@ PyMODINIT_FUNC PyInit_falconfs_kv_brpc(void)
     if (brpc::FLAGS_max_body_size < kMinBrpcMaxBody) {
         brpc::FLAGS_max_body_size = kMinBrpcMaxBody;
     }
-    return PyModule_Create(&kModuleDef);
+    if (!InitFalconKVReadBufferType()) return nullptr;
+    PyObject* module = PyModule_Create(&kModuleDef);
+    if (module == nullptr) return nullptr;
+    Py_INCREF(&FalconKVReadBufferType);
+    if (PyModule_AddObject(module, "ReadBuffer", reinterpret_cast<PyObject*>(&FalconKVReadBufferType)) != 0) {
+        Py_DECREF(&FalconKVReadBufferType);
+        Py_DECREF(module);
+        return nullptr;
+    }
+    return module;
 }

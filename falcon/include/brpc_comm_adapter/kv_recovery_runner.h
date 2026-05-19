@@ -26,6 +26,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 
 namespace falconfs::kv {
 class KVMetadataEngine;
@@ -38,6 +39,16 @@ struct KVRecoveryStats {
     int64_t bumped_dn_epoch = 0;
     int64_t recovered_rows = 0;
     int64_t reconciled_evicting = 0;
+};
+
+struct KVStoreRestartReconcileStats {
+    bool ok = false;
+    int64_t scanned_rows = 0;
+    int64_t deleted_rows = 0;
+    int64_t preserved_evicted_rows = 0;
+    int64_t validated_evicted_rows = 0;
+    int64_t invalid_deleted_rows = 0;
+    int64_t validation_failed_rows = 0;
 };
 
 class KVRecoveryRunner {
@@ -53,6 +64,10 @@ public:
     // `RegisterStoreRegion` so rows that were parked before any region existed
     // are applied to DRAM (v6.5 P1).
     KVRecoveryStats ReplayRecoverOnly();
+
+    // Reconcile durable catalog rows for a Store that restarted with a fresh
+    // store_epoch after runtime metadata has already been fenced.
+    KVStoreRestartReconcileStats ReconcileStoreRestart(int32_t store_node_id, const std::string& store_endpoint);
 
 private:
     std::shared_ptr<::falconfs::kv::KVMetadataEngine> engine_;

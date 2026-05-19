@@ -278,6 +278,30 @@ public:
         return out;
     }
 
+    StoreResultMeta ValidateEvictedPath(const std::string& block_hash,
+                                        const std::string& evicted_path) const {
+        std::shared_lock<std::shared_mutex> lock(engine_mu_);
+        if (spill_manager_ != nullptr) {
+            std::string err;
+            if (!spill_manager_->ValidateExistingFile(evicted_path, &err)) {
+                return MakeResult(false, ErrorCode::NOT_FOUND, false, err.c_str());
+            }
+            auto it = ssd_meta_.find(block_hash);
+            if (it != ssd_meta_.end() && it->second.path != evicted_path) {
+                return MakeResult(false, ErrorCode::CAS_CONFLICT, true, "ssd metadata path mismatch");
+            }
+            return MakeResult(true, ErrorCode::OK, false, "");
+        }
+        if (!ValidEvictedPathInMemory(evicted_path)) {
+            return MakeResult(false, ErrorCode::INVALID_ARGUMENT, false, "invalid evicted_path");
+        }
+        auto it = ssd_data_.find(block_hash);
+        if (it == ssd_data_.end() || it->second.path != evicted_path) {
+            return MakeResult(false, ErrorCode::NOT_FOUND, false, "ssd payload missing");
+        }
+        return MakeResult(true, ErrorCode::OK, false, "");
+    }
+
     StoreWriteResult SpillBlockToSSD(const std::string& block_hash,
                                      int64_t pool_offset,
                                      int64_t expected_version,
@@ -523,6 +547,11 @@ StoreReadResult KVStoreEngine::ReadFromSSD(const std::string& block_hash,
                                            const std::string& evicted_path,
                                            int64_t expected_version) const {
     return impl_->ReadFromSSD(block_hash, evicted_path, expected_version);
+}
+
+StoreResultMeta KVStoreEngine::ValidateEvictedPath(const std::string& block_hash,
+                                                   const std::string& evicted_path) const {
+    return impl_->ValidateEvictedPath(block_hash, evicted_path);
 }
 
 StoreWriteResult KVStoreEngine::SpillBlockToSSD(const std::string& block_hash,

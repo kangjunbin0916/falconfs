@@ -36,6 +36,8 @@ public:
                            HeartbeatResponse* resp) = 0;
     virtual void SpillBlockToSSD(const SpillBlockToSSDRequest& req,
                                  SpillBlockToSSDResponse* resp) = 0;
+    virtual void ValidateEvictedPaths(const ValidateEvictedPathsRequest& req,
+                                      ValidateEvictedPathsResponse* resp) = 0;
 };
 
 // brpc adapter: translates google::protobuf::Closure-style callbacks into
@@ -62,17 +64,25 @@ public:
                          SpillBlockToSSDResponse* response,
                          ::google::protobuf::Closure* done) override;
 
+    void ValidateEvictedPaths(::google::protobuf::RpcController* controller,
+                              const ValidateEvictedPathsRequest* request,
+                              ValidateEvictedPathsResponse* response,
+                              ::google::protobuf::Closure* done) override;
+
 private:
     std::shared_ptr<KVStoreAdminBrpcServiceImplBase> impl_;
 };
 
 /** DN bgworker implementation: RegisterStoreRegion + Heartbeat; SpillBlockToSSD
  * returns INTERNAL_ERROR ("not hosted on this node"). Optional
- * `after_region_registered` runs after each successful RegisterStoreRegion
- * (used to replay parked recovery rows once geometry exists). */
+ * `after_region_registered` runs after each new successful RegisterStoreRegion
+ * (used to replay parked recovery rows once geometry exists).
+ * `after_store_epoch_bump` runs after runtime fencing for same-geometry Store
+ * restart so the DN can reconcile durable catalog rows. */
 std::shared_ptr<KVStoreAdminBrpcServiceImplBase> CreateKVStoreAdminBrpcServiceImplForDn(
     std::shared_ptr<KVMetadataEngine> engine,
-    std::function<void()> after_region_registered = nullptr);
+    std::function<void()> after_region_registered = nullptr,
+    std::function<void(int32_t, const std::string&)> after_store_epoch_bump = nullptr);
 
 /** falcon_kv_store daemon: SpillBlockToSSD only; other RPCs return INTERNAL_ERROR. */
 std::shared_ptr<KVStoreAdminBrpcServiceImplBase> CreateKVStoreAdminBrpcServiceImplForStore(

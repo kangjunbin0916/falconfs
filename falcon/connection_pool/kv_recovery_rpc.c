@@ -69,6 +69,53 @@ Datum falcon_kv_metadata_recovery_call(PG_FUNCTION_ARGS)
             SET_VARSIZE(reply, VARHDRSZ + actual_size);
             break;
         }
+        case KV_CATALOG_METHOD_RECONCILE_STORE_RESTART: {
+            if (req_size < sizeof(KVCatalogStoreRestartRequest))
+                FALCON_ELOG_ERROR(ARGUMENT_ERROR,
+                                  "kv recovery store restart: payload too small");
+            KVCatalogStoreRestartRequest req;
+            memcpy(&req, req_buf, sizeof(req));
+            uint64_t resp_size = sizeof(KVCatalogStoreRestartResponse);
+            reply = (bytea *) palloc0(VARHDRSZ + resp_size);
+            SET_VARSIZE(reply, VARHDRSZ + resp_size);
+            KVCatalogStoreRestartResponse resp;
+            FalconKVBlockReconcileStoreRestart(req.store_node_id, req.now_ms, &resp);
+            memcpy(VARDATA(reply), &resp, sizeof(resp));
+            break;
+        }
+        case KV_CATALOG_METHOD_SCAN_STORE_EVICTED: {
+            if (req_size < sizeof(KVCatalogStoreEvictedScanRequest))
+                FALCON_ELOG_ERROR(ARGUMENT_ERROR,
+                                  "kv recovery scan store evicted: payload too small");
+            KVCatalogStoreEvictedScanRequest req;
+            memcpy(&req, req_buf, sizeof(req));
+            uint32_t max_rows = req.max_rows == 0 ? 1024 : req.max_rows;
+            if (max_rows > KV_RECOVERY_MAX_ROWS) max_rows = KV_RECOVERY_MAX_ROWS;
+            uint64_t max_size = sizeof(uint32_t) +
+                                (uint64_t) max_rows * sizeof(KVCatalogStoreEvictedRow);
+            reply = (bytea *) palloc0(VARHDRSZ + max_size);
+            char *resp_buf = (char *) VARDATA(reply);
+            KVCatalogStoreEvictedRow *rows =
+                (KVCatalogStoreEvictedRow *)(resp_buf + sizeof(uint32_t));
+            uint32_t produced = FalconKVBlockScanStoreEvicted(req.store_node_id, rows, max_rows);
+            memcpy(resp_buf, &produced, sizeof(uint32_t));
+            uint64_t actual_size = sizeof(uint32_t) +
+                                   (uint64_t) produced * sizeof(KVCatalogStoreEvictedRow);
+            SET_VARSIZE(reply, VARHDRSZ + actual_size);
+            break;
+        }
+        case KV_CATALOG_METHOD_DELETE_STORE_EVICTED_INVALID: {
+            if (req_size < sizeof(uint32_t))
+                FALCON_ELOG_ERROR(ARGUMENT_ERROR,
+                                  "kv recovery delete invalid evicted: payload too small");
+            uint32_t count = 0;
+            memcpy(&count, req_buf, sizeof(uint32_t));
+            uint64_t resp_size = KVCatalogResponseSize(method, count);
+            reply = (bytea *) palloc0(VARHDRSZ + resp_size);
+            SET_VARSIZE(reply, VARHDRSZ + resp_size);
+            FalconKVBlockDeleteInvalidEvicted(req_buf, req_size, VARDATA(reply), resp_size);
+            break;
+        }
         case KV_CATALOG_METHOD_LOAD_DN_EPOCH:
         case KV_CATALOG_METHOD_BUMP_DN_EPOCH: {
             if (req_size < sizeof(KVCatalogDnEpochRequest))

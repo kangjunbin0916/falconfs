@@ -87,6 +87,32 @@ bool SSDSpillManager::ValidatePath(const std::string& evicted_path) const {
     return true;
 }
 
+
+bool SSDSpillManager::ValidateExistingFile(const std::string& evicted_path,
+                                           std::string* error_message) const {
+    auto set_err = [&](const std::string& msg) {
+        if (error_message != nullptr) *error_message = msg;
+        return false;
+    };
+    if (!ValidatePath(evicted_path)) {
+        return set_err("invalid evicted_path");
+    }
+    struct stat st;
+    if (::stat(evicted_path.c_str(), &st) != 0) {
+        return set_err(std::string("stat failed: ") + std::strerror(errno));
+    }
+    if (!S_ISREG(st.st_mode)) {
+        return set_err("evicted_path is not a regular file");
+    }
+    int fd = ::open(evicted_path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        return set_err(std::string("open failed: ") + std::strerror(errno));
+    }
+    ::close(fd);
+    if (error_message != nullptr) error_message->clear();
+    return true;
+}
+
 SSDSpillResult SSDSpillManager::Spill(int32_t store_node_id,
                                       const std::string& block_hash,
                                       int64_t version,

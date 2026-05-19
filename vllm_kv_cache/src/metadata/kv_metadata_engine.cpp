@@ -200,6 +200,19 @@ struct ShardHashIndex {
         std::forward<Fn>(fn)(ref);
     }
 
+    void EraseStore(int32_t store_node_id) {
+        for (auto& s : stripes) {
+            std::unique_lock<std::shared_mutex> lk(s.mu);
+            for (auto it = s.map.begin(); it != s.map.end();) {
+                if (it->second.store_node_id == store_node_id) {
+                    it = s.map.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+
     void Clear() {
         for (auto& s : stripes) {
             std::unique_lock<std::shared_mutex> lk(s.mu);
@@ -289,6 +302,12 @@ public:
     bool HasRegion(int32_t store_node_id) const {
         std::shared_lock<std::shared_mutex> lk(regions_mu_);
         return regions_.find(store_node_id) != regions_.end();
+    }
+
+    int64_t RegionStoreEpoch(int32_t store_node_id) const {
+        std::shared_lock<std::shared_mutex> lk(regions_mu_);
+        auto it = regions_.find(store_node_id);
+        return it == regions_.end() ? 0 : it->second->store_epoch;
     }
 
     // ── Recovery helpers ─────────────────────────────────────────────────────
@@ -396,6 +415,11 @@ public:
         rows.push_back(PendingRestoreRow{block_hash, status, location, version, now_ms});
     }
 
+    void DropPendingRestoresForStore(int32_t store_node_id) {
+        std::lock_guard<std::mutex> lk(pending_restore_mu_);
+        pending_restores_by_store_.erase(store_node_id);
+    }
+
     void ApplyPendingRestoresForStore(int32_t store_node_id) {
         std::vector<PendingRestoreRow> rows;
         {
@@ -410,6 +434,31 @@ public:
                                      row.version, row.now_ms,
                                      /*park_if_region_missing=*/false);
         }
+    }
+
+    static void ResetRegionRuntime(KVRegion& region) {
+        for (auto& word : region.bitmap_words) {
+            word.store(0, std::memory_order_release);
+        }
+        for (int64_t idx = 0; idx < region.total_blocks; ++idx) {
+            region.meta[static_cast<std::size_t>(idx)] = DramMetaSlot{};
+        }
+        region.free_blocks.store(region.total_blocks, std::memory_order_relaxed);
+        region.alloc_hint.store(0, std::memory_order_relaxed);
+        region.clock_hand.store(0, std::memory_order_relaxed);
+    }
+
+    void ClearRuntimeForStoreRestart(int32_t store_node_id) {
+        // Match lookup/drop lock order: shard stripes first, then regions_mu_.
+        shard_index_.EraseStore(store_node_id);
+        {
+            std::unique_lock<std::shared_mutex> lk(regions_mu_);
+            auto it = regions_.find(store_node_id);
+            if (it != regions_.end()) {
+                ResetRegionRuntime(*it->second);
+            }
+        }
+        DropPendingRestoresForStore(store_node_id);
     }
 
     int64_t BumpDnEpoch() {
@@ -1593,23 +1642,57 @@ private:
     // ── RegisterStoreRegion (internal) ───────────────────────────────────────
 
     EngineResultMeta RegisterStoreRegionInternal(const EngineStoreRegion& region) {
-        std::unique_lock<std::shared_mutex> lk(regions_mu_);
-        auto it = regions_.find(region.store_node_id);
-        if (it != regions_.end()) {
-            KVRegion& existing = *it->second;
-            if (existing.base_offset == region.base_offset &&
-                existing.region_bytes == region.region_bytes &&
-                existing.block_size == region.block_size) {
-                // Same geometry: update epoch in place. Replacing the KVRegion would
-                // destroy meta[] while shard_index_ still holds SlotRefs into the old
-                // array (e.g. after RunStartupRecovery), corrupting the heap.
-                existing.store_epoch = region.store_epoch;
+        bool clear_runtime_for_restart = false;
+        {
+            std::unique_lock<std::shared_mutex> lk(regions_mu_);
+            auto it = regions_.find(region.store_node_id);
+            if (it != regions_.end()) {
+                KVRegion& existing = *it->second;
+                if (existing.base_offset == region.base_offset &&
+                    existing.region_bytes == region.region_bytes &&
+                    existing.block_size == region.block_size) {
+                    // Same geometry: keep the KVRegion allocation stable because
+                    // shard_index_ stores SlotRefs into meta[]. If the Store epoch
+                    // advances, the Store's DRAM contents are gone; quarantine the
+                    // region, clear stale runtime slots outside regions_mu_, then
+                    // publish the new epoch.
+                    if (region.store_epoch < existing.store_epoch) {
+                        return ToEngineResult(ItemResult::Err(ErrorCode::STALE_EPOCH, true,
+                                                              "stale store epoch"));
+                    }
+                    clear_runtime_for_restart = region.store_epoch > existing.store_epoch;
+                    if (clear_runtime_for_restart) {
+                        existing.state = EngineRegionState::QUARANTINED;
+                    } else {
+                        existing.store_epoch = region.store_epoch;
+                        existing.state = EngineRegionState::HEALTHY;
+                        return ToEngineResult(ItemResult::Ok());
+                    }
+                } else {
+                    regions_[region.store_node_id] = std::make_unique<KVRegion>(
+                        region.store_node_id, dn_id_, region.base_offset,
+                        region.region_bytes, block_size_, region.store_epoch);
+                    return ToEngineResult(ItemResult::Ok());
+                }
+            } else {
+                regions_[region.store_node_id] = std::make_unique<KVRegion>(
+                    region.store_node_id, dn_id_, region.base_offset,
+                    region.region_bytes, block_size_, region.store_epoch);
                 return ToEngineResult(ItemResult::Ok());
             }
         }
-        regions_[region.store_node_id] = std::make_unique<KVRegion>(
-            region.store_node_id, dn_id_, region.base_offset,
-            region.region_bytes, block_size_, region.store_epoch);
+
+        if (clear_runtime_for_restart) {
+            ClearRuntimeForStoreRestart(region.store_node_id);
+            std::unique_lock<std::shared_mutex> lk(regions_mu_);
+            auto it = regions_.find(region.store_node_id);
+            if (it == regions_.end()) {
+                return ToEngineResult(ItemResult::Err(ErrorCode::INTERNAL_ERROR, true,
+                                                      "region disappeared during restart"));
+            }
+            it->second->store_epoch = region.store_epoch;
+            it->second->state = EngineRegionState::HEALTHY;
+        }
         return ToEngineResult(ItemResult::Ok());
     }
 
@@ -1679,6 +1762,9 @@ EngineResultMeta KVMetadataEngine::SetRegionState(int32_t sid, EngineRegionState
 }
 bool KVMetadataEngine::HasRegion(int32_t sid) const {
     return impl_->HasRegion(sid);
+}
+int64_t KVMetadataEngine::RegionStoreEpoch(int32_t sid) const {
+    return impl_->RegionStoreEpoch(sid);
 }
 EngineResultMeta KVMetadataEngine::MarkBitmapOccupied(int32_t sid, int64_t offset) {
     return impl_->MarkBitmapOccupied(sid, offset);

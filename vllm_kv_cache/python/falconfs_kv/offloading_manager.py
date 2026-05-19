@@ -69,7 +69,7 @@ def _env_parallelism_max(env_name: str, default: int) -> int:
 
 @dataclass
 class LoadStoreSpec:
-    data: Dict[str, bytes] = field(default_factory=dict)
+    data: Dict[str, Any] = field(default_factory=dict)
     specs: List[dict] = field(default_factory=list)
 
 
@@ -218,12 +218,35 @@ class FalconFSOffloadingManager:
         self._write_batch_max_blocks = _env_parallelism_max(
             "FALCON_KV_CLIENT_BATCH_WRITE_MAX_BLOCKS", 1
         )
+        self._write_batch_local_max_blocks = _env_parallelism_max(
+            "FALCON_KV_CLIENT_BATCH_WRITE_LOCAL_MAX_BLOCKS", self._write_batch_max_blocks
+        )
+        self._write_batch_remote_max_blocks = _env_parallelism_max(
+            "FALCON_KV_CLIENT_BATCH_WRITE_REMOTE_MAX_BLOCKS", self._write_batch_max_blocks
+        )
+        self._adaptive_batching_rollbacks = 0
         self._read_batch_target_bytes = _env_int(
             "FALCON_KV_CLIENT_BATCH_READ_TARGET_BYTES", 8 * 1024 * 1024
         )
         self._write_batch_target_bytes = _env_int(
             "FALCON_KV_CLIENT_BATCH_WRITE_TARGET_BYTES", 4 * 1024 * 1024
         )
+        self._adaptive_batching_cooldown = _env_int("FALCON_KV_CLIENT_ADAPTIVE_COOLDOWN_WINDOWS", 1)
+        self._adaptive_batching_max_inflight_bytes = _env_int(
+            "FALCON_KV_CLIENT_ADAPTIVE_MAX_INFLIGHT_BYTES",
+            max(1, int(self._data_parallelism_max)) * max(1, int(self.block_size)) * 8,
+        )
+        self._adaptive_batching_state = self._init_adaptive_batching_state()
+        self._zero_copy_reads_enabled = _env_bool("FALCON_KV_CLIENT_ZERO_COPY_READS", False)
+        self._zero_copy_stats = {
+            "enabled": bool(self._zero_copy_reads_enabled),
+            "zero_copy_blocks": 0,
+            "bytes_materialized_blocks": 0,
+            "local_shm_views": 0,
+            "remote_attachment_views": 0,
+            "fallback_reasons": {},
+        }
+        self._zero_copy_lock = threading.Lock()
         self._meta_stage_pool = ThreadPoolExecutor(
             max_workers=self._meta_parallelism_max, thread_name_prefix="kv-om-meta"
         )
@@ -299,15 +322,31 @@ class FalconFSOffloadingManager:
             acc[f"{prefix}_{label}_bytes"] = float(acc.get(f"{prefix}_{label}_bytes", 0.0)) + float(byte_count)
             acc[f"n_{prefix}s_{label}"] = float(acc.get(f"n_{prefix}s_{label}", 0.0)) + float(logical_ops)
             acc[f"{prefix}_{label}_rpcs"] = float(acc.get(f"{prefix}_{label}_rpcs", 0.0)) + float(rpc_ops)
+            if rpc_ops > 0:
+                samples = acc.setdefault(f"{prefix}_{label}_latency_ms", [])
+                samples.append(1000.0 * elapsed_s / float(rpc_ops))
 
     def perf_breakdown(self) -> Dict[str, Any]:
         """Last high-level latency split (``FALCON_KV_OM_PERF=1`` cluster mode only).
 
         Keys may include ``prepare_store``, ``complete_store``, ``prepare_load``,
         ``complete_load`` with wall-clock seconds and summed BRPC sub-phases.
+        Stable observability sections are also included so benchmark JSON can be
+        compared across runs: metadata channel cache, promote-on-read, and the
+        active adaptive/static batching policy.
         """
         with self._om_perf_lock:
-            return dict(self._om_perf_last)
+            out = dict(self._om_perf_last)
+        out["adaptive_batching"] = self._adaptive_batching_snapshot()
+        if self._promote_worker is not None:
+            out["promote_on_read"] = self._promote_worker.stats()
+        out["zero_copy_read"] = self._zero_copy_snapshot()
+        if falconfs_kv_brpc is not None:
+            try:
+                out["metadata_channel_cache"] = dict(falconfs_kv_brpc.metadata_channel_stats())
+            except Exception:
+                pass
+        return out
 
     def set_om_perf_enabled(self, enabled: bool) -> None:
         """Turn cluster-side BRPC latency counters on or off (e.g. two-phase E2E).
@@ -352,6 +391,10 @@ class FalconFSOffloadingManager:
             "n_data_reads_unknown": 0.0,
             "data_read_unknown_rpcs": 0.0,
             "read_batching_enabled": 0.0,
+            "zero_copy_blocks": 0.0,
+            "bytes_materialized_blocks": 0.0,
+            "local_shm_views": 0.0,
+            "remote_attachment_views": 0.0,
         }
         try:
             return self._batch_load_impl(keys)
@@ -403,7 +446,12 @@ class FalconFSOffloadingManager:
                     "adaptive_batching_enabled": bool(acc.get("adaptive_batching_enabled", 0.0)),
                     "waves": int(acc.get("waves", 0.0)),
                     "data_parallelism_max": float(self._data_parallelism_max),
+                    "zero_copy_blocks": int(acc.get("zero_copy_blocks", 0.0)),
+                    "bytes_materialized_blocks": int(acc.get("bytes_materialized_blocks", 0.0)),
+                    "local_shm_views": int(acc.get("local_shm_views", 0.0)),
+                    "remote_attachment_views": int(acc.get("remote_attachment_views", 0.0)),
                 }
+            self._adaptive_observe_from_acc(acc, is_write=False)
             self._om_perf_ld_acc = None
             self._om_perf_ld_lookup_dn = {}
 
@@ -786,29 +834,233 @@ class FalconFSOffloadingManager:
         return merged
 
 
+    def _configured_batch_for_path(self, path: str) -> int:
+        return int({
+            "local_read": getattr(self, "_read_batch_local_max_blocks", 1),
+            "remote_read": getattr(self, "_read_batch_remote_max_blocks", 1),
+            "local_write": getattr(self, "_write_batch_local_max_blocks", 1),
+            "remote_write": getattr(self, "_write_batch_remote_max_blocks", 1),
+        }.get(path, 1))
+
+    def _path_is_write(self, path: str) -> bool:
+        return path.endswith("write")
+
+    def _target_bound_for_path(self, path: str, configured: int) -> int:
+        is_write = self._path_is_write(path)
+        target = self._write_batch_target_bytes if is_write else self._read_batch_target_bytes
+        by_bytes = max(1, int(target) // max(1, int(self.block_size)))
+        by_inflight = max(1, int(self._adaptive_batching_max_inflight_bytes) // max(1, int(self.block_size)) // max(1, int(self._data_parallelism_max)))
+        return max(1, min(int(configured), int(by_bytes), int(by_inflight), 4096))
+
+    def _init_adaptive_batching_state(self) -> Dict[str, Dict[str, Any]]:
+        state: Dict[str, Dict[str, Any]] = {}
+        for path in ("local_read", "remote_read", "local_write", "remote_write"):
+            configured = self._configured_batch_for_path(path)
+            selected = self._target_bound_for_path(path, configured)
+            state[path] = {
+                "configured": configured,
+                "selected": selected,
+                "previous": selected,
+                "last_good": selected,
+                "last_good_mb_s": 0.0,
+                "last_good_p95_ms": 0.0,
+                "pending_probe": False,
+                "cooldown": 0,
+                "rollback_count": 0,
+                "last_decision_reason": "static_defaults_active" if not self._adaptive_batching_enabled else "initial_policy",
+                "last_observed_mb_s": 0.0,
+                "last_p50_ms": 0.0,
+                "last_p95_ms": 0.0,
+                "last_error_rate": 0.0,
+                "throughput_before": 0.0,
+                "throughput_after": 0.0,
+            }
+        return state
+
     def _effective_batch_max_blocks(self, *, is_write: bool) -> int:
+        path = "local_write" if is_write else "local_read"
         configured = self._write_batch_max_blocks if is_write else self._read_batch_max_blocks
-        return self._effective_batch_max_from_configured(configured, is_write=is_write)
+        if self._adaptive_batching_enabled:
+            return self._adaptive_selected_for_path(path, configured)
+        return max(1, int(configured))
 
     def _effective_batch_max_from_configured(self, configured: int, *, is_write: bool) -> int:
-        if configured <= 1 or not self._adaptive_batching_enabled:
+        if not self._adaptive_batching_enabled:
             return max(1, int(configured))
-        target = self._write_batch_target_bytes if is_write else self._read_batch_target_bytes
-        by_bytes = max(1, target // max(1, int(self.block_size)))
-        # Adaptive mode is deliberately conservative: cap by target bytes while
-        # preserving the user's configured hard maximum. A later feedback loop can
-        # tune target bytes from measured RPC latency/throughput.
-        return max(1, min(int(configured), int(by_bytes)))
+        path = "local_write" if is_write else "local_read"
+        return self._adaptive_selected_for_path(path, configured)
+
+    def _adaptive_selected_for_path(self, path: str, configured: int) -> int:
+        if not self._adaptive_batching_enabled:
+            return max(1, int(configured))
+        st = self._adaptive_batching_state.get(path)
+        bound = self._target_bound_for_path(path, configured)
+        if st is None:
+            return bound
+        return max(1, min(int(st.get("selected", bound)), bound))
 
     def _effective_read_batch_max_for_store(self, store_id: int) -> int:
         locality = self._store_is_local(store_id)
         if locality is True:
-            configured = self._read_batch_local_max_blocks
-        elif locality is False:
-            configured = self._read_batch_remote_max_blocks
-        else:
-            configured = self._read_batch_max_blocks
-        return self._effective_batch_max_from_configured(configured, is_write=False)
+            return self._adaptive_selected_for_path("local_read", self._read_batch_local_max_blocks)
+        if locality is False:
+            return self._adaptive_selected_for_path("remote_read", self._read_batch_remote_max_blocks)
+        return self._effective_batch_max_blocks(is_write=False)
+
+    def _effective_write_batch_max_for_store(self, store_id: int) -> int:
+        locality = self._store_is_local(store_id)
+        if locality is True:
+            return self._adaptive_selected_for_path("local_write", self._write_batch_local_max_blocks)
+        if locality is False:
+            return self._adaptive_selected_for_path("remote_write", self._write_batch_remote_max_blocks)
+        return self._effective_batch_max_blocks(is_write=True)
+
+    def _percentile(self, values: Any, pct: float) -> float:
+        vals = sorted(float(v) for v in (values or []) if v is not None)
+        if not vals:
+            return 0.0
+        idx = min(len(vals) - 1, max(0, int(round((len(vals) - 1) * pct))))
+        return vals[idx]
+
+    def _adaptive_observe_from_acc(self, acc: Dict[str, Any], *, is_write: bool) -> None:
+        if not self._adaptive_batching_enabled:
+            return
+        prefix = "data_write" if is_write else "data_read"
+        suffix = "write" if is_write else "read"
+        for label in ("local", "remote"):
+            bytes_v = float(acc.get(f"{prefix}_{label}_bytes", 0.0))
+            seconds = float(acc.get(f"{prefix}_{label}_s", 0.0))
+            if bytes_v <= 0 or seconds <= 0:
+                continue
+            samples = acc.get(f"{prefix}_{label}_latency_ms", [])
+            self._adaptive_observe_path(
+                f"{label}_{suffix}",
+                mb_s=(bytes_v / 1.0e6) / seconds,
+                p50_ms=self._percentile(samples, 0.50),
+                p95_ms=self._percentile(samples, 0.95),
+                error_rate=0.0,
+            )
+
+    def _adaptive_observe_path(self, path: str, *, mb_s: float, p50_ms: float, p95_ms: float, error_rate: float) -> None:
+        st = self._adaptive_batching_state.get(path)
+        if st is None:
+            return
+        st["last_observed_mb_s"] = float(mb_s)
+        st["last_p50_ms"] = float(p50_ms)
+        st["last_p95_ms"] = float(p95_ms)
+        st["last_error_rate"] = float(error_rate)
+        configured = self._configured_batch_for_path(path)
+        max_batch = self._target_bound_for_path(path, configured)
+        selected = max(1, min(int(st.get("selected", 1)), max_batch))
+        st["previous"] = selected
+        if st.get("cooldown", 0) > 0:
+            st["cooldown"] = int(st.get("cooldown", 0)) - 1
+            st["last_decision_reason"] = "cooldown"
+            return
+        last_good_mb = float(st.get("last_good_mb_s", 0.0))
+        last_good_p95 = float(st.get("last_good_p95_ms", 0.0))
+        if last_good_mb <= 0.0:
+            st["last_good_mb_s"] = float(mb_s)
+            st["last_good_p95_ms"] = float(p95_ms)
+            st["last_good"] = selected
+            if selected < max_batch:
+                st["selected"] = selected + 1
+                st["pending_probe"] = True
+                st["last_decision_reason"] = "initial_probe_up"
+            else:
+                st["last_decision_reason"] = "initial_at_max"
+            return
+        regressed = error_rate > 0.0 or mb_s < (last_good_mb * 0.97) or (last_good_p95 > 0 and p95_ms > last_good_p95 * 1.20)
+        if st.get("pending_probe") and regressed:
+            st["selected"] = int(st.get("last_good", selected))
+            st["rollback_count"] = int(st.get("rollback_count", 0)) + 1
+            self._adaptive_batching_rollbacks += 1
+            st["pending_probe"] = False
+            st["cooldown"] = int(self._adaptive_batching_cooldown)
+            st["throughput_before"] = last_good_mb
+            st["throughput_after"] = float(mb_s)
+            st["last_decision_reason"] = "rollback_on_regression"
+            return
+        if mb_s >= last_good_mb and (last_good_p95 <= 0 or p95_ms <= last_good_p95 * 1.10):
+            st["last_good_mb_s"] = float(mb_s)
+            st["last_good_p95_ms"] = float(p95_ms)
+            st["last_good"] = selected
+            st["pending_probe"] = False
+            st["throughput_before"] = last_good_mb
+            st["throughput_after"] = float(mb_s)
+            if selected < max_batch:
+                st["selected"] = selected + 1
+                st["pending_probe"] = True
+                st["last_decision_reason"] = "accepted_probe_then_probe_up"
+            else:
+                st["last_decision_reason"] = "accepted_at_max"
+            return
+        if selected > 1 and p95_ms > last_good_p95 * 1.10:
+            st["selected"] = max(1, selected - 1)
+            st["pending_probe"] = True
+            st["last_decision_reason"] = "probe_down_on_latency"
+            return
+        st["last_decision_reason"] = "kept_last_good"
+
+    def _adaptive_batching_snapshot(self) -> Dict[str, Any]:
+        enabled = bool(getattr(self, "_adaptive_batching_enabled", False))
+        state = getattr(self, "_adaptive_batching_state", {})
+        selected = {path: int(st.get("selected", 1)) for path, st in state.items()}
+        controller = {}
+        for path, st in state.items():
+            controller[path] = {
+                "selected": int(st.get("selected", 1)),
+                "previous": int(st.get("previous", st.get("selected", 1))),
+                "configured": int(st.get("configured", self._configured_batch_for_path(path))),
+                "rollback_count": int(st.get("rollback_count", 0)),
+                "last_decision_reason": str(st.get("last_decision_reason", "static_defaults_active")),
+                "p50_ms": float(st.get("last_p50_ms", 0.0)),
+                "p95_ms": float(st.get("last_p95_ms", 0.0)),
+                "error_rate": float(st.get("last_error_rate", 0.0)),
+                "throughput_before_mb_s": float(st.get("throughput_before", 0.0)),
+                "throughput_after_mb_s": float(st.get("throughput_after", st.get("last_observed_mb_s", 0.0))),
+                "last_observed_mb_s": float(st.get("last_observed_mb_s", 0.0)),
+            }
+        return {
+            "enabled": enabled,
+            "selected_batch_size": {
+                "local_read": int(selected.get("local_read", self._read_batch_local_max_blocks if not enabled else 1)),
+                "remote_read": int(selected.get("remote_read", self._read_batch_remote_max_blocks if not enabled else 1)),
+                "local_write": int(selected.get("local_write", self._write_batch_local_max_blocks if not enabled else 1)),
+                "remote_write": int(selected.get("remote_write", self._write_batch_remote_max_blocks if not enabled else 1)),
+            },
+            "configured_batch_size": {
+                "read": int(getattr(self, "_read_batch_max_blocks", 1)),
+                "read_local": int(getattr(self, "_read_batch_local_max_blocks", 1)),
+                "read_remote": int(getattr(self, "_read_batch_remote_max_blocks", 1)),
+                "write": int(getattr(self, "_write_batch_max_blocks", 1)),
+                "write_local": int(getattr(self, "_write_batch_local_max_blocks", 1)),
+                "write_remote": int(getattr(self, "_write_batch_remote_max_blocks", 1)),
+            },
+            "target_bytes": {"read": int(self._read_batch_target_bytes), "write": int(self._write_batch_target_bytes)},
+            "cpu_count": int(os.cpu_count() or 1),
+            "data_parallelism": int(getattr(self, "_data_parallelism_max", 1)),
+            "max_inflight_bytes": int(getattr(self, "_adaptive_batching_max_inflight_bytes", 0)),
+            "block_size": int(self.block_size),
+            "rollback_count": int(getattr(self, "_adaptive_batching_rollbacks", 0)),
+            "last_decision_reason": ";".join(sorted({str(v.get("last_decision_reason", "")) for v in state.values()})) if enabled else "static_defaults_active",
+            "controller": controller,
+        }
+
+    def _zero_copy_bump(self, key: str, count: int = 1, reason: str = "") -> None:
+        with self._zero_copy_lock:
+            if key == "fallback":
+                reasons = self._zero_copy_stats.setdefault("fallback_reasons", {})
+                reasons[reason or "unknown"] = int(reasons.get(reason or "unknown", 0)) + int(count)
+            else:
+                self._zero_copy_stats[key] = int(self._zero_copy_stats.get(key, 0)) + int(count)
+
+    def _zero_copy_snapshot(self) -> Dict[str, Any]:
+        with self._zero_copy_lock:
+            out = dict(self._zero_copy_stats)
+            out["fallback_reasons"] = dict(self._zero_copy_stats.get("fallback_reasons", {}))
+        out["enabled"] = bool(getattr(self, "_zero_copy_reads_enabled", False))
+        return out
 
     def _store_io_wave_chunk_size(self, *, is_write: bool = True, batch_max: int = 1) -> int:
         """CPU-aware logical blocks per Store I/O wave.
@@ -900,13 +1152,23 @@ class FalconFSOffloadingManager:
             return successful
 
         raw_batch_max = self._effective_batch_max_blocks(is_write=True)
+        local_batch_max = self._effective_batch_max_from_configured(
+            self._write_batch_local_max_blocks, is_write=True
+        )
+        remote_batch_max = self._effective_batch_max_from_configured(
+            self._write_batch_remote_max_blocks, is_write=True
+        )
         if not getattr(self, "_write_grouping_enabled", True):
             raw_batch_max = 1
-        step = self._store_io_wave_chunk_size(is_write=True, batch_max=raw_batch_max)
+            local_batch_max = 1
+            remote_batch_max = 1
+        step = self._store_io_wave_chunk_size(is_write=True, batch_max=max(raw_batch_max, local_batch_max, remote_batch_max))
         if acc is not None:
             acc["wave_chunk_size"] = float(step)
-            acc["write_batching_enabled"] = 1.0 if raw_batch_max > 1 else 0.0
+            acc["write_batching_enabled"] = 1.0 if max(raw_batch_max, local_batch_max, remote_batch_max) > 1 else 0.0
             acc["write_batch_max_blocks"] = float(raw_batch_max)
+            acc["write_batch_local_max_blocks"] = float(local_batch_max)
+            acc["write_batch_remote_max_blocks"] = float(remote_batch_max)
             acc["adaptive_batching_enabled"] = 1.0 if getattr(self, "_adaptive_batching_enabled", False) else 0.0
         waves = 0
         for off in range(0, len(work), step):
@@ -929,8 +1191,13 @@ class FalconFSOffloadingManager:
                     grouped.setdefault((loc.dn_id, loc.store_id), []).append(k)
             futs = {}
             for (dn_id, store_id), group_keys in grouped.items():
-                for group_off in range(0, len(group_keys), raw_batch_max):
-                    part = group_keys[group_off : group_off + raw_batch_max]
+                group_batch_max = (
+                    self._effective_write_batch_max_for_store(store_id)
+                    if getattr(self, "_write_grouping_enabled", True)
+                    else 1
+                )
+                for group_off in range(0, len(group_keys), group_batch_max):
+                    part = group_keys[group_off : group_off + group_batch_max]
                     futs[self._data_stage_pool.submit(
                         self._complete_store_write_key_group, dn_id, store_id, part, data, batch_id
                     )] = None
@@ -994,6 +1261,8 @@ class FalconFSOffloadingManager:
                     "data_write_unknown_rpcs": int(acc.get("data_write_unknown_rpcs", 0.0)),
                     "write_batching_enabled": bool(acc.get("write_batching_enabled", 0.0)),
                     "write_batch_max_blocks": int(acc.get("write_batch_max_blocks", getattr(self, "_write_batch_max_blocks", 1))),
+                    "write_batch_local_max_blocks": int(acc.get("write_batch_local_max_blocks", getattr(self, "_write_batch_local_max_blocks", getattr(self, "_write_batch_max_blocks", 1)))),
+                    "write_batch_remote_max_blocks": int(acc.get("write_batch_remote_max_blocks", getattr(self, "_write_batch_remote_max_blocks", getattr(self, "_write_batch_max_blocks", 1)))),
                     "adaptive_batching_enabled": bool(acc.get("adaptive_batching_enabled", 0.0)),
                     "meta_update_status_s": float(acc.get("meta_update_status_s", 0.0)),
                     "meta_update_status_by_dn_s": dict(acc.get("meta_update_status_by_dn_s", {})),
@@ -1033,6 +1302,7 @@ class FalconFSOffloadingManager:
                     "wave_chunk_size": float(acc.get("wave_chunk_size", 0.0)),
                     "data_parallelism_max": float(self._data_parallelism_max),
                 }
+            self._adaptive_observe_from_acc(acc, is_write=True)
             self._om_perf_cs_acc = None
 
     def _free_allocated_for_keys(self, keys: List[str]) -> None:
@@ -1257,14 +1527,33 @@ class FalconFSOffloadingManager:
             return {}
         acc_ld = self._om_perf_ld_acc
         t0 = time.perf_counter() if acc_ld is not None else 0.0
-        if hasattr(cluster.store, "batch_read_payloads_fast"):
+        view_kinds: List[str] = []
+        use_zero_copy = bool(
+            getattr(self, "_zero_copy_reads_enabled", False)
+            and hasattr(cluster.store, "batch_read_payload_views")
+        )
+        if use_zero_copy:
+            try:
+                ok_flags, payloads, view_kinds = cluster.store.batch_read_payload_views(
+                    store_id, pool_offsets, store_epochs, block_hashes, self.block_size
+                )
+            except Exception:
+                self._zero_copy_bump("fallback", len(ordered_keys), "view_api_failed")
+                use_zero_copy = False
+        if not use_zero_copy and hasattr(cluster.store, "batch_read_payloads_fast"):
             ok_flags, payloads = cluster.store.batch_read_payloads_fast(
                 store_id, pool_offsets, store_epochs, block_hashes, self.block_size
             )
-        else:
+            view_kinds = ["bytes_fallback"] * len(payloads)
+            if getattr(self, "_zero_copy_reads_enabled", False):
+                self._zero_copy_bump("fallback", len(payloads), "view_api_unavailable")
+        elif not use_zero_copy:
             results = cluster.store.batch_read_blocks(store_id, blocks)
             ok_flags = [result.success for result, _ in results]
             payloads = [payload if result.success else b"" for result, payload in results]
+            view_kinds = ["bytes_fallback"] * len(payloads)
+            if getattr(self, "_zero_copy_reads_enabled", False):
+                self._zero_copy_bump("fallback", len(payloads), "batch_fast_unavailable")
         elapsed = time.perf_counter() - t0 if acc_ld is not None else 0.0
         if len(ok_flags) != len(ordered_keys) or len(payloads) != len(ordered_keys):
             raise RuntimeError(
@@ -1277,7 +1566,25 @@ class FalconFSOffloadingManager:
                 raise RuntimeError(f"Failed to read {key}: {ErrorCode.INTERNAL_ERROR}")
             out[key] = payload
             total_bytes += len(payload)
+            kind = view_kinds[len(out) - 1] if len(view_kinds) >= len(out) else "bytes_fallback"
+            if kind in ("local_native_buffer", "local_shm_view", "remote_attachment_buffer"):
+                self._zero_copy_bump("zero_copy_blocks")
+                if kind.startswith("local"):
+                    self._zero_copy_bump("local_shm_views")
+                else:
+                    self._zero_copy_bump("remote_attachment_views")
+            else:
+                self._zero_copy_bump("bytes_materialized_blocks")
         if acc_ld is not None:
+            for kind in view_kinds:
+                if kind in ("local_native_buffer", "local_shm_view", "remote_attachment_buffer"):
+                    acc_ld["zero_copy_blocks"] = float(acc_ld.get("zero_copy_blocks", 0.0)) + 1.0
+                    if kind.startswith("local"):
+                        acc_ld["local_shm_views"] = float(acc_ld.get("local_shm_views", 0.0)) + 1.0
+                    else:
+                        acc_ld["remote_attachment_views"] = float(acc_ld.get("remote_attachment_views", 0.0)) + 1.0
+                else:
+                    acc_ld["bytes_materialized_blocks"] = float(acc_ld.get("bytes_materialized_blocks", 0.0)) + 1.0
             self._record_data_batch_io(
                 acc_ld,
                 prefix="data_read",

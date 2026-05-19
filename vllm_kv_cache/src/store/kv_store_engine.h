@@ -94,6 +94,9 @@ public:
                                 const std::string& evicted_path,
                                 int64_t expected_version) const;
 
+    StoreResultMeta ValidateEvictedPath(const std::string& block_hash,
+                                        const std::string& evicted_path) const;
+
     // Spills DRAM bytes at `pool_offset` to SSD using the configured
     // SSDSpillManager. `dram_read_size` is the number of bytes to read from the
     // slot (must be <= BlockSize()); 0 means read the full configured block size.

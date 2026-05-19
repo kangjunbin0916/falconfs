@@ -137,6 +137,7 @@ public:
     EngineResultMeta RegisterStoreRegion(const EngineStoreRegion& region);
     EngineResultMeta SetRegionState(int32_t store_node_id, EngineRegionState state);
     bool HasRegion(int32_t store_node_id) const;
+    int64_t RegionStoreEpoch(int32_t store_node_id) const;
 
     // Recovery API (v6 §6.4, §15.1):
     // 1. After RegisterStoreRegion(), call MarkBitmapOccupied for every row

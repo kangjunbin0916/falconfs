@@ -14,6 +14,7 @@
 #include <sys/select.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -81,6 +82,14 @@ void AppendPayloadFramesToIOBuf(const std::vector<std::string>& payloads, butil:
     }
 }
 
+void AppendPayloadViewFramesToIOBuf(const std::vector<KVStoreWritePayloadView>& payloads, butil::IOBuf* out)
+{
+    for (const auto& payload : payloads) {
+        AppendU64LEIOBuf(out, static_cast<uint64_t>(payload.size));
+        if (payload.data != nullptr && payload.size > 0) out->append(payload.data, payload.size);
+    }
+}
+
 bool ReadU64LE(const std::string& in, size_t* pos, uint64_t* v)
 {
     if (*pos + 8 > in.size()) return false;
@@ -108,6 +117,43 @@ bool DecodePayloadFrames(const std::string& in, int n, std::vector<std::string>*
 }
 
 }  // namespace
+
+void IKVStoreFacade::BatchWriteBlockPayloadViews(const BatchWriteBlockRequest& req,
+                                                 const std::vector<KVStoreWritePayloadView>& views,
+                                                 BatchWriteBlockResponse* resp)
+{
+    std::vector<std::string> payloads;
+    payloads.reserve(views.size());
+    for (const auto& view : views) {
+        if (view.data != nullptr && view.size > 0) {
+            payloads.emplace_back(view.data, view.size);
+        } else {
+            payloads.emplace_back();
+        }
+    }
+    BatchWriteBlockPayloads(req, payloads, resp);
+}
+
+void IKVStoreFacade::BatchReadBlockPayloadViews(const BatchReadBlockRequest& req,
+                                                BatchReadBlockResponse* resp,
+                                                std::vector<KVStoreReadPayloadView>* views)
+{
+    std::vector<std::string> payloads;
+    BatchReadBlockPayloads(req, resp, &payloads);
+    if (views == nullptr) return;
+    views->clear();
+    views->resize(payloads.size());
+    for (size_t i = 0; i < payloads.size(); ++i) {
+        auto& view = (*views)[i];
+        view.ok = i < static_cast<size_t>(resp->results_size()) &&
+                  resp->results(static_cast<int>(i)).has_result() &&
+                  resp->results(static_cast<int>(i)).result().success();
+        view.owned_payload = std::move(payloads[i]);
+        view.data = view.owned_payload.data();
+        view.size = view.owned_payload.size();
+        view.kind = IsLocal() ? "local_native_buffer" : "remote_attachment_buffer";
+    }
+}
 
 class UnhealthyKVStoreFacade final : public IKVStoreFacade {
 public:
@@ -226,6 +272,19 @@ public:
         for (int i = 0; i < wire.items_size(); ++i) wire.mutable_items(i)->clear_payload();
         const bool use_attachment = static_cast<int>(payloads.size()) == req.items_size();
         if (use_attachment) AppendPayloadFramesToIOBuf(payloads, &cntl.request_attachment());
+        stub.BatchWriteBlock(&cntl, &wire, resp, nullptr);
+    }
+    void BatchWriteBlockPayloadViews(const BatchWriteBlockRequest& req,
+                                     const std::vector<KVStoreWritePayloadView>& payloads,
+                                     BatchWriteBlockResponse* resp) override
+    {
+        if (ch_ == nullptr) return;
+        KVDataService_Stub stub(ch_.get());
+        brpc::Controller cntl;
+        BatchWriteBlockRequest wire(req);
+        for (int i = 0; i < wire.items_size(); ++i) wire.mutable_items(i)->clear_payload();
+        const bool use_attachment = static_cast<int>(payloads.size()) == req.items_size();
+        if (use_attachment) AppendPayloadViewFramesToIOBuf(payloads, &cntl.request_attachment());
         stub.BatchWriteBlock(&cntl, &wire, resp, nullptr);
     }
     void BatchReadBlock(const BatchReadBlockRequest& req, BatchReadBlockResponse* resp) override
@@ -398,6 +457,16 @@ public:
                                  const std::vector<std::string>& payloads,
                                  BatchWriteBlockResponse* resp) override
     {
+        std::vector<KVStoreWritePayloadView> views;
+        views.reserve(payloads.size());
+        for (const auto& payload : payloads) views.push_back({payload.data(), payload.size()});
+        BatchWriteBlockPayloadViews(req, views, resp);
+    }
+
+    void BatchWriteBlockPayloadViews(const BatchWriteBlockRequest& req,
+                                     const std::vector<KVStoreWritePayloadView>& payloads,
+                                     BatchWriteBlockResponse* resp) override
+    {
         if (!IsHealthy()) {
             for (int i = 0; i < req.items_size(); ++i) {
                 auto* wr = resp->add_results();
@@ -411,13 +480,15 @@ public:
             auto* wr          = resp->add_results();
             wr->set_block_hash(it.block_hash());
             const size_t off = static_cast<size_t>(it.pool_offset());
-            const std::string& payload = (i < static_cast<int>(payloads.size())) ? payloads[static_cast<size_t>(i)] : it.payload();
-            const size_t psz = payload.size();
+            const KVStoreWritePayloadView payload =
+                (i < static_cast<int>(payloads.size())) ? payloads[static_cast<size_t>(i)]
+                                                        : KVStoreWritePayloadView{it.payload().data(), it.payload().size()};
+            const size_t psz = payload.size;
             if (it.pool_offset() < 0 || off + psz > shm_->len) {
                 FillErr(wr->mutable_result(), "pool_offset/payload out of range");
                 continue;
             }
-            if (psz > 0) std::memcpy(static_cast<char*>(shm_->base) + off, payload.data(), psz);
+            if (payload.data != nullptr && psz > 0) std::memcpy(static_cast<char*>(shm_->base) + off, payload.data, psz);
             wr->mutable_result()->set_success(true);
             wr->set_bytes_written(static_cast<int32_t>(psz));
         }
@@ -462,6 +533,48 @@ public:
             rr->mutable_result()->set_success(true);
             rr->set_compression(CompressionType::COMPRESSION_NONE);
             rr->set_original_size(bs);
+        }
+    }
+
+    void BatchReadBlockPayloadViews(const BatchReadBlockRequest& req,
+                                    BatchReadBlockResponse* resp,
+                                    std::vector<KVStoreReadPayloadView>* views) override
+    {
+        if (views != nullptr) views->clear();
+        if (!IsHealthy()) {
+            for (int i = 0; i < req.items_size(); ++i) {
+                auto* rr = resp->add_results();
+                rr->set_block_hash(req.items(i).block_hash());
+                FillErr(rr->mutable_result(), "local shm not mapped");
+                if (views != nullptr) views->push_back(KVStoreReadPayloadView{});
+            }
+            return;
+        }
+        if (views != nullptr) views->reserve(req.items_size());
+        for (int i = 0; i < req.items_size(); ++i) {
+            const ReadItem& it = req.items(i);
+            auto* rr = resp->add_results();
+            rr->set_block_hash(it.block_hash());
+            const size_t off = static_cast<size_t>(it.pool_offset());
+            const int bs = it.block_size() > 0 ? it.block_size() : shm_->block_size;
+            if (it.pool_offset() < 0 || off + static_cast<size_t>(bs) > shm_->len) {
+                FillErr(rr->mutable_result(), "pool_offset out of range");
+                if (views != nullptr) views->push_back(KVStoreReadPayloadView{});
+                continue;
+            }
+            const char* p = static_cast<const char*>(shm_->base) + off;
+            rr->mutable_result()->set_success(true);
+            rr->set_compression(CompressionType::COMPRESSION_NONE);
+            rr->set_original_size(bs);
+            if (views != nullptr) {
+                KVStoreReadPayloadView view;
+                view.ok = true;
+                view.data = p;
+                view.size = static_cast<size_t>(bs);
+                view.owner = shm_;
+                view.kind = "local_shm_view";
+                views->push_back(std::move(view));
+            }
         }
     }
 

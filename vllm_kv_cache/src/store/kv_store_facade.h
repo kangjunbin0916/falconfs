@@ -52,6 +52,20 @@ enum class RpcFailureKind : uint8_t {
     NotFoundAtDn,          // shard route stale; refresh shard table.
 };
 
+struct KVStoreReadPayloadView {
+    bool ok = false;
+    const char* data = nullptr;
+    size_t size = 0;
+    std::shared_ptr<void> owner;
+    std::string owned_payload;
+    std::string kind;
+};
+
+struct KVStoreWritePayloadView {
+    const char* data = nullptr;
+    size_t size = 0;
+};
+
 // A pluggable callable that performs the byte-level work for a single Store.
 // Two concrete implementations (P4):
 //   - LocalKVStoreShmFacade: shm_open + mmap(MAP_SHARED) into the
@@ -78,6 +92,9 @@ public:
     virtual void BatchWriteBlockPayloads(const BatchWriteBlockRequest&,
                                          const std::vector<std::string>& payloads,
                                          BatchWriteBlockResponse*) = 0;
+    virtual void BatchWriteBlockPayloadViews(const BatchWriteBlockRequest&,
+                                            const std::vector<KVStoreWritePayloadView>& payloads,
+                                            BatchWriteBlockResponse*);
     virtual void ReadBlock(const ReadBlockRequest&, ReadBlockResponse*)       = 0;
     virtual void ReadBlockPayload(const ReadBlockRequest&,
                                   ReadBlockResponse*,
@@ -85,6 +102,9 @@ public:
     virtual void BatchReadBlockPayloads(const BatchReadBlockRequest&,
                                         BatchReadBlockResponse*,
                                         std::vector<std::string>* payloads) = 0;
+    virtual void BatchReadBlockPayloadViews(const BatchReadBlockRequest& req,
+                                            BatchReadBlockResponse* resp,
+                                            std::vector<KVStoreReadPayloadView>* views);
     virtual void ReadFromSSD(const ReadFromSSDRequest&, ReadFromSSDResponse*) = 0;
 
     virtual void BatchWriteBlock (const BatchWriteBlockRequest&,

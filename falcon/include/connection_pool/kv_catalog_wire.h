@@ -44,6 +44,9 @@ typedef enum KVCatalogMethod {
     KV_CATALOG_METHOD_LOAD_DN_EPOCH     = 6,
     KV_CATALOG_METHOD_BUMP_DN_EPOCH     = 7,
     KV_CATALOG_METHOD_PROMOTE_FROM_EVICTED = 8,
+    KV_CATALOG_METHOD_RECONCILE_STORE_RESTART = 9,
+    KV_CATALOG_METHOD_SCAN_STORE_EVICTED = 10,
+    KV_CATALOG_METHOD_DELETE_STORE_EVICTED_INVALID = 11,
 } KVCatalogMethod;
 
 /* BlockStatus mirror (v6.4 \u00a73.2). 0 must never be persisted. */
@@ -171,6 +174,43 @@ typedef struct __attribute__((packed)) KVCatalogDnEpochResponse {
     int64_t dn_epoch;
 } KVCatalogDnEpochResponse;
 
+/* ---- Recovery: Store restart reconciliation ---------------------------- */
+
+typedef struct __attribute__((packed)) KVCatalogStoreRestartRequest {
+    int32_t store_node_id;
+    int64_t now_ms;
+} KVCatalogStoreRestartRequest;
+
+typedef struct __attribute__((packed)) KVCatalogStoreRestartResponse {
+    int64_t scanned_rows;
+    int64_t deleted_rows;
+    int64_t preserved_evicted_rows;
+} KVCatalogStoreRestartResponse;
+
+typedef struct __attribute__((packed)) KVCatalogStoreEvictedScanRequest {
+    int32_t store_node_id;
+    uint32_t max_rows;
+} KVCatalogStoreEvictedScanRequest;
+
+typedef struct __attribute__((packed)) KVCatalogStoreEvictedRow {
+    uint16_t block_hash_len;
+    uint8_t  block_hash[KV_CATALOG_BLOCK_HASH_MAX_LEN];
+    int64_t  version;
+    uint16_t evicted_path_len;
+    char     evicted_path[KV_CATALOG_EVICTED_PATH_MAX_LEN];
+} KVCatalogStoreEvictedRow;
+
+typedef struct __attribute__((packed)) KVCatalogDeleteInvalidEvictedItem {
+    uint16_t block_hash_len;
+    uint8_t  block_hash[KV_CATALOG_BLOCK_HASH_MAX_LEN];
+    int64_t  expected_version;
+} KVCatalogDeleteInvalidEvictedItem;
+
+typedef struct __attribute__((packed)) KVCatalogDeleteInvalidEvictedResult {
+    uint8_t deleted;
+    uint8_t conflict;
+} KVCatalogDeleteInvalidEvictedResult;
+
 /* Helper: compute response buffer size for a given method and item count. */
 static inline uint64_t KVCatalogResponseSize(int method, uint32_t count)
 {
@@ -186,6 +226,10 @@ static inline uint64_t KVCatalogResponseSize(int method, uint32_t count)
             return header + (uint64_t) count * sizeof(KVCatalogDeleteResult);
         case KV_CATALOG_METHOD_PROMOTE_FROM_EVICTED:
             return header + (uint64_t) count * sizeof(KVCatalogPromoteResult);
+        case KV_CATALOG_METHOD_SCAN_STORE_EVICTED:
+            return header + (uint64_t) count * sizeof(KVCatalogStoreEvictedRow);
+        case KV_CATALOG_METHOD_DELETE_STORE_EVICTED_INVALID:
+            return header + (uint64_t) count * sizeof(KVCatalogDeleteInvalidEvictedResult);
         default:
             return 0;
     }
