@@ -314,6 +314,26 @@ def _min_healthy_store_dram_bytes(conninfo: str) -> int:
         return 0
 
 
+def _env_store_dram_capacity_fallback(block_size: int) -> Dict[str, int]:
+    """Capacity fallback for environments where ``psql`` is absent from PATH.
+
+    The regression harness starts Stores from env knobs before Python tests run.
+    If the Python process cannot invoke ``psql`` to inspect ``falcon_store_node``,
+    use the same bounded local setup knobs instead of skipping the two-phase E2E.
+    """
+    try:
+        store_count = max(1, int(os.environ.get("STORE_COUNT", "1") or "1"))
+    except ValueError:
+        store_count = 1
+    try:
+        slots = max(1, int(os.environ.get("FALCON_KV_STORE_MIN_LOGICAL_SLOTS", "512") or "512"))
+    except ValueError:
+        slots = 512
+    bs = max(1, int(block_size or 1))
+    per_store = slots * bs
+    return {"sum": store_count * per_store, "min": per_store}
+
+
 def _perf_store_acc_new() -> Dict[str, Any]:
     return {
         "prepare_store_wall_s": 0.0,
@@ -687,16 +707,39 @@ def _prime_dn_catalog_for_mixed_e2e(conninfo: str) -> None:
 
     Without healthy rows, ``discover_dn_endpoints`` is empty and the facade registry
     skips DN metadata routing. Priming keeps Python E2E aligned with CI clusters
-    that run full DN stacks. Opt out with ``FALCON_MIX_SKIP_DN_PRIME=1``.
+    that run full DN stacks. The helper re-registers harness DN rows instead of
+    only flipping ``healthy`` so it also repairs rows deleted by preceding fault
+    drills or catalog cleanup. Opt out with ``FALCON_MIX_SKIP_DN_PRIME=1``.
     """
     if os.environ.get("FALCON_MIX_SKIP_DN_PRIME", "").strip().lower() in ("1", "true", "yes", "on"):
         return
     if not shutil.which("psql"):
         return
-    sql = (
+
+    def _pooler_port(endpoint: str) -> int:
+        return int(endpoint.rsplit(":", 1)[1])
+
+    dn_specs = [
+        (1, "worker0", _pooler_port(DN1_POOLER)),
+        (2, "worker1", _pooler_port(DN2_POOLER)),
+    ]
+    if _can_reach(DN3_POOLER, timeout_s=0.25):
+        dn_specs.append((3, "worker2", _pooler_port(DN3_POOLER)))
+
+    register_sql = []
+    for sid, host_node, port in dn_specs:
+        register_sql.append(
+            "SELECT pg_catalog.falcon_dn_node_register("
+            f"{sid}, '{host_node}'::cstring, '127.0.0.1'::cstring, "
+            f"{port}::int, {port}::int, "
+            f"COALESCE((SELECT dn_epoch FROM pg_catalog.falcon_dn_node WHERE server_id = {sid}), 1)::bigint"
+            ");"
+        )
+    register_sql.append(
         "UPDATE pg_catalog.falcon_dn_node SET healthy = true, "
         "last_heartbeat_ms = (EXTRACT(EPOCH FROM now()) * 1000)::bigint;"
     )
+    sql = "\n".join(register_sql)
     subprocess.run(
         ["psql", conninfo, "-v", "ON_ERROR_STOP=1", "-q", "-c", sql],
         capture_output=True,
@@ -783,6 +826,7 @@ def _om_perf_phases(mgr: Any) -> Dict[str, Any]:
         "promote_on_read": dict(bd.get("promote_on_read") or {}),
         "adaptive_batching": dict(bd.get("adaptive_batching") or {}),
         "zero_copy_read": dict(bd.get("zero_copy_read") or {}),
+        "prealloc_load_buffers": dict(bd.get("prealloc_load_buffers") or {}),
     }
 
 
@@ -830,50 +874,123 @@ def _phase_mb_s(section: Dict[str, Any], phase: str) -> Optional[float]:
         return None
 
 
-def _microbench_bounds_snapshot() -> Dict[str, Any]:
-    default_path = ROOT.parent / "logs" / "falcon_kv_store_microbench_latest.json"
-    path = Path(os.environ.get("FALCON_MIX_MICROBENCH_JSON", str(default_path)))
-    obj = _load_json_file(path)
-    if not isinstance(obj, dict):
-        return {"available": False, "path": str(path)}
-    out: Dict[str, Any] = {
-        "available": True,
-        "path": str(path),
-        "mode": obj.get("mode"),
-        "path_mode": obj.get("path_mode"),
-        "allocation": obj.get("allocation"),
-        "stores": obj.get("stores"),
-        "blocks": obj.get("blocks"),
-        "block_bytes": obj.get("block_bytes"),
+_MICROBENCH_BOUND_KEYS = (
+    "native_memcpy_bound",
+    "local_shm_upper_bound",
+    "local_shm_prealloc_write_bound",
+    "remote_brpc_upper_bound",
+    "mixed_facade_bound",
+)
+
+
+def _microbench_json_paths() -> List[Path]:
+    raw_many = os.environ.get("FALCON_MIX_MICROBENCH_JSONS", "").strip()
+    raw_one = os.environ.get("FALCON_MIX_MICROBENCH_JSON", "").strip()
+    default_dir = ROOT.parent / "logs"
+    defaults = [
+        default_dir / "falcon_kv_store_microbench_native_latest.json",
+        default_dir / "falcon_kv_store_microbench_local_read_latest.json",
+        default_dir / "falcon_kv_store_microbench_local_write_latest.json",
+        default_dir / "falcon_kv_store_microbench_remote_latest.json",
+        default_dir / "falcon_kv_store_microbench_latest.json",
+    ]
+    parts: List[str] = []
+    if raw_many:
+        parts.extend([x for x in raw_many.replace(",", os.pathsep).split(os.pathsep) if x])
+    if raw_one:
+        parts.append(raw_one)
+    parts.extend(str(x) for x in defaults)
+    out: List[Path] = []
+    seen = set()
+    for item in parts:
+        path = str(Path(item))
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append(Path(path))
+    return out
+
+
+def _legacy_microbench_section(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    write = obj.get("write") if isinstance(obj.get("write"), dict) else {}
+    read = obj.get("read") if isinstance(obj.get("read"), dict) else {}
+    if not write and not read:
+        return None
+    return {
+        "path_mode": obj.get("path_mode", "legacy"),
+        "write": write,
+        "read": read,
         "parallelism": obj.get("parallelism"),
         "batch_size": obj.get("batch_size"),
-        "verification": obj.get("verification"),
+        "block_bytes": obj.get("block_bytes"),
         "payloads_preallocated": obj.get("payloads_preallocated"),
-        "locality_assertions": obj.get("locality_assertions"),
+        "verification": obj.get("verification"),
+        "locality": obj.get("store_locality") or obj.get("locality_assertions"),
     }
-    for key in ("local_shm_upper_bound", "remote_brpc_upper_bound", "native_memcpy_bound", "mixed_facade_bound"):
+
+
+def _merge_microbench_obj(out: Dict[str, Any], obj: Dict[str, Any], path: Path) -> None:
+    out.setdefault("source_files", []).append(str(path))
+    for key in ("mode", "path_mode", "allocation", "stores", "blocks", "block_bytes", "parallelism", "batch_size", "verification", "payloads_preallocated", "locality_assertions"):
+        if out.get(key) is None and obj.get(key) is not None:
+            out[key] = obj.get(key)
+    for key in _MICROBENCH_BOUND_KEYS:
         val = obj.get(key)
         if isinstance(val, dict):
-            out[key] = val
-    # Backward compatibility for older one-section microbench JSON.
-    if not any(key in out for key in ("local_shm_upper_bound", "remote_brpc_upper_bound", "mixed_facade_bound")):
-        write = obj.get("write") if isinstance(obj.get("write"), dict) else {}
-        read = obj.get("read") if isinstance(obj.get("read"), dict) else {}
-        section = {
-            "path_mode": obj.get("path_mode", "legacy"),
-            "write": write,
-            "read": read,
-            "parallelism": obj.get("parallelism"),
-            "block_bytes": obj.get("block_bytes"),
-        }
-        loc = obj.get("store_locality") if isinstance(obj.get("store_locality"), dict) else {}
-        vals = list(loc.values())
-        if vals and all(bool(v) for v in vals):
-            out["local_shm_upper_bound"] = section
-        elif vals and not any(bool(v) for v in vals):
-            out["remote_brpc_upper_bound"] = section
-        else:
-            out["mixed_facade_bound"] = section
+            copied = dict(val)
+            copied.setdefault("source_path", str(path))
+            out[key] = copied
+    if any(key in obj for key in _MICROBENCH_BOUND_KEYS):
+        return
+    section = _legacy_microbench_section(obj)
+    if not section:
+        return
+    section = dict(section)
+    section.setdefault("source_path", str(path))
+    path_mode = str(obj.get("path_mode") or "")
+    if path_mode == "local-shm-prealloc-write":
+        out["local_shm_prealloc_write_bound"] = section
+        return
+    if path_mode == "local-shm-zero-copy-read":
+        out["local_shm_upper_bound"] = section
+        return
+    if path_mode == "remote-brpc-attachment":
+        out["remote_brpc_upper_bound"] = section
+        return
+    loc = obj.get("store_locality") if isinstance(obj.get("store_locality"), dict) else {}
+    vals = list(loc.values())
+    if vals and all(bool(v) for v in vals):
+        out["local_shm_upper_bound"] = section
+    elif vals and not any(bool(v) for v in vals):
+        out["remote_brpc_upper_bound"] = section
+    else:
+        out["mixed_facade_bound"] = section
+
+
+def _microbench_bounds_snapshot() -> Dict[str, Any]:
+    paths = _microbench_json_paths()
+    out: Dict[str, Any] = {
+        "available": False,
+        "paths": [str(p) for p in paths],
+        "source_files": [],
+        "mode": None,
+        "path_mode": None,
+        "allocation": None,
+        "stores": None,
+        "blocks": None,
+        "block_bytes": None,
+        "parallelism": None,
+        "batch_size": None,
+        "verification": None,
+        "payloads_preallocated": None,
+        "locality_assertions": None,
+    }
+    for path in paths:
+        obj = _load_json_file(path)
+        if isinstance(obj, dict):
+            out["available"] = True
+            _merge_microbench_obj(out, obj, path)
+    out["path"] = out["source_files"][0] if out["source_files"] else str(paths[0]) if paths else ""
     return out
 
 
@@ -882,7 +999,7 @@ def _microbench_upper_bound_snapshot() -> Dict[str, Any]:
     if not bounds.get("available"):
         return bounds
     section = None
-    for key in ("mixed_facade_bound", "local_shm_upper_bound", "remote_brpc_upper_bound"):
+    for key in ("mixed_facade_bound", "local_shm_prealloc_write_bound", "local_shm_upper_bound", "remote_brpc_upper_bound"):
         if isinstance(bounds.get(key), dict):
             section = bounds[key]
             break
@@ -890,6 +1007,7 @@ def _microbench_upper_bound_snapshot() -> Dict[str, Any]:
     return {
         "available": True,
         "path": bounds.get("path"),
+        "paths": bounds.get("source_files") or bounds.get("paths"),
         "mode": bounds.get("mode"),
         "path_mode": bounds.get("path_mode") or section.get("path_mode"),
         "allocation": bounds.get("allocation"),
@@ -908,7 +1026,8 @@ def _path_upper_bound_comparison(ev: Dict[str, Any], bounds: Optional[Dict[str, 
     perf = ev.get("path_throughput_latency") if isinstance(ev.get("path_throughput_latency"), dict) else {}
     store = perf.get("store_write") if isinstance(perf.get("store_write"), dict) else {}
     load = perf.get("load_read") if isinstance(perf.get("load_read"), dict) else {}
-    local_bound = bounds.get("local_shm_upper_bound") if isinstance(bounds.get("local_shm_upper_bound"), dict) else {}
+    local_read_bound = bounds.get("local_shm_upper_bound") if isinstance(bounds.get("local_shm_upper_bound"), dict) else {}
+    local_write_bound = bounds.get("local_shm_prealloc_write_bound") if isinstance(bounds.get("local_shm_prealloc_write_bound"), dict) else local_read_bound
     remote_bound = bounds.get("remote_brpc_upper_bound") if isinstance(bounds.get("remote_brpc_upper_bound"), dict) else {}
 
     def path_mb_s(phase: Dict[str, Any], label: str) -> Optional[float]:
@@ -921,11 +1040,12 @@ def _path_upper_bound_comparison(ev: Dict[str, Any], bounds: Optional[Dict[str, 
     return {
         "available": bool(bounds.get("available")),
         "microbench_path": bounds.get("path"),
-        "local_store_pct_of_local_shm_upper": _percent_of(path_mb_s(store, "local_shm"), _phase_mb_s(local_bound, "write")),
-        "local_load_pct_of_local_shm_upper": _percent_of(path_mb_s(load, "local_shm"), _phase_mb_s(local_bound, "read")),
+        "microbench_paths": bounds.get("source_files") or bounds.get("paths"),
+        "local_store_pct_of_local_shm_upper": _percent_of(path_mb_s(store, "local_shm"), _phase_mb_s(local_write_bound, "write")),
+        "local_load_pct_of_local_shm_upper": _percent_of(path_mb_s(load, "local_shm"), _phase_mb_s(local_read_bound, "read")),
         "remote_store_pct_of_remote_brpc_upper": _percent_of(path_mb_s(store, "remote_brpc"), _phase_mb_s(remote_bound, "write")),
         "remote_load_pct_of_remote_brpc_upper": _percent_of(path_mb_s(load, "remote_brpc"), _phase_mb_s(remote_bound, "read")),
-        "note": "Local paths compare against local_shm_upper_bound; remote paths compare against remote_brpc_upper_bound when those sections are available.",
+        "note": "Local writes compare against local_shm_prealloc_write_bound when present; local reads compare against local_shm_upper_bound; remote paths compare against remote_brpc_upper_bound.",
     }
 
 
@@ -933,11 +1053,10 @@ def _baseline_comparison_for_event(ev: Dict[str, Any]) -> Dict[str, Any]:
     tee = ev.get("throughput_end_to_end") if isinstance(ev.get("throughput_end_to_end"), dict) else {}
     current_store = float(tee.get("mb_s_phase_store") or 0.0) or None
     current_load = float(tee.get("mb_s_phase_load") or 0.0) or None
-    baseline_path = Path(os.environ.get(
-        "FALCON_MIX_BASELINE_JSON",
-        str(ROOT.parent / "logs" / "falcon_mix_metrics_baseline.json"),
-    ))
-    baseline = _extract_two_phase_throughput(_load_json_file(baseline_path))
+    baseline_env = os.environ.get("FALCON_MIX_BASELINE_JSON", "").strip()
+    baseline_path = Path(baseline_env or str(ROOT.parent / "logs" / "falcon_mix_metrics_baseline.json"))
+    baseline_exists = baseline_path.exists()
+    baseline = _extract_two_phase_throughput(_load_json_file(baseline_path)) if baseline_exists else {"store_mb_s": None, "load_mb_s": None}
     bounds = _microbench_bounds_snapshot()
     upper = _microbench_upper_bound_snapshot()
     upper_store = upper.get("write_wall_mb_s") if upper.get("available") else None
@@ -946,6 +1065,7 @@ def _baseline_comparison_for_event(ev: Dict[str, Any]) -> Dict[str, Any]:
         "current_store_mb_s": current_store,
         "current_load_mb_s": current_load,
         "saved_baseline_path": str(baseline_path),
+        "saved_baseline_exists": bool(baseline_exists),
         "saved_baseline_store_mb_s": baseline.get("store_mb_s"),
         "saved_baseline_load_mb_s": baseline.get("load_mb_s"),
         "store_pct_change_from_baseline": _percent_change(current_store, baseline.get("store_mb_s")),
@@ -953,7 +1073,60 @@ def _baseline_comparison_for_event(ev: Dict[str, Any]) -> Dict[str, Any]:
         "store_pct_of_upper_bound": _percent_of(current_store, upper_store),
         "load_pct_of_upper_bound": _percent_of(current_load, upper_load),
         "path_upper_bound_comparison": _path_upper_bound_comparison(ev, bounds),
+        "gating_enabled": bool(baseline_env and baseline_exists and os.environ.get("FALCON_MIX_ALLOW_PERF_REGRESSION", "0").strip().lower() not in ("1", "true", "yes", "on")),
     }
+
+
+def _truthy_env(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _assert_required_upper_bound_comparison(ev: Dict[str, Any], bounds: Dict[str, Any], cmp_obj: Dict[str, Any]) -> None:
+    if not _truthy_env("FALCON_MIX_REQUIRE_LOCAL_UPPER_BOUND", "1"):
+        return
+    if not bounds.get("available"):
+        return
+    locality = ev.get("store_locality") if isinstance(ev.get("store_locality"), dict) else {}
+    has_local_store = any(bool(v) for v in locality.values())
+    ratio = ev.get("local_remote_io_ratio") if isinstance(ev.get("local_remote_io_ratio"), dict) else {}
+    store_counts = ratio.get("store_writes") if isinstance(ratio.get("store_writes"), dict) else {}
+    load_counts = ratio.get("load_reads") if isinstance(ratio.get("load_reads"), dict) else {}
+    has_local_io = int(store_counts.get("local", 0) or 0) > 0 or int(load_counts.get("local", 0) or 0) > 0
+    if not (has_local_store or has_local_io):
+        return
+    missing: List[str] = []
+    if not isinstance(bounds.get("local_shm_upper_bound"), dict):
+        missing.append("local_shm_upper_bound")
+    if not isinstance(bounds.get("local_shm_prealloc_write_bound"), dict):
+        missing.append("local_shm_prealloc_write_bound")
+    if int(store_counts.get("local", 0) or 0) > 0 and cmp_obj.get("local_store_pct_of_local_shm_upper") is None:
+        missing.append("local_store_pct_of_local_shm_upper")
+    if int(load_counts.get("local", 0) or 0) > 0 and cmp_obj.get("local_load_pct_of_local_shm_upper") is None:
+        missing.append("local_load_pct_of_local_shm_upper")
+    if missing:
+        raise AssertionError(f"local Store exists but required local upper-bound metrics are missing/null: {missing}; microbench_paths={bounds.get('source_files') or bounds.get('paths')}")
+
+
+def _enforce_baseline_gate(event: Dict[str, Any], comparison: Dict[str, Any]) -> None:
+    baseline_env = os.environ.get("FALCON_MIX_BASELINE_JSON", "").strip()
+    if not baseline_env or not comparison.get("saved_baseline_exists"):
+        return
+    if _truthy_env("FALCON_MIX_ALLOW_PERF_REGRESSION", "0"):
+        return
+    try:
+        threshold = abs(float(os.environ.get("FALCON_MIX_BASELINE_REGRESSION_PCT", "10")))
+    except ValueError:
+        threshold = 10.0
+    failures: List[str] = []
+    for label, key in (("store", "store_pct_change_from_baseline"), ("load", "load_pct_change_from_baseline")):
+        val = comparison.get(key)
+        if val is not None and float(val) < -threshold:
+            failures.append(f"{label} {val}%")
+    if failures:
+        raise AssertionError(
+            "mixed E2E throughput regressed beyond "
+            f"{threshold:.1f}% versus {baseline_env}: " + ", ".join(failures)
+        )
 
 
 def _facade_ipc_sub(
@@ -1818,7 +1991,7 @@ class OffloadingManagerClusterMixedE2E(unittest.TestCase):
         super().tearDownClass()
 
     @classmethod
-    def _record(cls, event: Dict[str, Any]) -> None:
+    def _record(cls, event: Dict[str, Any], *, persist_metrics: bool = True) -> None:
         event["ts_wall_ms"] = int(time.time() * 1000)
         event.setdefault("e2e_quick", _e2e_quick_enabled())
         event.setdefault(
@@ -1840,19 +2013,39 @@ class OffloadingManagerClusterMixedE2E(unittest.TestCase):
         if "throughput_end_to_end" in event and isinstance(event.get("throughput_end_to_end"), dict):
             bounds = _microbench_bounds_snapshot()
             event.setdefault("microbench_bounds", bounds)
-            for key in ("local_shm_upper_bound", "remote_brpc_upper_bound", "native_memcpy_bound", "mixed_facade_bound"):
+            for key in _MICROBENCH_BOUND_KEYS:
                 if isinstance(bounds.get(key), dict):
                     event.setdefault(key, bounds[key])
             event.setdefault("microbench_upper_bound", _microbench_upper_bound_snapshot())
-            event.setdefault("path_upper_bound_comparison", _path_upper_bound_comparison(event, bounds))
-            event.setdefault("baseline_comparison", _baseline_comparison_for_event(event))
+            path_cmp = _path_upper_bound_comparison(event, bounds)
+            event.setdefault("path_upper_bound_comparison", path_cmp)
+            _assert_required_upper_bound_comparison(event, bounds, path_cmp)
+            baseline_cmp = _baseline_comparison_for_event(event)
+            event.setdefault("baseline_comparison", baseline_cmp)
+            _enforce_baseline_gate(event, baseline_cmp)
         event.setdefault(
             "recovery_stress",
             {
                 "large_dn_recovery_unit": "KVMetadataRecovery.LargeDnRecoveryStressRestoresRowsAndBitmap",
                 "late_store_registration_unit": "KVMetadataRecovery.LateStoreRegistrationParksAndReplaysRows",
+                "dn_restart_evicting_rollback_unit": "KVMetadataRecovery.RestoresRowsAndReconcilesEvicting",
                 "store_restart_validation_cluster": "kv-cluster-fault-test store-restart-reconcile",
+                "store_restart_matrix": [
+                    "ALLOCATED_deleted",
+                    "STORED_deleted",
+                    "EVICTING_deleted",
+                    "EVICTED_empty_path_deleted",
+                    "EVICTED_missing_path_deleted_after_validation",
+                    "EVICTED_valid_path_preserved",
+                ],
+                "scanned": None,
+                "parked": None,
+                "replayed": None,
+                "evicting_rolled_back": None,
+                "invalid_deleted": None,
+                "validation_failed": None,
                 "profile": os.environ.get("REGRESSION_PROFILE", ""),
+                "note": "Cluster scenario prints concrete Store restart counters; unit tests cover large DN recovery and late Store registration.",
             },
         )
         event.setdefault(
@@ -1869,6 +2062,12 @@ class OffloadingManagerClusterMixedE2E(unittest.TestCase):
                 "batch_write_request": "BRPC attachment payloads are passed directly to KVStoreEngine without rebuilding protobuf payloads.",
             },
         )
+        if not persist_metrics:
+            print(
+                "FALCON_MIX_CHECK\t" + json.dumps(event, ensure_ascii=False),
+                flush=True,
+            )
+            return
         cls.throughput_events.append(event)
         print(
             "FALCON_MIX_RUN_SUMMARY\t" + json.dumps(event, ensure_ascii=False),
@@ -1946,7 +2145,8 @@ class OffloadingManagerClusterMixedE2E(unittest.TestCase):
                 "distinct_dns": len(grouping),
                 "store_locality": _store_locality_snapshot(),
                 "facade_ipc_stats": _facade_ipc_snapshot(),
-            }
+            },
+            persist_metrics=False,
         )
 
     def test_batch_store_load_touch_full_block_three_dns(self) -> None:
@@ -2007,7 +2207,8 @@ class OffloadingManagerClusterMixedE2E(unittest.TestCase):
                     "facade_ipc_stats": ipc_after,
                     "facade_ipc_data_path": _facade_ipc_data_path_report(),
                     "om_perf_breakdown": _om_perf_phases(self.mgr),
-                }
+                },
+                persist_metrics=False,
             )
             floor = _require_store_mb_s()
             if floor > 0 and t_store > 0:
@@ -2071,7 +2272,8 @@ class OffloadingManagerClusterMixedE2E(unittest.TestCase):
                     "mb_s_complete_store": round(mb / t_cs, 3) if t_cs > 0 else None,
                     "mb_s_prepare_load": round(mb / t_pl, 3) if t_pl > 0 else None,
                     "om_perf_breakdown": _om_perf_phases(self.mgr),
-                }
+                },
+                persist_metrics=False,
             )
         finally:
             self.mgr.set_om_perf_enabled(_om_perf_enabled())
@@ -2222,7 +2424,8 @@ class OffloadingManagerClusterMixedE2E(unittest.TestCase):
                     "om_perf_breakdown": _om_perf_phases(mgr),
                     "store_locality": _store_locality_snapshot(),
                     "facade_ipc_stats": _facade_ipc_snapshot(),
-                }
+                },
+                persist_metrics=False,
             )
         finally:
             for k in keys:
@@ -2265,8 +2468,12 @@ class OffloadingManagerClusterMixedE2E(unittest.TestCase):
         bs = self.mgr.block_size
         sum_dram = _total_healthy_store_dram_bytes(self.cn_conninfo)
         min_dram = _min_healthy_store_dram_bytes(self.cn_conninfo)
-        if sum_dram <= 0 or not shutil.which("psql"):
-            self.skipTest("need psql + CN catalog dram_pool_bytes for two-phase sizing")
+        dram_capacity_source = "catalog"
+        if sum_dram <= 0:
+            fallback = _env_store_dram_capacity_fallback(bs)
+            sum_dram = int(fallback["sum"])
+            min_dram = int(fallback["min"])
+            dram_capacity_source = "env_fallback"
         nk_cap = sum_dram // bs if bs > 0 else 0
         if nk_cap < 1:
             self.skipTest(
@@ -2325,22 +2532,33 @@ class OffloadingManagerClusterMixedE2E(unittest.TestCase):
                 pass
 
             t_load0 = time.perf_counter()
+            load_measured_s = 0.0
+            load_verify_s = 0.0
             for off in range(0, nk, chunk):
                 sub = keys[off : off + chunk]
                 if pregen_payloads is not None:
                     expected = {k: pregen_payloads[k] for k in sub}
                 else:
                     expected = {k: _mixed_payload(bs, variant=off + j) for j, k in enumerate(sub)}
+                t_prepare_load0 = time.perf_counter()
                 ld = self.mgr.prepare_load(sub, None)
+                t_prepare_load1 = time.perf_counter()
+                t_verify0 = time.perf_counter()
                 for k in sub:
                     self.assertEqual(ld.data.get(k), expected[k], k)
+                load_verify_s += time.perf_counter() - t_verify0
+                t_complete_load0 = time.perf_counter()
                 self.mgr.complete_load(sub, None)
+                load_measured_s += (t_prepare_load1 - t_prepare_load0) + (
+                    time.perf_counter() - t_complete_load0
+                )
                 _perf_merge_load_chunk(acc_load, self.mgr.perf_breakdown())
             t_load1 = time.perf_counter()
 
             mb = nbytes_total / 1.0e6
             dt_s = max(t_store1 - t_store0, 1e-9)
-            dl_s = max(t_load1 - t_load0, 1e-9)
+            dl_wall_s = max(t_load1 - t_load0, 1e-9)
+            dl_s = max(load_measured_s, 1e-9)
             ipc_end = _facade_ipc_snapshot()
             cxx_facade_end = _facade_perf_snapshot()
             n_batches_e = (nk + chunk - 1) // chunk if nk > 0 else 1
@@ -2373,13 +2591,17 @@ class OffloadingManagerClusterMixedE2E(unittest.TestCase):
                 "payload_generation_timed": pregen_payloads is None,
                 "catalog_sum_dram_pool_bytes": sum_dram,
                 "catalog_min_dram_pool_bytes": min_dram,
+                "dram_capacity_source": dram_capacity_source,
                 "falcon_pool_shmem_mb_env": pool_ev,
                 "falcon_kv_store_min_logical_slots_env": dram_floor,
                 "throughput_end_to_end": {
                     "seconds_phase_store": round(dt_s, 6),
                     "seconds_phase_load": round(dl_s, 6),
+                    "seconds_phase_load_wall_including_verify": round(dl_wall_s, 6),
+                    "seconds_phase_load_verify": round(load_verify_s, 6),
                     "mb_s_phase_store": round(mb / dt_s, 3),
                     "mb_s_phase_load": round(mb / dl_s, 3),
+                    "mb_s_phase_load_wall_including_verify": round(mb / dl_wall_s, 3),
                 },
                 "throughput_breakdown_local_remote_mb_s": extra[
                     "throughput_breakdown_local_remote_mb_s"
@@ -2436,7 +2658,8 @@ class OffloadingManagerClusterMixedE2E(unittest.TestCase):
                 "num_stores": num_stores,
                 "store_locality": _store_locality_snapshot(),
                 "facade_ipc_stats": _facade_ipc_snapshot(),
-            }
+            },
+            persist_metrics=False,
         )
 
     def test_four_node_name_clients_subprocess_roundtrip(self) -> None:
@@ -2475,7 +2698,7 @@ class OffloadingManagerClusterMixedE2E(unittest.TestCase):
             self.assertGreater(rep.get("mb_s_complete_store") or 0, 0, rep)
             self.assertGreater(rep.get("mb_s_prepare_load") or 0, 0, rep)
             rep["test"] = f"subprocess_client_v65mix{i}"
-            type(self)._record(rep)
+            type(self)._record(rep, persist_metrics=False)
 
 
 if __name__ == "__main__":

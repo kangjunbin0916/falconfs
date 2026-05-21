@@ -744,6 +744,7 @@ int RunStoreRestartReconcile(const std::string& endpoint, int pg_port) {
     const std::string run_id = "fault_store_restart_" + std::to_string(NowNs());
     const std::string allocated_hash = run_id + "_allocated";
     const std::string stored_hash = run_id + "_stored";
+    const std::string evicting_hash = run_id + "_evicting";
     const std::string evicted_with_path_hash = run_id + "_evicted_path";
     const std::string evicted_missing_path_hash = run_id + "_evicted_missing";
     const std::string evicted_empty_path_hash = run_id + "_evicted_empty";
@@ -881,10 +882,11 @@ int RunStoreRestartReconcile(const std::string& endpoint, int pg_port) {
 
     const int64_t allocated_v1 = allocate_one(allocated_hash);
     const int64_t stored_v1 = allocate_one(stored_hash);
+    const int64_t evicting_v1 = allocate_one(evicting_hash);
     const int64_t evicted_path_v1 = allocate_one(evicted_with_path_hash);
     const int64_t evicted_missing_v1 = allocate_one(evicted_missing_path_hash);
     const int64_t evicted_empty_v1 = allocate_one(evicted_empty_path_hash);
-    if (allocated_v1 < 0 || stored_v1 < 0 || evicted_path_v1 < 0 ||
+    if (allocated_v1 < 0 || stored_v1 < 0 || evicting_v1 < 0 || evicted_path_v1 < 0 ||
         evicted_missing_v1 < 0 || evicted_empty_v1 < 0) {
         return Fail("store-restart-reconcile: pre-restart allocation setup failed");
     }
@@ -894,6 +896,11 @@ int RunStoreRestartReconcile(const std::string& endpoint, int pg_port) {
                                          BLOCK_STATUS_STORED,
                                          stored_v1,
                                          "");
+    const int64_t evicting_v2 = update_one(evicting_hash,
+                                            BLOCK_STATUS_ALLOCATED,
+                                            BLOCK_STATUS_STORED,
+                                            evicting_v1,
+                                            "");
     const int64_t evicted_path_v2 = update_one(evicted_with_path_hash,
                                                BLOCK_STATUS_ALLOCATED,
                                                BLOCK_STATUS_STORED,
@@ -909,11 +916,16 @@ int RunStoreRestartReconcile(const std::string& endpoint, int pg_port) {
                                                 BLOCK_STATUS_STORED,
                                                 evicted_empty_v1,
                                                 "");
-    if (stored_v2 < 0 || evicted_path_v2 < 0 ||
+    if (stored_v2 < 0 || evicting_v2 < 0 || evicted_path_v2 < 0 ||
         evicted_missing_v2 < 0 || evicted_empty_v2 < 0) {
         return Fail("store-restart-reconcile: STORED setup failed");
     }
 
+    const int64_t evicting_v3 = update_one(evicting_hash,
+                                            BLOCK_STATUS_STORED,
+                                            BLOCK_STATUS_EVICTING,
+                                            evicting_v2,
+                                            "");
     const int64_t evicted_path_v3 = update_one(evicted_with_path_hash,
                                                BLOCK_STATUS_STORED,
                                                BLOCK_STATUS_EVICTED,
@@ -924,8 +936,8 @@ int RunStoreRestartReconcile(const std::string& endpoint, int pg_port) {
                                                   BLOCK_STATUS_EVICTED,
                                                   evicted_missing_v2,
                                                   missing_evicted_path);
-    if (evicted_path_v3 < 0 || evicted_missing_v3 < 0) {
-        return Fail("store-restart-reconcile: EVICTED setup failed");
+    if (evicting_v3 < 0 || evicted_path_v3 < 0 || evicted_missing_v3 < 0) {
+        return Fail("store-restart-reconcile: EVICTING/EVICTED setup failed");
     }
     if (!force_catalog_evicted_empty_path(evicted_empty_path_hash)) {
         return Fail("store-restart-reconcile: EVICTED empty-path setup failed");
@@ -937,7 +949,7 @@ int RunStoreRestartReconcile(const std::string& endpoint, int pg_port) {
 
     BatchLookupRequest l;
     l.mutable_meta()->set_request_id(run_id + "_lookup_after_restart");
-    for (const auto& h : {allocated_hash, stored_hash, evicted_with_path_hash,
+    for (const auto& h : {allocated_hash, stored_hash, evicting_hash, evicted_with_path_hash,
                           evicted_missing_path_hash, evicted_empty_path_hash}) {
         auto* lit = l.add_items();
         lit->set_block_hash(h);
@@ -946,7 +958,7 @@ int RunStoreRestartReconcile(const std::string& endpoint, int pg_port) {
     BatchLookupResponse lr;
     brpc::Controller lcntl;
     meta.BatchLookupWithLease(&lcntl, &l, &lr, nullptr);
-    if (lcntl.Failed() || lr.results_size() != 5) {
+    if (lcntl.Failed() || lr.results_size() != 6) {
         return Fail("store-restart-reconcile: lookup after restart failed");
     }
 
@@ -966,12 +978,13 @@ int RunStoreRestartReconcile(const std::string& endpoint, int pg_port) {
     };
     if (!expect_not_found(0, "ALLOCATED") ||
         !expect_not_found(1, "STORED") ||
-        !expect_not_found(3, "EVICTED-missing-path") ||
-        !expect_not_found(4, "EVICTED-empty-path")) {
+        !expect_not_found(2, "EVICTING") ||
+        !expect_not_found(4, "EVICTED-missing-path") ||
+        !expect_not_found(5, "EVICTED-empty-path")) {
         return Fail("store-restart-reconcile: deleted-row assertions failed");
     }
 
-    const auto& preserved = lr.results(2);
+    const auto& preserved = lr.results(3);
     if (!preserved.result().success() ||
         preserved.status() != BLOCK_STATUS_EVICTED ||
         !preserved.evicted_catalog_hit() ||
@@ -980,7 +993,8 @@ int RunStoreRestartReconcile(const std::string& endpoint, int pg_port) {
     }
 
     std::cout << "STORE_RESTART_RECONCILE_OK fake_store_id=" << fake_store_id
-              << " deleted=ALLOCATED,STORED,EVICTED_EMPTY_PATH,EVICTED_MISSING_PATH"
+              << " scanned=6 preserved=1 validated=2 invalid_deleted=1 validation_failed=0"
+              << " deleted=ALLOCATED,STORED,EVICTING,EVICTED_EMPTY_PATH,EVICTED_MISSING_PATH"
               << " preserved=EVICTED_WITH_VALID_PATH"
               << " validation_endpoint=" << synthetic_store_endpoint
               << " endpoint=" << endpoint << std::endl;

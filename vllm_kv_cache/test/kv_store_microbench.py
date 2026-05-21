@@ -118,8 +118,10 @@ def _normalize_path_mode(raw: str) -> str:
 
 
 def _path_section_name(path_mode: str, locality_summary: Dict[str, Any]) -> str:
-    if path_mode in ("local-shm-zero-copy-read", "local-shm-prealloc-write"):
+    if path_mode == "local-shm-zero-copy-read":
         return "local_shm_upper_bound"
+    if path_mode == "local-shm-prealloc-write":
+        return "local_shm_prealloc_write_bound"
     if path_mode == "remote-brpc-attachment":
         return "remote_brpc_upper_bound"
     if path_mode == "pure-native-memcpy":
@@ -247,7 +249,7 @@ def _print_table(result: Dict[str, Any]) -> None:
             f"p95={p['p95_ms']:.4f}ms p99={p['p99_ms']:.4f}ms "
             f"instr_MB/s={p['instrumented_mb_s']:.3f}"
         )
-    for key in ("local_shm_upper_bound", "remote_brpc_upper_bound", "mixed_facade_bound", "native_memcpy_bound"):
+    for key in ("local_shm_upper_bound", "local_shm_prealloc_write_bound", "remote_brpc_upper_bound", "mixed_facade_bound", "native_memcpy_bound"):
         if key in result:
             print(f"{key}=" + json.dumps(result[key], sort_keys=True))
     if result.get("zero_copy_read"):

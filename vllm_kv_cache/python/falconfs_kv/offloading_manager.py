@@ -247,6 +247,20 @@ class FalconFSOffloadingManager:
             "fallback_reasons": {},
         }
         self._zero_copy_lock = threading.Lock()
+        self._prealloc_load_buffers_enabled = _env_bool("FALCON_KV_CLIENT_PREALLOC_LOAD_BUFFERS", False)
+        self._prealloc_load_pool_capacity = _env_int("FALCON_KV_CLIENT_PREALLOC_LOAD_BUFFER_POOL", 1024)
+        self._prealloc_load_lock = threading.Lock()
+        self._prealloc_load_pool: List[bytearray] = []
+        self._prealloc_load_outstanding: Dict[str, Tuple[bytearray, int]] = {}
+        self._prealloc_load_stats = {
+            "enabled": bool(self._prealloc_load_buffers_enabled),
+            "blocks": 0,
+            "bytes": 0,
+            "buffers_created": 0,
+            "buffers_reused": 0,
+            "buffers_returned": 0,
+            "fallback_reasons": {},
+        }
         self._meta_stage_pool = ThreadPoolExecutor(
             max_workers=self._meta_parallelism_max, thread_name_prefix="kv-om-meta"
         )
@@ -341,6 +355,7 @@ class FalconFSOffloadingManager:
         if self._promote_worker is not None:
             out["promote_on_read"] = self._promote_worker.stats()
         out["zero_copy_read"] = self._zero_copy_snapshot()
+        out["prealloc_load_buffers"] = self._prealloc_load_snapshot()
         if falconfs_kv_brpc is not None:
             try:
                 out["metadata_channel_cache"] = dict(falconfs_kv_brpc.metadata_channel_stats())
@@ -395,6 +410,8 @@ class FalconFSOffloadingManager:
             "bytes_materialized_blocks": 0.0,
             "local_shm_views": 0.0,
             "remote_attachment_views": 0.0,
+            "preallocated_load_blocks": 0.0,
+            "preallocated_load_bytes": 0.0,
         }
         try:
             return self._batch_load_impl(keys)
@@ -450,28 +467,34 @@ class FalconFSOffloadingManager:
                     "bytes_materialized_blocks": int(acc.get("bytes_materialized_blocks", 0.0)),
                     "local_shm_views": int(acc.get("local_shm_views", 0.0)),
                     "remote_attachment_views": int(acc.get("remote_attachment_views", 0.0)),
+                    "preallocated_load_blocks": int(acc.get("preallocated_load_blocks", 0.0)),
+                    "preallocated_load_bytes": int(acc.get("preallocated_load_bytes", 0.0)),
+                    "prealloc_load_buffers_enabled": bool(getattr(self, "_prealloc_load_buffers_enabled", False)),
                 }
             self._adaptive_observe_from_acc(acc, is_write=False)
             self._om_perf_ld_acc = None
             self._om_perf_ld_lookup_dn = {}
 
     def complete_load(self, keys: List[str], req_context=None):
-        if self._om_perf_enabled:
-            t0 = time.perf_counter()
-            self._om_perf_renew_dn = {}
+        try:
+            if self._om_perf_enabled:
+                t0 = time.perf_counter()
+                self._om_perf_renew_dn = {}
+                self._batch_renew_impl(keys)
+                renew_by_dn = dict(getattr(self, "_om_perf_renew_dn", {}))
+                with self._om_perf_lock:
+                    self._om_perf_last["complete_load"] = {
+                        "wall_s": time.perf_counter() - t0,
+                        "meta_renew_s": float(sum(renew_by_dn.values())),
+                        "meta_renew_by_dn_s": renew_by_dn,
+                        "n_keys": len(keys),
+                        "meta_parallelism_max": float(self._meta_parallelism_max),
+                    }
+                self._om_perf_renew_dn = {}
+                return
             self._batch_renew_impl(keys)
-            renew_by_dn = dict(getattr(self, "_om_perf_renew_dn", {}))
-            with self._om_perf_lock:
-                self._om_perf_last["complete_load"] = {
-                    "wall_s": time.perf_counter() - t0,
-                    "meta_renew_s": float(sum(renew_by_dn.values())),
-                    "meta_renew_by_dn_s": renew_by_dn,
-                    "n_keys": len(keys),
-                    "meta_parallelism_max": float(self._meta_parallelism_max),
-                }
-            self._om_perf_renew_dn = {}
-            return
-        self._batch_renew_impl(keys)
+        finally:
+            self._prealloc_load_release(keys)
 
     def prepare_store(self, keys: List[str], req_context=None) -> Optional[LoadStoreSpec]:
         if not self._om_perf_enabled:
@@ -1062,6 +1085,62 @@ class FalconFSOffloadingManager:
         out["enabled"] = bool(getattr(self, "_zero_copy_reads_enabled", False))
         return out
 
+    def _prealloc_load_bump(self, key: str, count: int = 1, reason: str = "") -> None:
+        with self._prealloc_load_lock:
+            if key == "fallback":
+                reasons = self._prealloc_load_stats.setdefault("fallback_reasons", {})
+                reasons[reason or "unknown"] = int(reasons.get(reason or "unknown", 0)) + int(count)
+            else:
+                self._prealloc_load_stats[key] = int(self._prealloc_load_stats.get(key, 0)) + int(count)
+
+    def _prealloc_load_snapshot(self) -> Dict[str, Any]:
+        with self._prealloc_load_lock:
+            out = dict(self._prealloc_load_stats)
+            out["fallback_reasons"] = dict(self._prealloc_load_stats.get("fallback_reasons", {}))
+            out["pool_size"] = len(self._prealloc_load_pool)
+            out["outstanding"] = len(self._prealloc_load_outstanding)
+            out["pool_capacity"] = int(getattr(self, "_prealloc_load_pool_capacity", 0))
+        out["enabled"] = bool(getattr(self, "_prealloc_load_buffers_enabled", False))
+        return out
+
+    def _prealloc_load_acquire(self, size: int) -> bytearray:
+        n = max(0, int(size))
+        with self._prealloc_load_lock:
+            while self._prealloc_load_pool:
+                buf = self._prealloc_load_pool.pop()
+                if len(buf) >= n:
+                    self._prealloc_load_stats["buffers_reused"] = int(self._prealloc_load_stats.get("buffers_reused", 0)) + 1
+                    return buf
+            self._prealloc_load_stats["buffers_created"] = int(self._prealloc_load_stats.get("buffers_created", 0)) + 1
+        return bytearray(max(n, int(self.block_size)))
+
+    def _prealloc_load_materialize(self, key: str, payload: Any) -> memoryview:
+        view = memoryview(payload)
+        buf = self._prealloc_load_acquire(len(view))
+        buf_view = memoryview(buf)
+        buf_view[:len(view)] = view
+        with self._prealloc_load_lock:
+            old = self._prealloc_load_outstanding.pop(key, None)
+            if old is not None and len(self._prealloc_load_pool) < int(self._prealloc_load_pool_capacity):
+                self._prealloc_load_pool.append(old[0])
+                self._prealloc_load_stats["buffers_returned"] = int(self._prealloc_load_stats.get("buffers_returned", 0)) + 1
+            self._prealloc_load_outstanding[key] = (buf, len(view))
+            self._prealloc_load_stats["blocks"] = int(self._prealloc_load_stats.get("blocks", 0)) + 1
+            self._prealloc_load_stats["bytes"] = int(self._prealloc_load_stats.get("bytes", 0)) + int(len(view))
+        return memoryview(buf)[:len(view)]
+
+    def _prealloc_load_release(self, keys: List[str]) -> None:
+        if not getattr(self, "_prealloc_load_buffers_enabled", False):
+            return
+        with self._prealloc_load_lock:
+            for key in keys:
+                item = self._prealloc_load_outstanding.pop(key, None)
+                if item is None:
+                    continue
+                if len(self._prealloc_load_pool) < int(self._prealloc_load_pool_capacity):
+                    self._prealloc_load_pool.append(item[0])
+                    self._prealloc_load_stats["buffers_returned"] = int(self._prealloc_load_stats.get("buffers_returned", 0)) + 1
+
     def _store_io_wave_chunk_size(self, *, is_write: bool = True, batch_max: int = 1) -> int:
         """CPU-aware logical blocks per Store I/O wave.
 
@@ -1162,10 +1241,11 @@ class FalconFSOffloadingManager:
             raw_batch_max = 1
             local_batch_max = 1
             remote_batch_max = 1
-        step = self._store_io_wave_chunk_size(is_write=True, batch_max=max(raw_batch_max, local_batch_max, remote_batch_max))
+        max_configured_batch = max(raw_batch_max, local_batch_max, remote_batch_max)
+        step = self._store_io_wave_chunk_size(is_write=True, batch_max=max_configured_batch)
         if acc is not None:
             acc["wave_chunk_size"] = float(step)
-            acc["write_batching_enabled"] = 1.0 if max(raw_batch_max, local_batch_max, remote_batch_max) > 1 else 0.0
+            acc["write_batching_enabled"] = 1.0 if max_configured_batch > 1 else 0.0
             acc["write_batch_max_blocks"] = float(raw_batch_max)
             acc["write_batch_local_max_blocks"] = float(local_batch_max)
             acc["write_batch_remote_max_blocks"] = float(remote_batch_max)
@@ -1174,7 +1254,7 @@ class FalconFSOffloadingManager:
         for off in range(0, len(work), step):
             waves += 1
             chunk = work[off : off + step]
-            if raw_batch_max <= 1:
+            if max_configured_batch <= 1:
                 futs_one = {
                     self._data_stage_pool.submit(self._complete_store_write_one_key, k, data, batch_id, req_context): k
                     for k in chunk
@@ -1382,6 +1462,9 @@ class FalconFSOffloadingManager:
                     elapsed_s=time.perf_counter() - t_r0,
                     byte_count=len(payload),
                 )
+            if result.success and getattr(self, "_zero_copy_reads_enabled", False):
+                self._zero_copy_bump("fallback", 1, "ssd_read")
+                self._zero_copy_bump("bytes_materialized_blocks")
             if result.success and self._promote_worker is not None:
                 self._promote_worker.enqueue(
                     key,
@@ -1528,61 +1611,81 @@ class FalconFSOffloadingManager:
         acc_ld = self._om_perf_ld_acc
         t0 = time.perf_counter() if acc_ld is not None else 0.0
         view_kinds: List[str] = []
-        use_zero_copy = bool(
-            getattr(self, "_zero_copy_reads_enabled", False)
+        prealloc_enabled = bool(getattr(self, "_prealloc_load_buffers_enabled", False))
+        use_zero_copy = bool(getattr(self, "_zero_copy_reads_enabled", False))
+        use_view_source = bool(
+            (use_zero_copy or prealloc_enabled)
             and hasattr(cluster.store, "batch_read_payload_views")
         )
-        if use_zero_copy:
+        if use_view_source:
             try:
                 ok_flags, payloads, view_kinds = cluster.store.batch_read_payload_views(
                     store_id, pool_offsets, store_epochs, block_hashes, self.block_size
                 )
             except Exception:
-                self._zero_copy_bump("fallback", len(ordered_keys), "view_api_failed")
-                use_zero_copy = False
-        if not use_zero_copy and hasattr(cluster.store, "batch_read_payloads_fast"):
+                if use_zero_copy:
+                    self._zero_copy_bump("fallback", len(ordered_keys), "view_api_failed")
+                if prealloc_enabled:
+                    self._prealloc_load_bump("fallback", len(ordered_keys), "view_api_failed")
+                use_view_source = False
+        if not use_view_source and hasattr(cluster.store, "batch_read_payloads_fast"):
             ok_flags, payloads = cluster.store.batch_read_payloads_fast(
                 store_id, pool_offsets, store_epochs, block_hashes, self.block_size
             )
             view_kinds = ["bytes_fallback"] * len(payloads)
-            if getattr(self, "_zero_copy_reads_enabled", False):
+            if use_zero_copy:
                 self._zero_copy_bump("fallback", len(payloads), "view_api_unavailable")
-        elif not use_zero_copy:
+            if prealloc_enabled:
+                self._prealloc_load_bump("fallback", len(payloads), "view_api_unavailable")
+        elif not use_view_source:
             results = cluster.store.batch_read_blocks(store_id, blocks)
             ok_flags = [result.success for result, _ in results]
             payloads = [payload if result.success else b"" for result, payload in results]
             view_kinds = ["bytes_fallback"] * len(payloads)
-            if getattr(self, "_zero_copy_reads_enabled", False):
+            if use_zero_copy:
                 self._zero_copy_bump("fallback", len(payloads), "batch_fast_unavailable")
-        elapsed = time.perf_counter() - t0 if acc_ld is not None else 0.0
+            if prealloc_enabled:
+                self._prealloc_load_bump("fallback", len(payloads), "batch_fast_unavailable")
         if len(ok_flags) != len(ordered_keys) or len(payloads) != len(ordered_keys):
             raise RuntimeError(
                 f"Store {store_id} returned {len(payloads)} read payloads for {len(ordered_keys)} requested blocks"
             )
-        out: Dict[str, bytes] = {}
+        out: Dict[str, Any] = {}
+        result_kinds: List[str] = []
         total_bytes = 0
         for key, ok, payload in zip(ordered_keys, ok_flags, payloads):
             if not ok:
                 raise RuntimeError(f"Failed to read {key}: {ErrorCode.INTERNAL_ERROR}")
+            kind = view_kinds[len(out)] if len(view_kinds) > len(out) else "bytes_fallback"
+            if prealloc_enabled and not use_zero_copy and kind in ("local_native_buffer", "local_shm_view", "remote_attachment_buffer"):
+                payload = self._prealloc_load_materialize(key, payload)
+                kind = "preallocated_load_buffer"
             out[key] = payload
+            result_kinds.append(kind)
             total_bytes += len(payload)
-            kind = view_kinds[len(out) - 1] if len(view_kinds) >= len(out) else "bytes_fallback"
             if kind in ("local_native_buffer", "local_shm_view", "remote_attachment_buffer"):
                 self._zero_copy_bump("zero_copy_blocks")
                 if kind.startswith("local"):
                     self._zero_copy_bump("local_shm_views")
                 else:
                     self._zero_copy_bump("remote_attachment_views")
+            elif kind == "preallocated_load_buffer":
+                self._zero_copy_bump("bytes_materialized_blocks")
             else:
                 self._zero_copy_bump("bytes_materialized_blocks")
+        elapsed = time.perf_counter() - t0 if acc_ld is not None else 0.0
         if acc_ld is not None:
-            for kind in view_kinds:
+            for kind in result_kinds:
                 if kind in ("local_native_buffer", "local_shm_view", "remote_attachment_buffer"):
                     acc_ld["zero_copy_blocks"] = float(acc_ld.get("zero_copy_blocks", 0.0)) + 1.0
                     if kind.startswith("local"):
                         acc_ld["local_shm_views"] = float(acc_ld.get("local_shm_views", 0.0)) + 1.0
                     else:
                         acc_ld["remote_attachment_views"] = float(acc_ld.get("remote_attachment_views", 0.0)) + 1.0
+                elif kind == "preallocated_load_buffer":
+                    acc_ld["bytes_materialized_blocks"] = float(acc_ld.get("bytes_materialized_blocks", 0.0)) + 1.0
+                    acc_ld["preallocated_load_blocks"] = float(acc_ld.get("preallocated_load_blocks", 0.0)) + 1.0
+                    acc_ld["preallocated_load_bytes"] = float(acc_ld.get("preallocated_load_bytes", 0.0)) + float(self.block_size)
                 else:
                     acc_ld["bytes_materialized_blocks"] = float(acc_ld.get("bytes_materialized_blocks", 0.0)) + 1.0
             self._record_data_batch_io(

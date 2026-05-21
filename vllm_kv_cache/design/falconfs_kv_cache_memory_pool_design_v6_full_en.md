@@ -922,7 +922,7 @@ Helpers:
 - `Oid KvblockRelationIndexId(void)` — caches `RelnameGetRelid("falcon_kvblock_table_pkey")`.
 - `void ConstructCreateKvblockTableCommand(StringInfo, const char *)` — builds the v6.4 §3.1 schema; called by `falcon_create_kvblock_table()` (`falcon/distributed_backend/distributed_backend_falcon.c`) the first time the plugin starts on a DN.
 
-Recovery scans are wired for DN startup through `falcon::kv_proto::KVRecoveryRunner`: the runner opens a local libpq recovery connection, calls the catalog scan method, bumps `dn_epoch`, and applies rows to the in-process `KVMetadataEngine`. Rows whose Store region has not registered yet are parked and replayed when `RegisterStoreRegion` succeeds. Store-restart runtime fencing is implemented in `KVMetadataEngine::RegisterStoreRegion`: a higher `store_epoch` on identical geometry quarantines the region, clears that Store's DRAM shard-index entries, bitmap, meta slots, free counters, and pending restores, then publishes the new epoch. On that successful bump, the DN invokes `KVRecoveryRunner::ReconcileStoreRestart(store_node_id)`, whose recovery SQL method scans the durable catalog and deletes rows whose only copy was the lost DRAM image. `EVICTED` rows with a recorded `evicted_path` are preserved; remote SSD file validation/GC remains a Store-local hardening task because the PG backend cannot reliably stat each Store's local spill path.
+Recovery scans are wired for DN startup through `falcon::kv_proto::KVRecoveryRunner`: the runner opens a local libpq recovery connection, calls the catalog scan method, bumps `dn_epoch`, and applies rows to the in-process `KVMetadataEngine`. Rows whose Store region has not registered yet are parked and replayed when `RegisterStoreRegion` succeeds. Store-restart runtime fencing is implemented in `KVMetadataEngine::RegisterStoreRegion`: a higher `store_epoch` on identical geometry quarantines the region, clears that Store's DRAM shard-index entries, bitmap, meta slots, free counters, and pending restores, then publishes the new epoch. On that successful bump, the DN invokes `KVRecoveryRunner::ReconcileStoreRestart(store_node_id)`, whose recovery SQL method scans the durable catalog and deletes rows whose only copy was the lost DRAM image. `EVICTED` rows with a recorded `evicted_path` are preserved by the fast catalog pass, then the DN performs phase-2 Store-local validation through `KVStoreAdminService.ValidateEvictedPaths` in bounded chunks and deletes invalid preserved rows through the catalog recovery path. If the Store validation RPC fails, rows are kept and `validation_failed` is logged for operator repair.
 
 Important properties:
 
@@ -3697,7 +3697,7 @@ The hardcoded `min(8, len(groups))` ThreadPool is removed. Two **independently s
 #### 29.5.2 Data stage pool (`_data_stage_pool`)
 
 - **Wire transport.** Each task issues one bounded Store data RPC: either unary `WriteBlock` / `ReadBlock` / `ReadFromSSD`, or a small `BatchWriteBlock` / `BatchReadBlock` group against one `(dn_id, store_id)`. Same-host Stores use `LocalKVStoreShmFacade`; remote Stores use BRPC attachments. The Store does not run an internal worker pool; grouping is decided here on the client.
-- **Size:** `min(num_tasks, falcon_kv.client_data_parallelism_max, hw_concurrency * 2)`. Default `min(64, hw_concurrency * 2)`.
+- **Size:** `min(num_tasks, falcon_kv.client_data_parallelism_max, hw_concurrency * 2)`. Default `min(64, hw_concurrency * 2)`. Full-profile testing showed cpu*4 oversubscription can increase Store write latency, so the conservative cpu*2 default remains the baseline.
 - **Unit of work:** one bounded group of blocks for a single `(dn_id, store_id)`, capped by batch count and target bytes. If grouping is disabled, the group size is 1. Stripe-splitting is reserved for future very-large-block work; current 512 KiB / 1 MiB / 2 MiB KV blocks are tuned primarily by batch count and data-stage parallelism.
 - **What it carries:**
   - **Parallel store:** `Store.WriteBlock(item)` per task via `KVStoreFacadeRegistry::Resolve(store_id)` (Local SHM if same-host, else Remote BRPC).
@@ -3842,10 +3842,7 @@ performance policy from unary-only to bounded attachment micro-batching.
   local/remote ratios, metadata timings, OM data timings, C++ facade timings,
   byte counts, operation counts, batch sizes, wave count, and configured
   parallelism.
-- **Store micro-benchmark.** `vllm_kv_cache/test/kv_store_microbench.py` measures
-  Store facade read/write upper bounds with configurable block size, store set,
-  allocation mode, and multi-threaded client parallelism. It also prints a local
-  Python copy bound for perspective.
+- **Path-specific Store micro-benchmark.** `vllm_kv_cache/test/kv_store_microbench.py` now labels and persists separate upper bounds for `native_memcpy_bound`, `local_shm_upper_bound` (zero-copy local reads), `local_shm_prealloc_write_bound` (preallocated local writes), `remote_brpc_upper_bound`, and mixed facade runs. Payload generation, verification, warmup, and cleanup are outside the measured windows, and local modes assert Store locality.
 - **Regression gate hardening.** `scripts/falcon_kv_regression.sh` runs the KV
   smoke gate, restarts after destructive fault drills before Python E2E, aligns
   Python block size with Store block size, and `scripts/falcon_distributed_test.sh`
@@ -3869,6 +3866,8 @@ FALCON_KV_CLIENT_BATCH_WRITE_REMOTE_MAX_BLOCKS default write max
 FALCON_KV_CLIENT_BATCH_READ_TARGET_BYTES  default 8 MiB
 FALCON_KV_CLIENT_BATCH_WRITE_TARGET_BYTES default 4 MiB
 FALCON_KV_CLIENT_ADAPTIVE_BATCHING      default 0 (experimental)
+FALCON_KV_CLIENT_PREALLOC_LOAD_BUFFERS  default 0 (reuse client load buffers; opt-in)
+FALCON_KV_CLIENT_ZERO_COPY_READS        default 0 (return read-only native views; opt-in)
 ```
 
 Trade-off:
@@ -3909,20 +3908,9 @@ regress against the saved baseline JSON.
 
 #### 29.10.4 Remaining design gaps
 
-- **Adaptive batching controller.** The flag-gated implementation now applies
-  per-path configured caps and target-byte bounds and persists the selected
-  policy. The remaining release-tuning work is the closed-loop controller that
-  changes those caps from measured wall MB/s, p95 latency, error/throttle rate,
-  CPU count, data parallelism, and inflight bytes, with cooldown/hysteresis and
-  rollback on regression. Static defaults stay active until that loop proves no
-  loss against the saved baseline.
-- **Zero-copy read handoff limit.** Attachments reduce protobuf copies but Python
-  still materializes `bytes` for vLLM. A future integration should pass native
-  buffers or tensors directly where the vLLM API allows it.
-- **Recovery stress scale.** Smoke covers Store restart reconciliation and Store
-  SSD validation. The full profile still needs larger-row DN recovery, late Store
-  registration parking/replay, and interrupted-eviction stress variants before
-  release signoff.
+- **Adaptive batching release tuning.** The flag-gated implementation includes a closed-loop per-path controller that observes wall MB/s, p50/p95 latency, error/throttle rate, CPU count, data parallelism, batch size, block size, and inflight bytes. It probes one step at a time, rolls back on throughput drop, p95 spike, or errors, and persists selected policy/reason in mixed E2E JSON. Remaining work is release promotion: keep static defaults until adaptive-on beats or matches static defaults across repeated full-profile runs.
+- **Preallocated and zero-copy load buffers.** `FALCON_KV_CLIENT_PREALLOC_LOAD_BUFFERS=1` uses native read views as the source and copies into reusable client-owned `bytearray` buffers, returning `memoryview`s until `complete_load` releases them. `FALCON_KV_CLIENT_ZERO_COPY_READS=1` skips that copy and returns read-only native/local-SHM views directly. The remaining gap is real vLLM consumer validation proving no accidental `bytes()` materialization and selecting the safe default.
+- **Recovery stress breadth.** Unit coverage includes large DN recovery, late Store registration parking/replay, and DN-startup `EVICTING -> STORED` reconciliation. Cluster Store-restart reconciliation covers `ALLOCATED`, `STORED`, `EVICTING`, valid `EVICTED`, empty-path `EVICTED`, and missing-path `EVICTED` rows. Remaining release work is larger full-profile scale and richer Store-local SSD validation stress (out-of-root, non-regular, unreadable) against a real Store root.
 - **Full-profile regression.** Smoke is the required pre-commit gate; the full
   topology/failover/mixed/promote gate must run before declaring a release.
 
@@ -3941,8 +3929,7 @@ persist:
   chunk size, batch sizes, and inflight byte target.
 - Payload-generation policy: whether payloads were pre-generated outside phase
   timers and the memory cap used.
-- Baseline comparison: previous saved JSON path, percentage of Store facade
-  upper bound, and percentage change vs previous end-to-end run.
+- Baseline comparison: previous saved JSON path, path-correct percentages of `local_shm_upper_bound`, `local_shm_prealloc_write_bound`, and `remote_brpc_upper_bound`, plus percentage change vs previous end-to-end run.
 
 The mixed E2E dashboard is the reference format. It must make clear whether a
 number is **wall time**, **summed instrumented intervals**, or **C++ facade time**,
@@ -3967,24 +3954,14 @@ until the earlier correctness and observability gates are stable.
 3. **Promote-on-read metrics/admission — DONE for smoke.** Foreground SSD load
    returns before promote completion; queue-full, pressure, hotness, and failure
    metrics are exposed and tested.
-4. **Recovery stress — REMAINING FULL-PROFILE WORK.** DN startup recovery scans
-   are implemented; add large-row, late-Store-registration, and interrupted
-   eviction stress variants to the full profile.
+4. **Recovery stress — PARTIALLY DONE.** DN startup recovery scans, large-row unit stress, late Store registration parking/replay, DN-startup `EVICTING -> STORED`, and Store-restart `EVICTING` deletion are covered. Full-profile release work is larger cluster scale and real Store SSD validation edge cases (out-of-root, non-regular, unreadable).
 
 ### 30.2 Make performance policy adaptive but safe
 
-1. **Implement adaptive batching behind `FALCON_KV_CLIENT_ADAPTIVE_BATCHING=1`.**
-   Keep defaults static until the controller is proven. Tune independently for
-   local read, remote read, local write, and remote write.
-2. **Controller inputs:** wall MB/s, p95 latency, error/throttle rate, CPU count,
-   data parallelism, batch size, inflight bytes, local/remote path, and block
-   size.
-3. **Controller guardrails:** min/max batch size, max inflight bytes, hysteresis,
-   cooldown window, and rollback to the last-good policy on throughput drop or
-   p95 spike.
-4. **Default promotion rule:** adopt a new default only if it improves both read
-   and write aggregate throughput, does not regress p95, and stays within the
-   measured Store facade upper-bound percentage target.
+1. **Keep adaptive batching flag-gated.** The per-path probe/rollback controller is implemented behind `FALCON_KV_CLIENT_ADAPTIVE_BATCHING=1`; defaults remain static.
+2. **Repeat adaptive-on full runs.** Promote an adaptive policy only after at least three full-profile runs show no regression versus static defaults and improved or equal p95.
+3. **Do not promote write batching by default yet.** Write batch max stays `1` until batched writes improve both Store throughput and p95 versus unary writes.
+4. **Persist policy evidence.** Mixed E2E JSON must keep selected batch, previous batch, decision reason, rollback count, latency, throughput before/after, CPU count, data parallelism, and inflight bytes.
 
 ### 30.3 Strengthen benchmark and regression gates
 
@@ -3994,10 +3971,7 @@ until the earlier correctness and observability gates are stable.
 2. **Run both block sizes under memory pressure.** Use 1 MiB as the default local
    smoke size and 512 KiB for low-memory fallback; keep 2 MiB release coverage
    when DRAM allows.
-3. **Promote the micro-benchmark into the gate.** Add a non-flaky, bounded
-   `kv_store_microbench.py` smoke mode that verifies true multi-threaded client
-   parallelism and catches severe read/write regression without hard-coding a
-   machine-specific GB/s number.
+3. **Promote path-specific micro-benchmarks into the gate.** The regression runner persists separate native/local-read/local-write/remote/mixed JSON files and mixed E2E merges all of them. Local E2E comparisons must not be null when a local Store is exercised. Optional baseline gating fails on >10% store/load regression when `FALCON_MIX_BASELINE_JSON` is set, unless explicitly overridden with `FALCON_MIX_ALLOW_PERF_REGRESSION=1`.
 4. **Full profile before release.** `REGRESSION_PROFILE=smoke` is the pre-commit
    gate; `REGRESSION_PROFILE=full` is required before declaring the full design
    done because it covers failover/topology/mixed-colocation/promote drills.

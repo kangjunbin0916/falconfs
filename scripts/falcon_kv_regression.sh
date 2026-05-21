@@ -321,6 +321,7 @@ suite_kv_store_microbench_info() {
     local par_default=$(( $(nproc) * 2 ))
     if [ "$par_default" -gt 64 ]; then par_default=64; fi
     local parallelism="${FALCON_KV_MICRO_PARALLELISM:-$par_default}"
+    local copy_iters="${FALCON_KV_MICRO_COPY_BOUND_ITERS:-64}"
     if [ -z "${FALCON_KV_MICRO_STORES:-}" ]; then
         local count="${STORE_COUNT:-2}"
         local stores=""
@@ -331,16 +332,72 @@ suite_kv_store_microbench_info() {
         done
         export FALCON_KV_MICRO_STORES="$stores"
     fi
-    export FALCON_KV_MICRO_JSON="${FALCON_KV_MICRO_JSON:-$PROJECT_DIR/logs/falcon_kv_store_microbench_latest.json}"
-    log_step "  microbench info: stores=${FALCON_KV_MICRO_STORES} blocks=${blocks} block_bytes=${block_bytes} parallelism=${parallelism}"
-    if ! "$PYTHON_BIN" vllm_kv_cache/test/kv_store_microbench.py \
-        --mode facade \
-        --allocation metadata \
-        --blocks "$blocks" \
-        --block-bytes "$block_bytes" \
-        --parallelism "$parallelism" \
-        --copy-bound-iters "${FALCON_KV_MICRO_COPY_BOUND_ITERS:-64}"; then
-        log_warn "kv_store_microbench informational run failed; continuing without a performance gate"
+
+    mkdir -p "$PROJECT_DIR/logs"
+    local latest_json="${FALCON_KV_MICRO_JSON:-$PROJECT_DIR/logs/falcon_kv_store_microbench_latest.json}"
+    local native_json="${FALCON_KV_MICRO_NATIVE_JSON:-$PROJECT_DIR/logs/falcon_kv_store_microbench_native_latest.json}"
+    local local_read_json="${FALCON_KV_MICRO_LOCAL_READ_JSON:-$PROJECT_DIR/logs/falcon_kv_store_microbench_local_read_latest.json}"
+    local local_write_json="${FALCON_KV_MICRO_LOCAL_WRITE_JSON:-$PROJECT_DIR/logs/falcon_kv_store_microbench_local_write_latest.json}"
+    local remote_json="${FALCON_KV_MICRO_REMOTE_JSON:-$PROJECT_DIR/logs/falcon_kv_store_microbench_remote_latest.json}"
+    local local_store="${FALCON_KV_MICRO_LOCAL_STORE_ID:-1}"
+    local node_name="${FALCON_KV_MICRO_NODE_NAME:-${FALCON_MIX_FACADE_NODE_NAME:-${NODE_NAME:-v65mix0}}}"
+    local remote_stores=""
+    local store
+    IFS=',' read -ra _micro_store_ids <<< "$FALCON_KV_MICRO_STORES"
+    for store in "${_micro_store_ids[@]}"; do
+        if [ "$store" != "$local_store" ]; then
+            if [ -n "$remote_stores" ]; then remote_stores="$remote_stores,$store"; else remote_stores="$store"; fi
+        fi
+    done
+
+    export FALCON_MIX_MICROBENCH_JSONS="$native_json:$local_read_json:$local_write_json:$remote_json:$latest_json"
+    export FALCON_MIX_MICROBENCH_JSON="$latest_json"
+    log_step "  microbench info: stores=${FALCON_KV_MICRO_STORES} local_store=${local_store} node=${node_name} blocks=${blocks} block_bytes=${block_bytes} parallelism=${parallelism}"
+
+    if ! FALCON_KV_MICRO_JSON="$native_json" "$PYTHON_BIN" vllm_kv_cache/test/kv_store_microbench.py \
+        --mode facade --allocation fixed --stores "$local_store" --path-mode pure-native-memcpy \
+        --verify none --blocks "$blocks" --block-bytes "$block_bytes" \
+        --parallelism "$parallelism" --copy-bound-iters "$copy_iters"; then
+        log_warn "kv_store_microbench native memcpy bound failed; continuing"
+    fi
+
+    if ! NODE_NAME="$node_name" FALCON_KV_MICRO_REQUIRE_LOCAL=1 FALCON_KV_MICRO_JSON="$local_read_json" "$PYTHON_BIN" vllm_kv_cache/test/kv_store_microbench.py \
+        --mode facade --allocation metadata --stores "$local_store" --path-mode local-shm-zero-copy-read \
+        --require-local-store "$local_store" --verify none --blocks "$blocks" \
+        --block-bytes "$block_bytes" --parallelism "$parallelism" --copy-bound-iters "$copy_iters"; then
+        if [ "${FALCON_KV_MICRO_REQUIRE_LOCAL_BOUNDS:-1}" = "1" ]; then
+            log_err "kv_store_microbench local SHM zero-copy read bound failed"
+            return 1
+        fi
+        log_warn "kv_store_microbench local SHM zero-copy read bound failed; continuing"
+    fi
+
+    if ! NODE_NAME="$node_name" FALCON_KV_MICRO_REQUIRE_LOCAL=1 FALCON_KV_MICRO_JSON="$local_write_json" "$PYTHON_BIN" vllm_kv_cache/test/kv_store_microbench.py \
+        --mode facade --allocation metadata --stores "$local_store" --path-mode local-shm-prealloc-write \
+        --require-local-store "$local_store" --verify none --blocks "$blocks" \
+        --block-bytes "$block_bytes" --parallelism "$parallelism" --copy-bound-iters "$copy_iters"; then
+        if [ "${FALCON_KV_MICRO_REQUIRE_LOCAL_BOUNDS:-1}" = "1" ]; then
+            log_err "kv_store_microbench local SHM preallocated write bound failed"
+            return 1
+        fi
+        log_warn "kv_store_microbench local SHM preallocated write bound failed; continuing"
+    fi
+
+    if [ -n "$remote_stores" ]; then
+        if ! NODE_NAME="$node_name" FALCON_KV_MICRO_JSON="$remote_json" "$PYTHON_BIN" vllm_kv_cache/test/kv_store_microbench.py \
+            --mode facade --allocation metadata --stores "$remote_stores" --path-mode remote-brpc-attachment \
+            --verify none --blocks "$blocks" --block-bytes "$block_bytes" \
+            --parallelism "$parallelism" --copy-bound-iters "$copy_iters"; then
+            log_warn "kv_store_microbench remote BRPC attachment bound failed; continuing without remote upper bound"
+        fi
+    else
+        log_warn "kv_store_microbench remote BRPC attachment bound skipped; no remote stores in ${FALCON_KV_MICRO_STORES}"
+    fi
+
+    if ! NODE_NAME="$node_name" FALCON_KV_MICRO_JSON="$latest_json" "$PYTHON_BIN" vllm_kv_cache/test/kv_store_microbench.py \
+        --mode facade --allocation metadata --blocks "$blocks" --block-bytes "$block_bytes" \
+        --parallelism "$parallelism" --copy-bound-iters "$copy_iters"; then
+        log_warn "kv_store_microbench compatibility mixed/facade run failed; continuing without legacy latest JSON"
     fi
     return 0
 }

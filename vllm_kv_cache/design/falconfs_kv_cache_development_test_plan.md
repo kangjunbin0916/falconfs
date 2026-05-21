@@ -187,6 +187,8 @@ Exit criteria:
 
 ### M3 - Python OffloadingManager + BRPC Client Integration
 
+Status: implemented for reference and BRPC cluster modes. Remaining release work is real vLLM consumer validation for opt-in zero-copy buffers, not API parity.
+
 Deliverables:
 
 1. DN client adapter (BRPC-backed) with batch APIs:
@@ -210,6 +212,8 @@ Exit criteria:
 - Multi-DN routing validated by hashing keys to different DNs and asserting both DNs are hit.
 
 ### M4 - Distributed Multi-DN Validation
+
+Status: implemented in smoke/full regression. Remaining release work is broader full-profile recovery stress and path-correct performance baseline enforcement.
 
 Deliverables:
 
@@ -303,11 +307,11 @@ Exit criteria:
 
 ### WBS-5 (M4) Distributed Validation
 
-- [ ] D4.1 Harness adds KV ports + Store region registration on both DNs.
-- [ ] D4.2 `kv-cluster-test` command: alloc/write/update/lookup/read across both DNs.
-- [ ] D4.3 `kv-cluster-fault-test` command: epoch fencing, restart, two-phase eviction, idempotency replay.
-- [ ] D4.4 Per-DN counters/logs to assert both DNs hit.
-- [ ] D4.5 Repeat-cycle stability check.
+- [x] D4.1 Harness adds KV ports + Store region registration on both DNs.
+- [x] D4.2 `kv-cluster-test` command: alloc/write/update/lookup/read across both DNs.
+- [x] D4.3 `kv-cluster-fault-test` command: epoch fencing, restart, Store restart validation, two-phase eviction, idempotency replay.
+- [x] D4.4 Per-DN counters/logs to assert both DNs hit.
+- [x] D4.5 Repeat-cycle stability check.
 
 ### WBS-6 (M5) vLLM E2E
 
@@ -319,10 +323,10 @@ Exit criteria:
 
 ### Cross-cutting (parallel to all milestones)
 
-- [ ] X1 Observability: per-API metrics (qps/p50/p95/p99, error counters), DN-specific (bitmap free ratio, leases, eviction rollback), Store-specific (DRAM/SSD throughput).
-- [ ] X2 Structured logs with `request_id`, `trace_id`, `client_id`, `block_hash`, `dn_epoch`, `store_node_id`, `pool_offset`, `error_code`.
-- [ ] X3 Performance gate: per-API budgets per v6 full §21.
-- [ ] X4 Backpressure tuning: chunk size, queue depth.
+- [x] X1 Observability: per-API metrics, metadata channel cache metrics, promote/zero-copy/adaptive counters, local/remote throughput and latency, and persisted mixed E2E JSON.
+- [x] X2 Structured logs with `request_id`, `trace_id`, `client_id`, `block_hash`, `dn_epoch`, `store_node_id`, `pool_offset`, `error_code`, and Store restart validation counters.
+- [ ] X3 Performance gate: path-specific upper-bound JSONs and optional baseline regression gate are implemented; release still needs repeated adaptive-on/zero-copy-on no-regression evidence.
+- [ ] X4 Backpressure tuning: chunk size, queue depth, adaptive batching promotion thresholds, and zero-copy consumer rollout remain release tuning.
 
 ---
 
@@ -416,21 +420,21 @@ python3 vllm_kv_cache/test/vllm/benchmark_vllm_kv.py
 
 ## 8. Acceptance Matrix
 
-- [ ] A1 Partial Store write failure never marks failed keys as `STORED`.
-- [ ] A2 PG concurrent-update returns retryable `CAS_CONFLICT`; CAS by version mismatch returns the same.
-- [ ] A3 Leases are ownerless; `LEASE_TOKEN_MISMATCH` and `LEASE_EXPIRED` are distinct, retryable after lookup.
-- [ ] A4 Stale `dn_epoch`/`store_epoch` requests are fenced with `STALE_EPOCH` (retryable after refresh).
-- [ ] A5 DN restart rebuilds bitmap/LRU/lease and bumps `dn_epoch`; old lease tokens rejected.
+- [x] A1 Partial Store write failure never marks failed keys as `STORED`.
+- [x] A2 PG concurrent-update returns retryable `CAS_CONFLICT`; CAS by version mismatch returns the same.
+- [x] A3 Leases are ownerless; `LEASE_TOKEN_MISMATCH` and `LEASE_EXPIRED` are distinct, retryable after lookup.
+- [x] A4 Stale `dn_epoch`/`store_epoch` requests are fenced with `STALE_EPOCH` (retryable after refresh).
+- [x] A5 DN restart rebuilds bitmap/LRU/lease and bumps `dn_epoch`; old lease tokens rejected.
 - [x] A6 Store restart with new epoch quarantines region until reconciliation; old `store_epoch` rejected; DRAM-only rows deleted; `EVICTED` rows with valid `evicted_path` preserved after Store validation; invalid/missing SSD paths deleted.
-- [ ] A7 Two-phase eviction: success path frees bitmap, rollback path restores `STORED` and LRU.
-- [ ] A8 `complete_store(success=False)` and partial-data cases free or schedule cleanup of failed keys.
-- [ ] A9 Probe-only `lookup()` is side-effect-free; reads must use `prepare_load()`.
-- [ ] A10 Mutating RPCs are idempotent under retry by `(api_name, request_id, client_id)`.
-- [ ] A11 EVICTING lookup returns `CAS_CONFLICT, retryable=true`, never a half-evicted location.
-- [ ] A12 Distributed: keys hashed across DNs verifiably hit both DN1 and DN2.
-- [ ] A13 vLLM smoke + correctness + fault green.
-- [ ] A14 Per-API latency budgets met (v6 full §21 targets) on the harness baseline.
-- [ ] A15 Observability: required metrics and structured logs emitted.
+- [x] A7 Two-phase eviction: success path frees bitmap, rollback path restores `STORED` and LRU.
+- [x] A8 `complete_store(success=False)` and partial-data cases free or schedule cleanup of failed keys.
+- [x] A9 Probe-only `lookup()` is side-effect-free; reads must use `prepare_load()`.
+- [x] A10 Mutating RPCs are idempotent under retry by `(api_name, request_id, client_id)`.
+- [x] A11 EVICTING lookup returns `CAS_CONFLICT, retryable=true`, never a half-evicted location.
+- [x] A12 Distributed: keys hashed across DNs verifiably hit both DN1 and DN2.
+- [ ] A13 vLLM smoke + correctness + fault green. Current Python OffloadingManager E2E is green; real vLLM consumer path remains release validation.
+- [ ] A14 Per-API latency budgets met (v6 full §21 targets) on the harness baseline. Current gate persists path-specific bounds and optional baseline comparison; repeated no-regression runs remain.
+- [x] A15 Observability: required metrics and structured logs emitted.
 
 ---
 
@@ -455,11 +459,11 @@ Status legend: `TODO`, `IN_PROGRESS`, `BLOCKED`, `DONE`.
 | P2 | M2 Store native path | DONE | agent | 2026-05-07 | Completed KV BRPC integration in PG extension runtime end-to-end: `libbrpcplugin.so` links KV metadata/data stack + generated KV protobufs, `FalconBrpcServer::Run` registers legacy meta + KV metadata + KV data BRPC services, and KV RPCs are now enqueued via `KVCacheJob` shim to `PGConnectionPool::DispatchKVServiceJob` (executed on pool workers through `KVCacheWorkerTask`) instead of running on BRPC worker threads. Plugin build now supports read-only source proto dirs by generating KV protobufs under `build/brpc_comm_adapter/proto` and reusing existing remote proto objects. Validation: full `./build.sh build falcon` + `FalconKVPrimitivesUT` (71 tests) green |
 | P2A | M2 Phase A (data service backend baseline) | DONE | agent | 2026-05-06 | Added `KVStoreEngine` and rewired `KVDataServiceImpl` write/read/read-from-ssd off stubs to backend semantics; added `test_kv_store_engine.cpp` and expanded `test_kv_data_service_impl.cpp`; full gates green (`FalconKVPrimitivesUT` 34 tests + `kv-test` + `kv-fault-test`) |
 | P2B | M2 Phase B (DRAM pool + region state + SSD spill) | DONE | agent | 2026-05-06 | Added `DramPool` (mmap-backed, hugepage-aware), `StoreRegionRegistry` (region state machine with heartbeat ticks + epoch-driven QUARANTINED), `SSDSpillManager` (sanitized path layout + `fdatasync`); refactored `KVStoreEngine` to use them; added unit tests `test_dram_pool.cpp`, `test_store_region_registry.cpp`, `test_ssd_spill_manager.cpp`, plus integration tests in `test_kv_store_engine.cpp`. Registered `falcon_kv.{max_stores,lease_default_ttl_ms,lease_recovery_grace_ms,idempotency_ttl_ms,store_max_inflight,store_suspect_ms,store_offline_ms,client_max_inflight_per_dn,eviction_chunk}` GUCs in `falcon_init.c` (validated by 2-DN cluster start). Full gates green: `FalconKVPrimitivesUT` 48 tests + `kv-test` + `kv-fault-test` |
-| P3 | M3 Python OffloadingManager + BRPC clients | IN_PROGRESS | agent | 2026-05-06 | Reference manager now supports multi-DN routing, partial-failure cleanup, and `prepare_store` returning `None`. BRPC adapters pending |
-| P4 | M4 Distributed 2-DN cluster validation | TODO | unassigned | - | Adds `kv-cluster-test`, `kv-cluster-fault-test` |
-| P5 | M5 vLLM end-to-end suite | TODO | unassigned | - | Smoke/correctness/fault/benchmark |
-| X1 | Observability + metrics | TODO | unassigned | - | Cross-cutting |
-| X2 | Performance gates | TODO | unassigned | - | Cross-cutting; tied to v6 §21 |
+| P3 | M3 Python OffloadingManager + BRPC clients | DONE | agent | 2026-05-19 | BRPC cluster mode, metadata channel reuse metrics, partial-failure cleanup, zero-copy buffer plumbing, and Python E2E are implemented; real vLLM zero-copy consumer validation remains under M5 |
+| P4 | M4 Distributed multi-DN cluster validation | DONE | agent | 2026-05-19 | `kv-cluster-test`, `kv-cluster-fault-test`, failover/topology/mixed-colocation/promote, Store restart SSD validation, and smoke/full regression gates are present |
+| P5 | M5 vLLM end-to-end suite | IN_PROGRESS | agent | 2026-05-19 | Python OffloadingManager E2E and metrics JSON are green; real vLLM integration and zero-copy consumer validation remain |
+| X1 | Observability + metrics | DONE | agent | 2026-05-19 | Mixed E2E persists metadata/data path latency, local/remote ratios, metadata channel cache, promote, zero-copy, adaptive, recovery, and upper-bound comparisons |
+| X2 | Performance gates | IN_PROGRESS | agent | 2026-05-19 | Path-specific microbench JSONs and optional baseline gating are implemented; adaptive-on/zero-copy-on promotion remains informational until repeated no-regression evidence |
 
 ---
 
