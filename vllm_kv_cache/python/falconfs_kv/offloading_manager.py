@@ -142,15 +142,28 @@ class FalconFSOffloadingManager:
         timeout_ms: int = 30000,
         cn_conninfo: Optional[str] = None,
     ):
-        if mode == "cluster" and (not shard_table):
-            if not cn_conninfo:
+        if mode == "cluster":
+            if not shard_table and not cn_conninfo:
                 raise RuntimeError("mode=cluster requires shard_table or cn_conninfo")
             if falconfs_kv_brpc is None:
                 raise RuntimeError("falconfs_kv_brpc extension is required for cluster mode")
-            falconfs_kv_brpc.membership_start(cn_conninfo)
-            # Prime registry + DN endpoint view.
-            falconfs_kv_brpc.membership_refresh(timeout_ms)
-            shard_table = falconfs_kv_brpc.discover_dn_endpoints()
+            if cn_conninfo:
+                falconfs_kv_brpc.membership_start(cn_conninfo)
+                # Prime Store facade registry. Also discover DN endpoints when
+                # the caller did not provide an explicit shard table. CN/DN rows
+                # can lag briefly after restart and fault drills, so use the
+                # caller's timeout as a discovery budget instead of failing after
+                # one empty snapshot.
+                deadline = time.monotonic() + max(0.1, float(timeout_ms) / 1000.0)
+                while True:
+                    falconfs_kv_brpc.membership_refresh(timeout_ms)
+                    if shard_table:
+                        break
+                    discovered = falconfs_kv_brpc.discover_dn_endpoints()
+                    if discovered or time.monotonic() >= deadline:
+                        shard_table = discovered
+                        break
+                    time.sleep(0.25)
         self.shard_table = dict(shard_table or {})
         if mode == "cluster" and not self.shard_table:
             raise RuntimeError("cluster mode discovered no DN endpoints")
