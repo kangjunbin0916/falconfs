@@ -24,7 +24,6 @@ try:
         offload_key_to_falcon_key,
     )
     from vllm.config.kv_transfer import KVTransferConfig
-    from vllm.config.vllm import VllmConfig
     from vllm.v1.kv_offload.abstract import ReqContext, make_offload_key
     from vllm.v1.kv_offload.mediums import GPULoadStoreSpec
     from vllm.v1.kv_offload.spec import CanonicalKVCaches, CanonicalKVCacheRef, CanonicalKVCacheTensor
@@ -209,7 +208,7 @@ class FalconFSVllmConnectorTest(unittest.TestCase):
         load.shutdown()
 
 
-    def _fake_vllm_config(self, *, role="kv_both", extra=None, backend="falconfs", connector=None):
+    def _fake_vllm_config(self, *, role="kv_both", extra=None, backend="native", connector=None):
         ktc = KVTransferConfig(
             kv_connector=connector,
             kv_role=role,
@@ -230,26 +229,27 @@ class FalconFSVllmConnectorTest(unittest.TestCase):
             model_config=SimpleNamespace(model="unit-model"),
         )
 
-    def test_vllm_config_first_class_falconfs_backend(self):
-        cfg = self._fake_vllm_config(extra={"cn_conninfo": "dbname=falcon"})
-        VllmConfig._post_init_kv_transfer_config(cfg)
+    def test_dynamic_connector_config_is_supported_without_vllm_patch(self):
+        cfg = self._fake_vllm_config(
+            extra={
+                "cn_conninfo": "dbname=falcon",
+                "falconfs_namespace": "ns",
+                "falconfs_tenant": "tenant",
+            },
+            connector="FalconFSConnector",
+        )
+        cfg.kv_transfer_config.kv_connector_module_path = "falconfs_kv.vllm_kv_connector"
+        adapter = FalconFSOffloadingManagerAdapter(
+            vllm_config=cfg,
+            inner_manager=SimpleNamespace(local_cache={}),
+        )
         self.assertEqual(cfg.kv_transfer_config.kv_connector, "FalconFSConnector")
         self.assertEqual(
             cfg.kv_transfer_config.kv_connector_module_path,
             "falconfs_kv.vllm_kv_connector",
         )
-        self.assertEqual(cfg.kv_transfer_config.kv_role, "kv_both")
-        self.assertEqual(
-            cfg.kv_transfer_config.kv_connector_extra_config["cn_conninfo"],
-            "dbname=falcon",
-        )
-
-    def test_vllm_config_rejects_conflicting_falconfs_connector(self):
-        cfg = self._fake_vllm_config(
-            extra={"cn_conninfo": "dbname=falcon"}, connector="OtherConnector"
-        )
-        with self.assertRaisesRegex(ValueError, "requires kv_connector"):
-            VllmConfig._post_init_kv_transfer_config(cfg)
+        self.assertEqual(adapter.key_namespace.namespace, "ns")
+        self.assertEqual(adapter.key_namespace.tenant, "tenant")
 
     def test_namespaced_keys_are_stable_and_isolated(self):
         key = self._key(44)
