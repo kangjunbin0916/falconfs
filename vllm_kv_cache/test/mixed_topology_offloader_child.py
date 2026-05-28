@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import sys
 import time
 from pathlib import Path
@@ -26,6 +27,24 @@ def _fail(msg: str) -> int:
 def _emit_report(obj: dict) -> int:
     sys.stdout.write("FALCON_MIX_REPORT\t" + json.dumps(obj, ensure_ascii=False) + "\n")
     return 0
+
+
+def _can_reach(endpoint: str, timeout_s: float = 0.5) -> bool:
+    try:
+        host, port = endpoint.rsplit(":", 1)
+        with socket.create_connection((host, int(port)), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
+def _fallback_dn_shard_table() -> dict[int, str]:
+    candidates = {
+        1: os.environ.get("FALCON_VLLM_SMOKE_DN1_ENDPOINT", "127.0.0.1:55530"),
+        2: os.environ.get("FALCON_VLLM_SMOKE_DN2_ENDPOINT", "127.0.0.1:55550"),
+        3: os.environ.get("FALCON_VLLM_SMOKE_DN3_ENDPOINT", "127.0.0.1:55570"),
+    }
+    return {dn_id: ep for dn_id, ep in candidates.items() if _can_reach(ep)}
 
 
 def main() -> int:
@@ -54,7 +73,7 @@ def main() -> int:
 
     t0 = time.perf_counter()
     brpc.facade_ipc_stats_reset()
-    mgr = FalconFSOffloadingManager(
+    mgr_kwargs = dict(
         client_id=cid,
         client_hostname=node,
         mode="cluster",
@@ -62,6 +81,15 @@ def main() -> int:
         timeout_ms=45000,
         cn_conninfo=cn,
     )
+    try:
+        mgr = FalconFSOffloadingManager(**mgr_kwargs)
+    except RuntimeError as exc:
+        if "discovered no DN endpoints" not in str(exc):
+            raise
+        fallback_shards = _fallback_dn_shard_table()
+        if len(fallback_shards) < 3:
+            raise
+        mgr = FalconFSOffloadingManager(shard_table=fallback_shards, **mgr_kwargs)
     t_init = time.perf_counter() - t0
 
     m = re.fullmatch(r"v65mix(\d+)", node)

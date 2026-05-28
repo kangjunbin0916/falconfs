@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -357,6 +358,133 @@ class FalconFSVllmConnectorTest(unittest.TestCase):
         self.assertTrue(adapter.write_prepared_payloads(spec, {key: payload}))
         self.assertIsInstance(inner.seen_payload, memoryview)
         self.assertEqual(bytes(inner.seen_payload), b"abcdefgh")
+
+    def test_async_and_layerwise_config_defaults_and_overrides(self):
+        default_adapter = FalconFSOffloadingManagerAdapter(
+            vllm_config=self._fake_vllm_config(connector="FalconFSConnector"),
+            inner_manager=SimpleNamespace(local_cache={}),
+        )
+        self.assertTrue(default_adapter.async_load_enabled)
+        self.assertFalse(default_adapter.layerwise_load_enabled)
+        self.assertEqual(default_adapter.layer_prefetch_depth, 2)
+
+        adapter = FalconFSOffloadingManagerAdapter(
+            vllm_config=self._fake_vllm_config(
+                connector="FalconFSConnector",
+                extra={
+                    "falconfs_async_load": False,
+                    "falconfs_layerwise_load": True,
+                    "falconfs_layer_prefetch_depth": 3,
+                },
+            ),
+            inner_manager=SimpleNamespace(local_cache={}),
+        )
+        self.assertFalse(adapter.async_load_enabled)
+        self.assertTrue(adapter.layerwise_load_enabled)
+        self.assertEqual(adapter.layer_prefetch_depth, 3)
+
+    def _layerwise_handler_fixture(self, *, async_load=True, layerwise=True, read_gate=None):
+        key = self._key(500)
+        tensor = torch.zeros((3, 16), dtype=torch.int8)
+        caches = CanonicalKVCaches(
+            tensors=[CanonicalKVCacheTensor(tensor=tensor, page_size_bytes=16)],
+            group_data_refs=[[CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=16)]],
+        )
+        falcon_spec = FalconFSLoadStoreSpec(
+            [key],
+            [FalconFSBlockLocationSpec(key, offload_key_to_falcon_key(key), dn_id=1, store_id=1, pool_offset=0, store_epoch=1)],
+        )
+        gpu_spec = GPULoadStoreSpec([1], group_sizes=(1,))
+
+        class Adapter:
+            def __init__(self):
+                self.async_load_enabled = async_load
+                self.layerwise_load_enabled = layerwise
+                self.layer_prefetch_depth = 1
+                self.load_failure_policy = "recompute"
+                self.kv_cache_config = SimpleNamespace(
+                    kv_cache_groups=[SimpleNamespace(layer_names=["layer.0", "layer.1"])]
+                )
+                self.stats = {}
+                self.read_calls = 0
+
+            def _bump(self, key, count=1):
+                self.stats[key] = self.stats.get(key, 0) + count
+
+            def read_prepared_payloads(self, spec):
+                self.read_calls += 1
+                if read_gate is not None:
+                    read_gate[0].set()
+                    if not read_gate[1].wait(timeout=2.0):
+                        raise TimeoutError("layer-wise async read was not released")
+                return {key: bytes(range(16))}
+
+        adapter = Adapter()
+        handler = _FalconFSTransferHandler(adapter, caches, block_size_factor=1, gpu_to_falconfs=False)
+        return adapter, handler, tensor, falcon_spec, gpu_spec
+
+    def test_whole_block_sync_load_completes_inline_when_async_disabled(self):
+        adapter, handler, tensor, falcon_spec, gpu_spec = self._layerwise_handler_fixture(
+            async_load=False,
+            layerwise=False,
+        )
+        try:
+            self.assertTrue(handler.transfer_async(10, (falcon_spec, gpu_spec)))
+            result = handler.get_finished()
+            self.assertEqual(len(result), 1)
+            self.assertTrue(result[0].success)
+            self.assertEqual(adapter.read_calls, 1)
+            self.assertEqual(tensor[1].tolist(), list(range(16)))
+            self.assertEqual(adapter.stats.get("whole_block_loads"), 1)
+        finally:
+            handler.shutdown()
+
+    def test_layerwise_sync_load_fetches_once_and_copies_per_wait(self):
+        adapter, handler, tensor, falcon_spec, gpu_spec = self._layerwise_handler_fixture(
+            async_load=False,
+            layerwise=True,
+        )
+        try:
+            self.assertTrue(handler.transfer_async(11, (falcon_spec, gpu_spec)))
+            self.assertEqual(adapter.read_calls, 0)
+            handler.wait_for_layer_load("layer.0")
+            self.assertEqual(adapter.read_calls, 1)
+            self.assertEqual(tensor[1, :8].tolist(), list(range(8)))
+            self.assertEqual(tensor[1, 8:].tolist(), [0] * 8)
+            handler.wait_for_layer_load("layer.1")
+            self.assertEqual(adapter.read_calls, 1)
+            self.assertEqual(tensor[1].tolist(), list(range(16)))
+            result = handler.get_finished()
+            self.assertEqual(len(result), 1)
+            self.assertTrue(result[0].success)
+            self.assertEqual(adapter.stats.get("layerwise_loads"), 1)
+            self.assertEqual(adapter.stats.get("layerwise_sync_waits"), 2)
+        finally:
+            handler.shutdown()
+
+    def test_layerwise_async_load_starts_fetch_before_layer_wait(self):
+        read_started = threading.Event()
+        read_unblock = threading.Event()
+        adapter, handler, tensor, falcon_spec, gpu_spec = self._layerwise_handler_fixture(
+            async_load=True,
+            layerwise=True,
+            read_gate=(read_started, read_unblock),
+        )
+        try:
+            self.assertTrue(handler.transfer_async(12, (falcon_spec, gpu_spec)))
+            self.assertTrue(read_started.wait(timeout=2.0))
+            self.assertEqual(adapter.read_calls, 1)
+            read_unblock.set()
+            handler.wait_for_layer_load("layer.0")
+            handler.wait_for_layer_load("layer.1")
+            result = handler.get_finished()
+            self.assertEqual(len(result), 1)
+            self.assertTrue(result[0].success)
+            self.assertEqual(tensor[1].tolist(), list(range(16)))
+            self.assertEqual(adapter.stats.get("layerwise_async_jobs"), 1)
+        finally:
+            read_unblock.set()
+            handler.shutdown()
 
 
 

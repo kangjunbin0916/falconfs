@@ -238,17 +238,28 @@ Exit criteria:
 
 ### M5 - vLLM End-to-End Validation
 
+Status: partially implemented. The dynamic FalconFS vLLM V1 KVConnector,
+batched scheduler lookup, namespaced keys, producer/consumer roles, direct block
+store/load tests, and async/layer-wise load unit coverage are implemented. The
+remaining release gate is live vLLM serving/offload on a GPU-capable host plus
+real consumer validation for opt-in zero-copy buffers.
+
 Deliverables:
 
 1. vLLM-installed environment provisioning notes.
-2. Smoke test passes (already skips when vLLM missing).
+2. Dynamic connector import/config smoke.
 3. Correctness test: deterministic prefix store→load round-trip.
-4. Fault test: Store offline becomes retryable failure or cache miss.
-5. Benchmark baseline: store/lookup/load latency for 100-block run.
+4. Async/layer-wise load mode matrix: whole-sync, whole-async, layer-sync,
+   layer-async.
+5. Live vLLM serving/offload on a GPU-capable host.
+6. Fault test: Store offline becomes retryable failure or cache miss.
+7. Benchmark baseline: store/lookup/load latency for 100-block run.
 
 Exit criteria:
 
-- All vLLM tests green or with documented skip reasons.
+- Dynamic connector unit/direct tests green locally, or skipped only for missing
+  optional vLLM/torch/live-cluster dependencies.
+- Live GPU serving/offload tests green before release.
 - Recorded baseline numbers committed in §10 execution log.
 
 ---
@@ -315,11 +326,13 @@ Exit criteria:
 
 ### WBS-6 (M5) vLLM E2E
 
-- [ ] D5.1 Provisioning notes for vLLM install.
-- [ ] D5.2 Smoke green.
-- [ ] D5.3 Correctness green.
-- [ ] D5.4 Fault green.
-- [ ] D5.5 Benchmark numbers captured.
+- [x] D5.1 Dynamic connector module and config path.
+- [x] D5.2 Batched scheduler lookup avoids single-key lookup storms.
+- [x] D5.3 Direct connector store/load correctness tests and namespace key tests.
+- [x] D5.4 Async/layer-wise load unit coverage for the four mode combinations.
+- [ ] D5.5 Live vLLM serve/offload green on GPU-capable host.
+- [ ] D5.6 Store-offline/failure policy green through live vLLM connector.
+- [ ] D5.7 Benchmark numbers captured for live connector path.
 
 ### Cross-cutting (parallel to all milestones)
 
@@ -384,11 +397,11 @@ scripts/falcon_distributed_test.sh stop
 scripts/falcon_distributed_test.sh status
 ```
 
-After M4 lands:
+Cluster validation commands:
 
 ```bash
-scripts/falcon_distributed_test.sh kv-cluster-test       # planned
-scripts/falcon_distributed_test.sh kv-cluster-fault-test # planned
+scripts/falcon_distributed_test.sh kv-cluster-test
+scripts/falcon_distributed_test.sh kv-cluster-fault-test
 ```
 
 ### 7.3 vLLM gate (run last)
@@ -410,11 +423,12 @@ python3 vllm_kv_cache/test/vllm/benchmark_vllm_kv.py
 | `test_brpc_contract_reference.py` | reference | active | end-to-end cycle, partial failure |
 | `test_kv_fault_reference.py` | reference | active | fault scenarios, EVICTING-as-conflict |
 | `test_offloading_manager_api.py` | reference | active | upstream API surface |
-| `test_offloading_manager_cluster.py` | reference + (cluster, future) | active | cluster entrypoint |
-| `test_offloading_manager.py` | legacy mock | RETIRE in M0 | superseded |
-| `test/vllm/*.py` | vLLM | placeholder | activated in M5 |
-| `kv-cluster-test` (planned) | cluster | TODO M4 | distributed BRPC validation |
-| `kv-cluster-fault-test` (planned) | cluster | TODO M4 | fault drills |
+| `test_offloading_manager_cluster.py` | reference + cluster | active | cluster entrypoint |
+| `test_offloading_manager.py` | legacy mock | retired | superseded and no longer present |
+| `test_vllm_kv_connector.py` | vLLM connector | active | dynamic connector, batched lookup, roles, async/layer-wise load |
+| `test_vllm_kv_connector_live.py` | live vLLM/FalconFS | active/skip-gated | direct connector E2E and opt-in live serve smoke |
+| `kv-cluster-test` | cluster | active | distributed BRPC validation |
+| `kv-cluster-fault-test` | cluster | active | fault drills |
 
 ---
 
@@ -461,7 +475,7 @@ Status legend: `TODO`, `IN_PROGRESS`, `BLOCKED`, `DONE`.
 | P2B | M2 Phase B (DRAM pool + region state + SSD spill) | DONE | agent | 2026-05-06 | Added `DramPool` (mmap-backed, hugepage-aware), `StoreRegionRegistry` (region state machine with heartbeat ticks + epoch-driven QUARANTINED), `SSDSpillManager` (sanitized path layout + `fdatasync`); refactored `KVStoreEngine` to use them; added unit tests `test_dram_pool.cpp`, `test_store_region_registry.cpp`, `test_ssd_spill_manager.cpp`, plus integration tests in `test_kv_store_engine.cpp`. Registered `falcon_kv.{max_stores,lease_default_ttl_ms,lease_recovery_grace_ms,idempotency_ttl_ms,store_max_inflight,store_suspect_ms,store_offline_ms,client_max_inflight_per_dn,eviction_chunk}` GUCs in `falcon_init.c` (validated by 2-DN cluster start). Full gates green: `FalconKVPrimitivesUT` 48 tests + `kv-test` + `kv-fault-test` |
 | P3 | M3 Python OffloadingManager + BRPC clients | DONE | agent | 2026-05-19 | BRPC cluster mode, metadata channel reuse metrics, partial-failure cleanup, zero-copy buffer plumbing, and Python E2E are implemented; real vLLM zero-copy consumer validation remains under M5 |
 | P4 | M4 Distributed multi-DN cluster validation | DONE | agent | 2026-05-19 | `kv-cluster-test`, `kv-cluster-fault-test`, failover/topology/mixed-colocation/promote, Store restart SSD validation, and smoke/full regression gates are present |
-| P5 | M5 vLLM end-to-end suite | IN_PROGRESS | agent | 2026-05-19 | Python OffloadingManager E2E and metrics JSON are green; real vLLM integration and zero-copy consumer validation remain |
+| P5 | M5 vLLM end-to-end suite | IN_PROGRESS | agent | 2026-05-26 | Dynamic FalconFSConnector, batched prefix lookup, namespace keys, roles, direct connector tests, and async/layer-wise load coverage are implemented. Remaining release validation is live GPU vLLM serve/offload, failure policy through vLLM, and zero-copy consumer validation |
 | X1 | Observability + metrics | DONE | agent | 2026-05-19 | Mixed E2E persists metadata/data path latency, local/remote ratios, metadata channel cache, promote, zero-copy, adaptive, recovery, and upper-bound comparisons |
 | X2 | Performance gates | IN_PROGRESS | agent | 2026-05-19 | Path-specific microbench JSONs and optional baseline gating are implemented; adaptive-on/zero-copy-on promotion remains informational until repeated no-regression evidence |
 
@@ -614,4 +628,3 @@ Operational ordering in the implementation:
 - 2026-05-06 v2: Reviewed v6 full + proto + Python reference + tests; expanded WBS, added contract verification checklist, expanded acceptance matrix, added test inventory with retirement, made dependencies explicit, added observability/perf cross-cutting threads, recorded deprecated docs and known semantic gaps (`complete_store(success=False)`, partial-data cleanup).
 - 2026-05-07 v3: Closed v6.2 priority slices: PG accessor-backed metadata runtime path, KV worker transaction+sub-transaction envelope, KV BRPC port split (`falcon_kv_pool.port`), Store region registration + heartbeat/eviction/idempotency background loops, Python cluster-factory mode, and explicit recovery scenario ordering matrix.
 - 2026-05-07 v4: Corrected KV metadata execution architecture: BRPC metadata requests now serialize protobuf payloads through shared memory and execute in PostgreSQL backends via `falcon_kv_metadata_call_by_serialized_shmem_internal`; direct catalog/shmem runtime execution from libpq helper threads was removed. KV dispatch now queues through the pool manager and fans out across pooled PG connections.
-

@@ -11,6 +11,7 @@ import time
 import unittest
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -39,6 +40,27 @@ def _can_connect(host: str, port: int, timeout: float = 0.5) -> bool:
             return True
     except OSError:
         return False
+
+
+def _live_block_size_candidates() -> list[int]:
+    explicit = os.environ.get("FALCON_VLLM_SMOKE_BLOCK_BYTES")
+    if explicit:
+        return [int(explicit)]
+    candidates: list[int] = []
+    for value in (
+        os.environ.get("FALCON_KV_STORE_BLOCK_SIZE"),
+        os.environ.get("FALCON_MIX_KV_BLOCK_BYTES"),
+        "1048576",
+        "2097152",
+        "524288",
+        "65536",
+    ):
+        if not value:
+            continue
+        size = int(value)
+        if size > 0 and size not in candidates:
+            candidates.append(size)
+    return candidates
 
 
 def _tail(path: Path, max_chars: int = 12000) -> str:
@@ -170,14 +192,14 @@ def _make_tiny_opt_model(model_dir: Path) -> None:
     hf_tokenizer.save_pretrained(model_dir)
 
 
-@unittest.skipUnless(
-    _env_enabled("FALCON_VLLM_LIVE_SMOKE"),
-    "set FALCON_VLLM_LIVE_SMOKE=1 to run the live vLLM/FalconFS serve smoke",
-)
 @unittest.skipIf(IMPORT_ERROR is not None, f"vLLM/torch deployment unavailable: {IMPORT_ERROR}")
 class FalconFSVllmServeSmokeTest(unittest.TestCase):
     """Live dynamic-connector smoke using a tiny generated local model."""
 
+    @unittest.skipUnless(
+        _env_enabled("FALCON_VLLM_LIVE_SMOKE"),
+        "set FALCON_VLLM_LIVE_SMOKE=1 to run the live vLLM/FalconFS serve smoke",
+    )
     def test_vllm_serve_with_falconfs_connector(self):
         cn_port = int(os.environ.get("FALCON_VLLM_SMOKE_CN_PORT", "55500"))
         store_port = int(
@@ -203,12 +225,7 @@ class FalconFSVllmServeSmokeTest(unittest.TestCase):
             f"hostaddr=127.0.0.1 port={cn_port} user={os.environ.get('USER', 'junbin')} "
             "dbname=postgres application_name=FalconFSVllmServeSmoke",
         )
-        block_bytes = int(
-            os.environ.get(
-                "FALCON_VLLM_SMOKE_BLOCK_BYTES",
-                os.environ.get("FALCON_KV_STORE_BLOCK_SIZE", "65536"),
-            )
-        )
+        block_bytes = _live_block_size_candidates()[0]
         shard_table = {
             "1": os.environ.get("FALCON_VLLM_SMOKE_DN1_ENDPOINT", "127.0.0.1:55530"),
             "2": os.environ.get("FALCON_VLLM_SMOKE_DN2_ENDPOINT", "127.0.0.1:55550"),
@@ -319,40 +336,54 @@ class FalconFSVllmServeSmokeTest(unittest.TestCase):
             f"hostaddr=127.0.0.1 port={cn_port} user={os.environ.get('USER', 'junbin')} "
             "dbname=postgres application_name=FalconFSVllmBlockOffloadE2E",
         )
-        block_bytes = int(
-            os.environ.get(
-                "FALCON_VLLM_SMOKE_BLOCK_BYTES",
-                os.environ.get("FALCON_KV_STORE_BLOCK_SIZE", "65536"),
-            )
-        )
+        block_candidates = _live_block_size_candidates()
         old_store_endpoint = os.environ.get("FALCON_KV_STORE_BRPC_ENDPOINT")
         os.environ["FALCON_KV_STORE_BRPC_ENDPOINT"] = f"127.0.0.1:{store_port}"
-        inner = FalconFSOffloadingManager(
-            client_id=int(os.environ.get("FALCON_VLLM_SMOKE_CLIENT_ID", "9092")),
-            client_hostname=os.environ.get("NODE_NAME", "falconfs-vllm-block-e2e"),
-            shard_table={
-                1: os.environ.get("FALCON_VLLM_SMOKE_DN1_ENDPOINT", "127.0.0.1:55530"),
-                2: os.environ.get("FALCON_VLLM_SMOKE_DN2_ENDPOINT", "127.0.0.1:55550"),
-            },
-            mode="cluster",
-            cn_conninfo=None,
-            block_size=block_bytes,
-        )
-        adapter = FalconFSOffloadingManagerAdapter(inner_manager=inner, metrics_label="live-e2e")
+        adapter = None
         store_handler = None
-        load_handler = None
+        load_handlers = []
         try:
             nonce = time.time_ns() & 0xFFFFFFFFFFFF
             keys = [make_offload_key(f"lv{nonce:012x}{i}".encode(), 0) for i in range(2)]
+            store_output = None
+            last_prepare = ""
+            for block_bytes in block_candidates:
+                inner = FalconFSOffloadingManager(
+                    client_id=int(os.environ.get("FALCON_VLLM_SMOKE_CLIENT_ID", "9092")),
+                    client_hostname=os.environ.get("NODE_NAME", "falconfs-vllm-block-e2e"),
+                    shard_table={
+                        1: os.environ.get("FALCON_VLLM_SMOKE_DN1_ENDPOINT", "127.0.0.1:55530"),
+                        2: os.environ.get("FALCON_VLLM_SMOKE_DN2_ENDPOINT", "127.0.0.1:55550"),
+                    },
+                    mode="cluster",
+                    cn_conninfo=None,
+                    block_size=block_bytes,
+                )
+                candidate_adapter = FalconFSOffloadingManagerAdapter(inner_manager=inner, metrics_label="live-e2e")
+                candidate_adapter.kv_cache_config = SimpleNamespace(
+                    kv_cache_groups=[SimpleNamespace(layer_names=["layer.0", "layer.1"])]
+                )
+                candidate_output = candidate_adapter.prepare_store(
+                    keys, ReqContext(kv_transfer_params={"request_id": f"live-store-{block_bytes}"})
+                )
+                if candidate_output is not None and set(candidate_output.keys_to_store) == set(keys):
+                    adapter = candidate_adapter
+                    store_output = candidate_output
+                    break
+                if candidate_output is not None and candidate_output.keys_to_store:
+                    candidate_adapter.complete_store(candidate_output.keys_to_store, success=False)
+                last_prepare = f"block_bytes={block_bytes} keys_to_store={getattr(candidate_output, 'keys_to_store', None)!r}"
+                candidate_adapter.shutdown()
+            if adapter is None or store_output is None:
+                self.fail(
+                    "FalconFS live connector could not allocate test blocks; "
+                    f"tried block sizes {block_candidates}. Last result: {last_prepare}"
+                )
             tensor = torch.zeros((4, block_bytes), dtype=torch.int8)
             caches = CanonicalKVCaches(
                 tensors=[CanonicalKVCacheTensor(tensor=tensor, page_size_bytes=block_bytes)],
                 group_data_refs=[[CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=block_bytes)]],
             )
-            store_output = adapter.prepare_store(keys, ReqContext(kv_transfer_params={"request_id": "live-store"}))
-            self.assertIsNotNone(store_output)
-            assert store_output is not None
-            self.assertEqual(set(store_output.keys_to_store), set(keys))
             self.assertIsInstance(store_output.store_spec, FalconFSLoadStoreSpec)
 
             expected_by_key = {}
@@ -379,31 +410,49 @@ class FalconFSVllmServeSmokeTest(unittest.TestCase):
 
             lookup = adapter.lookup_many(keys, ReqContext(kv_transfer_params={"request_id": "live-load"}))
             self.assertEqual(lookup, {key: True for key in keys})
-            load_spec = adapter.prepare_load(keys, ReqContext(kv_transfer_params={"request_id": "live-load"}))
-            tensor[2:].zero_()
-            load_handler = _FalconFSTransferHandler(adapter, caches, block_size_factor=1, gpu_to_falconfs=False)
-            self.assertTrue(
-                load_handler.transfer_async(2, (load_spec, GPULoadStoreSpec([2, 3], group_sizes=(2,))))
-            )
-            load_handler.wait({2})
-            load_results = load_handler.get_finished()
-            self.assertEqual(len(load_results), 1)
-            self.assertTrue(load_results[0].success)
-            for row, key in enumerate(load_spec.keys, start=2):
-                self.assertTrue(torch.equal(tensor[row], expected_by_key[key]))
+            modes = [
+                ("whole-sync", False, False),
+                ("whole-async", True, False),
+                ("layer-sync", False, True),
+                ("layer-async", True, True),
+            ]
+            for idx, (mode_name, async_load, layerwise_load) in enumerate(modes, start=2):
+                adapter.async_load_enabled = async_load
+                adapter.layerwise_load_enabled = layerwise_load
+                adapter.layer_prefetch_depth = 1
+                load_spec = adapter.prepare_load(keys, ReqContext(kv_transfer_params={"request_id": f"live-load-{mode_name}"}))
+                tensor[2:].zero_()
+                load_handler = _FalconFSTransferHandler(adapter, caches, block_size_factor=1, gpu_to_falconfs=False)
+                load_handlers.append(load_handler)
+                self.assertTrue(
+                    load_handler.transfer_async(idx, (load_spec, GPULoadStoreSpec([2, 3], group_sizes=(2,))))
+                )
+                if layerwise_load:
+                    load_handler.wait_for_layer_load("layer.0")
+                    load_handler.wait_for_layer_load("layer.1")
+                else:
+                    load_handler.wait({idx})
+                load_results = load_handler.get_finished()
+                self.assertEqual(len(load_results), 1, mode_name)
+                self.assertTrue(load_results[0].success, mode_name)
+                for row, key in enumerate(load_spec.keys, start=2):
+                    self.assertTrue(torch.equal(tensor[row], expected_by_key[key]), mode_name)
 
             stats = adapter.stats_snapshot()
             self.assertGreaterEqual(stats.get("prepare_store_keys", 0), 2)
             self.assertGreaterEqual(stats.get("data_write_blocks", 0), 2)
             self.assertGreaterEqual(stats.get("lookup_many_keys", 0), 2)
             self.assertGreaterEqual(stats.get("prepare_load_keys", 0), 2)
-            self.assertGreaterEqual(stats.get("data_read_blocks", 0), 2)
+            self.assertGreaterEqual(stats.get("data_read_blocks", 0), 8)
+            self.assertGreaterEqual(stats.get("whole_block_loads", 0), 2)
+            self.assertGreaterEqual(stats.get("layerwise_loads", 0), 2)
         finally:
             if store_handler is not None:
                 store_handler.shutdown()
-            if load_handler is not None:
+            for load_handler in load_handlers:
                 load_handler.shutdown()
-            adapter.shutdown()
+            if adapter is not None:
+                adapter.shutdown()
             if old_store_endpoint is None:
                 os.environ.pop("FALCON_KV_STORE_BRPC_ENDPOINT", None)
             else:

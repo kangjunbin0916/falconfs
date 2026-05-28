@@ -130,6 +130,13 @@ os.environ.setdefault("FALCON_KV_STORE_BRPC_ENDPOINT", f"127.0.0.1:{STORE_BASE}"
 _VLLM_FORMULA_KV_BYTES = 2 * 32 * 8 * 128 * 16 * 2
 
 
+def _psql_bin() -> str:
+    local = Path("/usr/local/pgsql/bin/psql")
+    if local.is_file():
+        return str(local)
+    return shutil.which("psql") or ""
+
+
 def _mixed_workload_block_bytes() -> int:
     # Default matches ``falcon_kv_store`` / harness vLLM-style block_size (see
     # ``FALCON_KV_STORE_BLOCK_SIZE``). Override with ``FALCON_MIX_KV_BLOCK_BYTES``
@@ -271,14 +278,15 @@ def _phase_pregenerate_payload_max_bytes() -> int:
 
 def _total_healthy_store_dram_bytes(conninfo: str) -> int:
     """Sum ``dram_pool_bytes`` across healthy ``falcon_store_node`` rows (CN catalog)."""
-    if not shutil.which("psql"):
+    psql_bin = _psql_bin()
+    if not psql_bin:
         return 0
     sql = (
         "SELECT coalesce(sum(dram_pool_bytes), 0)::bigint "
         "FROM pg_catalog.falcon_store_node WHERE coalesce(healthy, true);"
     )
     r = subprocess.run(
-        ["psql", conninfo, "-v", "ON_ERROR_STOP=1", "-qtA", "-c", sql],
+        [psql_bin, conninfo, "-v", "ON_ERROR_STOP=1", "-qtA", "-c", sql],
         capture_output=True,
         text=True,
         timeout=20,
@@ -293,14 +301,15 @@ def _total_healthy_store_dram_bytes(conninfo: str) -> int:
 
 
 def _min_healthy_store_dram_bytes(conninfo: str) -> int:
-    if not shutil.which("psql"):
+    psql_bin = _psql_bin()
+    if not psql_bin:
         return 0
     sql = (
         "SELECT coalesce(min(dram_pool_bytes), 0)::bigint "
         "FROM pg_catalog.falcon_store_node WHERE coalesce(healthy, true);"
     )
     r = subprocess.run(
-        ["psql", conninfo, "-v", "ON_ERROR_STOP=1", "-qtA", "-c", sql],
+        [psql_bin, conninfo, "-v", "ON_ERROR_STOP=1", "-qtA", "-c", sql],
         capture_output=True,
         text=True,
         timeout=20,
@@ -713,7 +722,10 @@ def _prime_dn_catalog_for_mixed_e2e(conninfo: str) -> None:
     """
     if os.environ.get("FALCON_MIX_SKIP_DN_PRIME", "").strip().lower() in ("1", "true", "yes", "on"):
         return
-    if not shutil.which("psql"):
+    psql_bin = "/usr/local/pgsql/bin/psql"
+    if not Path(psql_bin).is_file():
+        psql_bin = shutil.which("psql") or ""
+    if not psql_bin:
         return
 
     def _pooler_port(endpoint: str) -> int:
@@ -742,7 +754,7 @@ def _prime_dn_catalog_for_mixed_e2e(conninfo: str) -> None:
     sql = "\n".join(register_sql)
     for attempt in range(3):
         proc = subprocess.run(
-            ["psql", conninfo, "-v", "ON_ERROR_STOP=1", "-q", "-c", sql],
+            [psql_bin, conninfo, "-v", "ON_ERROR_STOP=1", "-q", "-c", sql],
             capture_output=True,
             text=True,
             timeout=15,
@@ -2425,7 +2437,8 @@ class OffloadingManagerClusterMixedE2E(unittest.TestCase):
         }
         os.environ["FALCON_KV_CLIENT_ADAPTIVE_BATCHING"] = "1"
         os.environ["FALCON_KV_CLIENT_ZERO_COPY_READS"] = "1"
-        mgr = FalconFSOffloadingManager(
+        _prime_dn_catalog_for_mixed_e2e(self.cn_conninfo)
+        mgr_kwargs = dict(
             client_id=5151,
             client_hostname=self._client_hostname,
             mode="cluster",
@@ -2433,6 +2446,15 @@ class OffloadingManagerClusterMixedE2E(unittest.TestCase):
             timeout_ms=45000,
             cn_conninfo=self.cn_conninfo,
         )
+        try:
+            mgr = FalconFSOffloadingManager(**mgr_kwargs)
+        except RuntimeError as exc:
+            if "discovered no DN endpoints" not in str(exc):
+                raise
+            fallback_shards = _mixed_e2e_live_dn_shard_table()
+            if len(fallback_shards) < 3:
+                raise
+            mgr = FalconFSOffloadingManager(shard_table=fallback_shards, **mgr_kwargs)
         mgr.set_om_perf_enabled(True)
         keys = [self._key(f"flagged{i}") for i in range(24)]
         try:

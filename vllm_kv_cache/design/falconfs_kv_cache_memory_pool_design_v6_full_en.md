@@ -4,161 +4,84 @@
 
 | Item | Value |
 |---|---|
-| Version | v6.6.4 full design |
-| Date | 2026-05-18 |
-| Status | Full implementation design |
+| Version | v6.6.5 full design |
+| Date | 2026-05-26 |
+| Status | Implementation-aligned full design; release validation remains gated by regression/profile results |
 | Transport | BRPC only |
 | Proto files | `kv_common.proto`, `kv_metadata_service.proto`, `kv_data_service.proto` |
 | Scope | FalconFS KV cache metadata + memory pool + Store data path + vLLM integration |
 
 This document is self-contained. It does not depend on any previous design document.
 
-### Changelog (v6.1)
+**Reading guide / compaction policy.** Sections 1-17 describe the implementation
+contract. Sections 18-23 are intentionally compact release checklists rather than
+long historical plans. Historical changelog text is kept only when it changes a
+current invariant; superseded implementation sketches are summarized and point to
+the current sections instead of repeating obsolete detail.
 
-1. Service hosting model clarified: DN BRPC runs **inside** the PostgreSQL extension and dispatches jobs to the existing PG connection-pool workers, mirroring `BrpcMetaServiceImpl` → `PGConnectionPool::DispatchMetaServiceJob`.
-2. Transaction lifecycle made explicit: catalog access uses `BeginInternalSubTransaction` / `ReleaseCurrentSubTransaction` exactly like `FalconCreateHandle`, and reuses `BATCH_OPERATION_GROUP_SIZE = 8` for the inner sub-batch.
-3. Bitmap and lease map (legacy auxiliary state) moved to **PostgreSQL shared memory** (LWLock-protected, like `ShardTableShmemInit`) where still used by older hooks; v6.4 runtime cache is in-process in the pool worker (see changelog v6.4).
-4. Recovery rules differentiated: DN restart preserves Store DRAM (rollback `EVICTING -> STORED` is valid), while Store restart loses DRAM (DRAM-only blocks must transition to `FAILED`).
-5. vLLM integration aligned with the upstream `OffloadingManager` API surface: external methods stay singular (`lookup`, `prepare_load`, `complete_load`, `prepare_store`, `complete_store`, `touch`); batching happens inside the C++ client.
-6. Reader race against eviction explicitly closed: hot-path lookups must use `renew_lease_on_hit=true`.
-7. Added GUC plan, init sequencing, and a code-mapping appendix tying every component to existing FalconFS files (BRPC server, perf macros, shard table cache, connection pool, etc.).
+### Changelog (v6.6.5)
 
-### Changelog (v6.2)
+Design-alignment follow-up for the dynamic vLLM connector and the async/layer-wise
+load implementation:
 
-1. Lease semantics corrected: leases protect DRAM blocks from eviction during access and are **not client-owned**. Removed `owner_client_id` / owner-claim semantics from the design.
-2. Concurrent tuple update handling made explicit: `CatalogTupleUpdateWithInfo` may raise a PostgreSQL concurrent-update error; handlers convert it into retryable `CAS_CONFLICT` for the client.
-3. Store registration redesigned: each Store partitions its DRAM pool into per-DN continuous regions and registers one region with each DN. DN bitmaps manage only the region assigned to that DN.
-4. Epoch semantics clarified: epochs fence stale metadata/location/lease observations after DN or Store restart; they are not ownership markers.
-5. Store failure handling expanded: heartbeat-based drain/offline/quarantine states temporarily remove slow or failed Stores from allocation while recovery/restart proceeds.
+1. **FalconFS remains a dynamically loaded vLLM V1 KVConnector.** No vLLM source
+   patch is required. Operators load it through `kv_connector_module_path` and
+   `kv_connector="FalconFSConnector"`; first-class vLLM registry edits are out of
+   scope for the FalconFS repo.
+2. **Batched prefix metadata lookup is mandatory.** The connector scheduler calls
+   `lookup_many()` once per candidate prefix/window and computes the safe prefix
+   locally. The compatibility `lookup()` fallback exists only to satisfy the
+   upstream interface and increments `forbidden_single_key_lookup_count`.
+3. **Production-safe namespaced keys are implemented.** FalconFS keys include key
+   version, namespace, tenant, model identity, hash algorithm, cache salt, KV
+   layout version, vLLM block size, LoRA identity, group index, and vLLM block
+   hash before hashing to the stored FalconFS block key. Legacy unnamespaced mode
+   is explicit and default-off.
+4. **Connector role semantics are implemented.** `kv_both` loads and stores,
+   `kv_producer` stores only, and `kv_consumer` loads only. This supports shared
+   prefix cache reuse across instances and shared-cache PD disaggregation when
+   producer and consumer use identical namespace inputs.
+5. **Async load and layer-wise load are independently configurable.** Defaults
+   preserve current behavior: `falconfs_async_load=true` and
+   `falconfs_layerwise_load=false`. Enabling layer-wise load keeps the current
+   whole-block FalconFS object format, fetches a payload once, and copies only the
+   requested layer at `wait_for_layer_load(layer_name)`. With async enabled,
+   fetch/prefetch runs on the connector transfer executor; with async disabled,
+   fetch/copy happens synchronously at the layer wait.
+6. **Zero-copy remains opt-in.** Local SHM/native read views and preallocated load
+   buffers exist for FalconFS OffloadingManager paths, but GPU vLLM integration
+   still copies host payloads into vLLM KV pages. Real GPU consumer validation is
+   the release gate before changing defaults.
+7. **Document length was reduced by moving old “how we got here” detail into
+   summaries.** Current contracts and function-call diagrams are authoritative;
+   obsolete v6.6 worker-pool sketches are no longer repeated as active design.
 
-### Changelog (v6.3)
+### Historical Changelog Summary (v6.1-v6.6.4)
 
-1. Metadata runtime model aligned with implementation: durable block rows remain in `falcon_kvblock_table`, while DRAM-resident per-block runtime state (status mirror, lease token/expiry, CLOCK `ref_bit`) is kept in PG shared memory (`KVDramMeta*`).
-2. Eviction candidate source updated from process-local LRU abstraction to shared `KVDramMetaColdCandidates` CLOCK scan over the DRAM-meta hash table.
-3. Eviction lifecycle clarified: successful `EVICTING -> EVICTED` removes DRAM-meta entry and frees bitmap slot; persistent catalog row remains and records `EVICTED` state/path.
-4. Runtime wiring clarified: `KVMetadataEngine` prefers `KVShmemRuntimeOps.dram_meta_*`; legacy `lease_*` hooks are fallback-only when full DRAM-meta ops are unavailable.
-5. Added `falcon_kv.dram_meta_max_entries` sizing guidance (current max 100,000,000; high values require large add-in shared memory budget).
+Older changelogs are summarized here to keep the design readable. The active
+contract is in §§1-17 and the performance policy is in §29.
 
-### Changelog (v6.4)
-
-This release re-architects the metadata engine to **cleanly decouple DRAM runtime state from persistent catalog state**, and to **co-locate DRAM runtime state with the libpq worker pool** so all worker threads share it as plain in-process memory rather than through PG shared memory + LWLocks.
-
-Summary of the shift:
-
-1. **Two metadata tiers, explicitly separated**:
-   - **DRAM Runtime Cache** (volatile): bitmap + per-block meta entry + per-shard hash index + lease + CLOCK `ref_bit`. Lives **inside the BackgroundPoolManager process** that hosts the BRPC server and the libpq connection pool. Owned and mutated by pool-worker threads using C++ atomics / `std::shared_mutex` / striped locks. Indexes only blocks that are currently in DRAM.
-   - **Persistent Catalog** (durable): `falcon_kvblock_table` rows. Indexes **every** block (DRAM-resident, EVICTED to SSD, FAILED). Mutated only through libpq SQL calls into PG backends.
-2. **DRAM cache is a write-through cache before the catalog**: every cache-side mutation (insert / status update / free) is paired with a catalog mutation issued through libpq; the cache mutation only commits if the catalog mutation succeeds.
-3. **Each meta entry represents exactly one DRAM block**. When the block is evicted to SSD (`EVICTING -> EVICTED`), its meta entry is freed and its bitmap bit is cleared in the same critical section. Catalog row remains and records `EVICTED` + `evicted_path`.
-4. **Per registered DRAM region**: one fixed bitmap of `total_blocks` bits and one fixed meta array of `total_blocks` entries, sharing the same index space (bit `i` ↔ slot `i`). No allocator metadata fragmentation; the bitmap is the meta-slot allocator.
-5. **Per catalog shard**: one concurrent hash map `block_hash -> (region_id, slot_idx)` that is the only block-hash → DRAM-slot index. Sharded so different shards do not contend.
-6. **Recovery is parallel by shard**: pool-worker threads each scan one shard via libpq and repopulate their own per-shard hash maps and the per-region meta arrays/bitmaps. Recovery completes before BRPC starts accepting requests.
-7. **CLOCK LRU recycles DRAM blocks and meta space together**: candidate scan is per-region over the dense meta array; eviction success releases the bitmap bit, the meta slot, and the per-shard hash map entry atomically.
-8. **Lookup/update path**:
-   - Lookup hit (per-shard hash map finds slot): pool-worker returns directly without touching the PG backend.
-   - Lookup miss: pool-worker issues a libpq `SELECT` against `falcon_kvblock_table`; an `EVICTED` row returns the SSD path and stays out of DRAM cache; a missing row returns `NOT_FOUND`.
-   - Insert/update: pool-worker first reserves bitmap+slot or finds the existing slot, then issues the catalog SQL (INSERT/UPDATE with CAS on `version`); on catalog success the cache mirror is finalized; on catalog failure the cache reservation is rolled back.
-9. **Removed**: PG-shmem `KVDramMeta*` hash, `KVLease*` shmem hash, and `KVBitmap*` shmem segment. `falcon_kv_metadata_call_by_serialized_shmem_internal` is reduced to a thin **catalog-only RPC** (the engine no longer runs in the PG backend at all).
-10. **Process model invariant**: there is exactly one BackgroundPoolManager process per DN; therefore exactly one DRAM cache instance per DN. Multiple PG backends remain as catalog executors but do not own runtime cache state.
-11. **Per-item split-and-combine for mixed-hit/miss batches**: handlers with a catalog fast-path — `BatchLookupWithLease` **and `BatchAllocateWithLease`** — first walk each item over the in-process cache and write resolved-by-cache results into their original `results[i]` slot. Only the unresolved items are collected into a single libpq sub-batch (preserving each item's original index), dispatched to the PG backend in one libpq round-trip, and merged back into `results[]`. **`BatchRenewLease`** is **not** in this set: it is **DRAM-only** per §11.3 (no catalog `SELECT` on miss; miss ⇒ `LEASE_EXPIRED(retryable=true)` and the client refreshes via `BatchLookupWithLease`). The response is returned in the original request order. The catalog SQL function therefore receives a sub-batch whose size is `<= request_items`, never larger, and cache-resolved items pay zero PG round-trip cost. For `BatchAllocateWithLease` specifically: an item whose `block_hash` is already present in the cache (because a prior allocate or recovery seeded it) does **not** re-reserve a bitmap slot and does **not** re-issue a catalog `INSERT`; it returns the existing slot/lease with `reused_existing_allocation = true`.
-12. **Conflict semantics on the same logical block hash**: the metadata DN treats the per-shard hash index as the single source of truth for *which* DRAM slot holds a given `block_hash`, and uses it to make concurrent operations on the same hash idempotent rather than fatal. Two race classes are explicitly defined (full pseudocode in §7.11):
-    - **Lookup races allocate/store**: a `BatchLookupWithLease` may see `NOT_FOUND` (no row yet), `ALLOCATED` (catalog row + DRAM reservation exist, **committed bytes not yet visible** for readers), `STORED` (bytes committed and safe for `BatchReadBlock`), `EVICTING` (in-flight evict), or `EVICTED` (durable row on SSD with `evicted_path`). For **tensor load (`prepare_load`)**: treat **`STORED` and `EVICTED` as usable byte hits** (DRAM vs SSD leg of `LoadStoreSpec` respectively); treat **`ALLOCATED` as not a DRAM read hit** — return an **empty / no-DRAM** load spec so clients never call `BatchReadBlock` on a slot that can still be empty or torn until `ALLOCATED → STORED`. For **prefix existence only** (`lookup` returning a boolean), `ALLOCATED` may still be considered “present” so a caller can wait or coordinate; it must not imply safe DRAM reuse. **`EVICTED` is not the same as `NOT_FOUND`**: bytes exist on SSD and are loaded via `BatchReadFromSSD`, not recomputed from the prompt. The DN never lies about state (§7.3, §7.11.2, §12.3.1).
-    - **Allocate races allocate (same `block_hash`)**: at most one allocate wins the bitmap+catalog `INSERT`. Concurrent losers fold onto the winner's slot via the per-shard hash index (cache pre-step) or via the catalog primary key (catalog pre-step), free their reserved bitmap bit, and return `reused_existing_allocation = true` with the winner's `(store_node_id, pool_offset, lease_token, version)`. The DN never returns two distinct DRAM slots for the same `block_hash`.
-    - **Store races store (same `block_hash`)**: because KV blocks are immutable after `ALLOCATED -> STORED`, the *second* `BatchUpdateBlockStatus(ALLOCATED -> STORED)` on a row that is already `STORED` is treated as a no-op success when the request sets `allow_noop_if_already_target=true`; the corresponding `BatchWriteBlock` byte payload from the redundant client is dropped at the OffloadingManager (§16) before it reaches the Store. From vLLM's perspective: identical content + identical `block_hash` ⇒ at most one Store write actually lands.
-    - **Lookup vs allocate is OK; concurrent stores must be deduplicated**: lookup is allowed to return `null`/`NOT_FOUND` so vLLM may recompute; redundant stores of the same `block_hash` are dropped client-side (§16.1, §13.2) so the cluster never absorbs two payloads for one logical block.
-13. **`ALLOCATED` vs `STORED` vs `EVICTED` for reads**: `BatchLookupWithLease` / cache pass must not treat `ALLOCATED` as a `BatchReadBlock` hit; `EVICTED` is an SSD read hit for `prepare_load`, not a prompt recompute. **`BatchReadFromSSD`** stays metadata-neutral; rehydration to DRAM `STORED` is an explicit DN + Store sequence (§12.3.1).
-14. **Promote-on-read for `EVICTED` blocks**: hot blocks drift back into DRAM via an **asynchronous, best-effort** promote pipeline owned by the OffloadingManager (§12.3.2 / §12.3.3 / §13.4). Foreground load reads SSD via **`KVDataService.ReadFromSSD` / `BatchReadFromSSD`** on the owning Store (v6.6.2 — no FalconFS client Direct I/O shortcut) and returns immediately; a background worker pool then issues the standard `BatchAllocateWithLease(hint=PROMOTE_FROM_EVICTED) + BatchWriteBlock + BatchUpdateBlockStatus(ALLOCATED → STORED)` triple to repopulate DRAM with catalog transition `EVICTED → ALLOCATED → STORED` and a fresh `version`. Promote is bounded (drop-on-full queue, no infinite retry), gated by an admission policy (hot-key sketch + DRAM-pressure watermark + per-DN inflight cap), and never extends foreground latency. New GUCs: `falcon_kv.promote_enabled`, `falcon_kv.promote_queue_capacity`, `falcon_kv.promote_max_inflight`, `falcon_kv.promote_min_access_count`, `falcon_kv.promote_when_pressure_below`. ~~`falcon_kv.promote_via_falconfs_direct_io`~~ retired in v6.6.2 (see §25).
-
-### Changelog (v6.4 implementation lock-in)
-
-The §4.1.1 / §4.1.3 / §4.2 / §4.2.1 / §4.7 prose now matches the actual code in `falcon/connection_pool/`, `falcon/metadb/`, `falcon/brpc_comm_adapter/`, and `vllm_kv_cache/src/metadata/`. Locked-in implementation choices (subset that diverged from earlier drafts of this document):
-
-1. **Catalog SQL surface is `falcon_kv_metadata_catalog_call(int method, bytea payload) RETURNS bytea`**, not a shmem-shift handle. The whole sub-batch fits in one `bytea` parameter; `PQexecParams` with binary format issues exactly one PG-protocol message per sub-batch. The earlier draft `falcon_kv_metadata_catalog_call_by_serialized_shmem_internal(method, shmem_shift, request_size, signature)` was dropped because the BRPC plugin is the only catalog client and does not need cross-process shmem visibility into FalconShmemAllocator (FalconFS-meta `SingleWorkerTask` / `BatchWorkerTask` keep using their existing shmem path).
-2. **Wire format is POD struct arrays defined in `kv_catalog_wire.h`**, not protobuf. This keeps `falcon.so` free of KV protobuf descriptors so duplicate descriptor registration (which crashes the bgworker at plugin load) is structurally impossible. Plugin-side packers/unpackers are in `falcon/brpc_comm_adapter/kv_runtime_register.cpp`.
-3. **Engine ↔ pool worker hand-off is one C function pointer**, registered at plugin startup via `FalconKVSetProcessJob` (declared in `falcon/include/connection_pool/falcon_kv_runtime_bridge.h`, exported from `falcon.so` with default visibility). The pool worker (`falcon.so`) calls the pointer with its own `PGconn`; the implementation (`libbrpcplugin.so`) does protobuf parsing, engine call, catalog round-trip, response serialization. There is no protobuf in `falcon.so` and no engine code in `falcon.so`.
-4. **`PGConnectionPool` carries a dedicated `kvTaskList`** and `KVDequeueExec` dispatches each KV job to a distinct `PGConnection` worker. Concurrent KV BRPC calls therefore execute against different PG backends in parallel — not serialized through one shared libpq connection.
-5. **Catalog accessor is `falcon/metadb/kvblock_table.{c,h}`** with C functions `FalconKVBlockBatchLookup` / `FalconKVBlockBatchInsertAllocated` / `FalconKVBlockBatchCASStatusUpdate` / `FalconKVBlockBatchDelete`. They use PG internal APIs (`table_open`, `systable_beginscan` with `F_BYTEAEQ`, `heap_modify_tuple`, `CatalogTupleInsertWithInfo`, `CatalogTupleUpdateWithInfo`, `simple_heap_delete`). No raw SQL on the hot path; the only SQL the plugin emits is the call to `falcon_kv_metadata_catalog_call`.
-6. **`falcon_kvblock_table` is one table per DN**, not sharded by `range_point`. The schema is created by `pg_catalog.falcon_create_kvblock_table()` (`falcon/distributed_backend/distributed_backend_falcon.c`, idempotent), invoked once per DN by the plugin at startup. Only the `(status, updated_at_ms)` btree index is materialized; `(store_node_id, pool_offset)` is not, because runtime resolution goes through the DRAM shard hash index (§7.1).
-7. **Recovery driver and `EVICTING` reconcile scan are implemented for DN startup.** `KVRecoveryRunner::Run()` calls the catalog scan path, bumps `dn_epoch`, applies `ScanShardForRecovery` rows to `KVMetadataEngine`, reconciles `EVICTING -> STORED`, and parks rows until Store regions register. Store restart runtime fencing is also implemented on epoch bump; remaining release work is catalog-row reconciliation / SSD GC hardening, not basic DN recovery.
-
-The remainder of this document is rewritten where the architecture changed; sections that were unaffected (proto contract, error model, vLLM integration) are unchanged.
-
-### Changelog (v6.6.1)
-
-v6.6 introduced parallelism on **both** sides of the data plane — the Client's `_data_stage_pool` fans out per block, and the Store handlers `BatchWriteBlock` / `BatchReadBlock` *also* fanned items out across an internal worker pool. Three issues followed: (a) the two layers of parallelism duplicate work and obscure ownership, (b) the §13 flow text used "libpq" next to client-visible steps, blurring the wire boundary between Client→DN (BRPC) and DN-internal catalog access (libpq), and (c) the lock-vs-lease description leaned on the wrong invariant ("the DN-issued lease guarantees no concurrent writer on the same slot"). v6.6.1 fixes all three:
-
-1. **Data-plane RPCs are unary (historical v6.6.1 rule; superseded by v6.6.3 bounded micro-batches below).** The KV data Store exposes single-block `WriteBlock`, `ReadBlock`, `ReadFromSSD` (one item per RPC). All parallelism on the data plane lives on the **Client**: the data stage pool fires N concurrent unary RPCs, and stripe-splitting (one large block → multiple stripe-sized RPCs) is decided client-side. The Store handler is naturally parallel because BRPC dispatches each RPC on its own bthread; no second worker pool, no internal item fan-out, no internal stripe-splitting on the server. The legacy `BatchWriteBlock` / `BatchReadBlock` / `BatchReadFromSSD` names are kept on the wire for one release as **thin compatibility wrappers** (`items_size() == 1` is the recommended call shape; multi-item batches are deprecated and processed sequentially), so existing builds still link, but no new Store-side parallelism logic depends on them. See §12.1 / §12.2 / §12.3 / §29.3.
-2. **Client→DN is BRPC end-to-end. libpq is intra-DN only.** The §13 flow steps now keep "libpq" strictly under the **DN pool-worker** lane (the worker thread inside `BackgroundPoolManager` that holds a libpq connection to its **own local PG backend** and runs the catalog SQL on `falcon_kvblock_table`). The Client never opens a libpq connection to a DN. Every Client → DN call — `BatchLookupWithLease`, `BatchAllocateWithLease`, `BatchUpdateBlockStatus`, `BatchFreeAllocated`, `BatchRenewLease` — is a BRPC call against the DN's `KVMetadataService`. The `pg_catalog.falcon_dn_node` row carries `pg_host`/`pg_port` only so DBAs can connect for ops; the hot path uses `kv_brpc_port`. See §11, §13.1, §13.2, §29.5.1.
-3. **Stripe lock protects both reads and writes; leases protect against eviction, not concurrent writers.** The DN-issued lease is an **eviction shield**: while the lease is valid, the DN's eviction worker will not reclaim the slot. It is **not** a single-writer guarantee — recovery, lease takeover, racing allocators across a `STALE_EPOCH`, and reader-vs-writer on a slot that just transitioned all admit physical concurrency on the same `pool_offset`. The DRAM stripe lock therefore protects both reads and writes for byte-level integrity. v6.6.1 changes the per-stripe primitive from `std::mutex` to **`std::shared_mutex`**: writers take the stripe in **exclusive** mode, readers take it in **shared** mode, so concurrent readers do not serialize but every reader still sees a consistent payload relative to any writer on the same stripe. The DN's CAS on `version` provides the **logical** "one publisher per `block_hash`" guarantee independently. See §29.2, §27.
-
-These three corrections do not change the wire layout, the catalog schema, the client API, or any GUC that controls the metadata stage. They only correct the body of §12 / §13 / §27 / §29 where the v6.6 first cut over-promised. The same memcpy-only Store and the same two-stage Client pipeline remain.
-
-### Changelog (v6.6.2)
-
-1. **SSD reads use `KVDataService` uniformly.** Earlier text described an optional **FalconFS client Direct I/O** leg that read `evicted_path` by bypassing the Store BRPC server. That is **removed from the contract**: foreground `prepare_load`, promote-on-read staging, and any parallel data-stage task for `EVICTED` keys must call **`KVDataService.BatchReadFromSSD` / `ReadFromSSD`** (unary in v6.6.1) on the **Store that owns the spill file** (the same `store_node_id` the DN returned in metadata). The Store daemon continues to read bytes from local disk via `SSDSpillManager` under `<ssd_root>` (§12.4); whether that path is backed by a FalconFS mount is a **deployment detail inside the Store host**, not a second client I/O stack. **Implementation alignment:** [`FalconFSOffloadingManager._load_one_key_bytes`](vllm_kv_cache/python/falconfs_kv/offloading_manager.py) already uses `cluster.store.read_from_ssd` → BRPC `BatchReadFromSSD`; [`LocalKVStoreShmFacade::BatchReadFromSSD`](vllm_kv_cache/src/store/kv_store_facade.cpp) forwards to the Store stub over `ssd_ch_`, not `open(2)` on the client. §12.3.2 / §12.6.3 / §13 / §25 / §29 are updated to match.
-2. **`falcon_kv.promote_via_falconfs_direct_io` retired.** The knob implied a client-side FalconFS read leg; with the uniform Store service rule it is **reserved / ignored** (always use Store `ReadFromSSD`). Remove from new installs; keep reserved in proto/GUC tables for one release if already shipped.
-
-### Changelog (v6.6.4)
-
-Design-alignment follow-up after the measured performance work:
-
-1. **Store restart now fences stale DN runtime metadata, reconciles durable catalog rows, and validates preserved SSD paths.** When `RegisterStoreRegion` observes the same Store geometry with a higher `store_epoch`, the DN quarantines the region, erases that Store's shard-index entries, clears the region bitmap/meta/free counters, drops pending restores for the old Store image, and then publishes the new epoch as `HEALTHY`; a lower epoch is rejected as `STALE_EPOCH`. The successful epoch bump invokes `KVRecoveryRunner::ReconcileStoreRestart`, whose phase 1 scans `falcon_kvblock_table` for that `store_node_id`, deletes DRAM-only rows, and preserves only `EVICTED` rows with a non-empty `evicted_path`. Phase 2 calls the Store-hosted `KVStoreAdminService.ValidateEvictedPaths` RPC in bounded chunks and deletes invalid preserved rows through the catalog recovery path. Validation failure is conservative: rows are kept and `validation_failed` is logged. Regression: `KVMetadataEngine.StoreEpochRestartClearsStaleDramRuntime`, the cluster fault scenario `store-restart-reconcile`, and `FalconKvStoreSmoke.ValidateEvictedPathsChecksStoreLocalSSD`.
-2. **Metadata BRPC channel cache observability and regression coverage are exported.** The pybind extension exposes `metadata_channel_stats()` and `metadata_channel_stats_reset()` for cache size, hits, misses, failures, and failure-driven evictions. Python unittest coverage asserts repeated calls reuse the channel and failed endpoints are evicted.
-3. **Promote-on-read is explicitly asynchronous and admission-controlled.** The promote worker is a bounded background queue with drop-on-full backpressure, configurable worker parallelism, memory-pressure admission (`FALCON_KV_PROMOTE_WHEN_PRESSURE_BELOW`), and hotness admission (`FALCON_KV_PROMOTE_MIN_ACCESS_COUNT`). Foreground SSD loads enqueue best-effort promotion work and do not wait for the allocate/write/status triple.
-4. **Adaptive batching is flag-gated and observable.** Static defaults remain read batch 8 and write batch 1. With `FALCON_KV_CLIENT_ADAPTIVE_BATCHING=1`, selected local/remote read/write batch sizes are capped by configured maxima and target bytes, and the chosen policy/reason is persisted in mixed E2E metrics JSON.
-
-### Changelog (v6.6.3)
-
-Measured mixed-colocation and Store micro-benchmark runs changed the performance contract without changing the metadata semantics or public OffloadingManager API:
-
-1. **Data-plane call shape is bounded micro-batch, not unary-only.** v6.6.1 made the important ownership correction that the Store must not run an internal worker pool and the Client owns parallelism. v6.6.3 keeps that ownership but supersedes the strict unary recommendation: each data-stage task may carry a small `(dn_id, store_id)` group, bounded by `FALCON_KV_CLIENT_BATCH_{READ,WRITE}_MAX_BLOCKS` and target bytes. This reduces BRPC scheduling and Python/native crossing overhead while preserving parallelism because many bounded groups are still issued concurrently. Current default: reads batch up to 8 blocks, writes default to 1 block unless explicitly enabled.
-2. **Large payloads use BRPC attachment paths.** Remote `WriteBlock` / `BatchWriteBlock` send block bytes outside protobuf `bytes`; remote `ReadBlock` / `BatchReadBlock` return payloads in response attachments, framed for batch reads. Protobuf keeps metadata, status, and checksums; the 1-2 MiB tensor bytes use `butil::IOBuf` attachment transfer. Store service attachment handlers pass payload buffers directly to `KVStoreEngine` instead of reconstructing per-item protobuf payload strings.
-3. **DRAM hot-path checksums are opt-in.** Store DRAM writes/reads no longer compute CRC by default because TCP/BRPC and hardware already protect transport integrity and the duplicate CPU cost is visible in the hot path. `verify_checksum=true` and `FALCON_KV_STORE_COMPUTE_CHECKSUMS=1` still force checksum computation/validation. SSD spill/readback keeps integrity checks.
-4. **Benchmark timers exclude payload generation.** Throughput tests pre-generate payloads when memory budget permits and report whether generation was timed. The default pre-generation cap allows 1 MiB / 512 KiB block tests on memory-limited machines while keeping phase throughput focused on Store + metadata offloading work.
-5. **Regression harness is part of the design.** The pre-commit gate is `scripts/falcon_kv_regression.sh`; it now restarts the cluster after destructive fault drills before Python metadata/offloading tests, aligns Python block size with `FALCON_KV_STORE_BLOCK_SIZE`, and waits for all CN/DN BRPC pooler ports. The documented gate lives in `docs/falcon_kv_precommit_regression.md`.
-
-### Changelog (v6.6)
-
-> **Superseded in part by v6.6.1** — items 2/3/4 below are the v6.6 first cut.
-> Read v6.6.1 (above) for the corrected stripe-lock primitive
-> (`std::shared_mutex`, protects R+W), the unary data plane (no Store-side
-> internal worker pool or stripe-splitting), and the BRPC-vs-libpq wire
-> clarification.
-
-v6.5 left two architectural duplications that capped throughput well below DRAM / NIC ceilings on the byte-moving path. v6.6 removes both and introduces an **explicit two-stage parallel pipeline** on the Client side. The wire contracts (§10–§12) are unchanged; what changes is who owns metadata, where locks live, and how the OffloadingManager schedules work.
-
-1. **Store data plane is fully metadata-free.** `KVStoreEngine` no longer keeps a per-`block_hash` `Entry` map or a per-engine global mutex. The DN's `KVMetadataEngine` is the **single source of truth** for `(block_hash → store_node_id, pool_offset, version, status, store_epoch)`; the Store only validates `store_epoch`, bounds-checks the `(pool_offset, length)` against the registered region, and does the memcpy. CAS on `version` lives only at the DN. The legacy per-engine `mu_` and `meta_` are removed; SSD spill book-keeping remains under a small dedicated lock because the Store owns SSD paths (§29.2).
-2. **Per-stripe DRAM locking, not a global one.** `DramPool` exposes byte-level read/write **without a global mutex**. A **stripe lock array** indexed by `slot = pool_offset / block_size` (size configurable, e.g. 64 stripes per region) protects writers and readers against physical race on the same stripe; disjoint stripes never serialize. *(Superseded by v6.6.1: the primitive is `std::shared_mutex`, writers exclusive, readers shared; the lock is load-bearing, not defensive — leases protect against eviction reclaim, not against physical reader-vs-writer races; §29.2.)*
-3. **Internal parallelism inside `BatchWriteBlock` / `BatchReadBlock`.** Both Store-side handlers fan items out across a bounded **C++/bthread worker pool** of size `min(items, falcon_kv.store_data_workers, store_max_inflight)`; items target disjoint `pool_offset`s so they run truly in parallel, each bumping at most one stripe lock. For very large blocks an item is further split into **stripes** (`falcon_kv.store_stripe_bytes`, default 512 KiB) so a single block can saturate multiple memory channels. *(Superseded by v6.6.1: the data plane is **unary** — `Store.WriteBlock` / `Store.ReadBlock` carry one block per RPC; BRPC dispatches each on its own bthread, so no internal worker pool is needed. Stripe-splitting moves to the client; `falcon_kv.store_data_workers` and `falcon_kv.store_stripe_bytes` are retired; §29.3.)*
-4. **Local SHM facade is parallel.** `LocalKVStoreShmFacade::BatchWriteBlock` / `BatchReadBlock` partition items across a native worker pool and `memcpy` on disjoint offsets concurrently. The Python extension releases the GIL for the whole call. No global lock; same stripe contract as remote. *(Superseded by v6.6.1: the facade exposes single-block `WriteBlock` / `ReadBlock`; the data stage pool fans out, not the facade. `falcon_kv.client_local_facade_workers` is retired; §29.4.)*
-5. **OffloadingManager: explicit two-stage pipeline (metadata stage + data stage), with parallel store *and parallel load*.** The hardcoded `min(8, len(groups))` ThreadPool is removed. Two independently sized pools run with a clear pipeline:
-   - **Metadata stage:** one worker per DN, all DNs in parallel (`falcon_kv.client_meta_parallelism_max`, default `num_dns`). Carries `BatchLookup` / `BatchAllocate` / `BatchUpdateBlockStatus` / `BatchFreeAllocated` / `BatchRenewLease` — small messages stay batched per DN.
-   - **Data stage:** one task per block (or per stripe, for large blocks), all blocks across all stores in parallel (`falcon_kv.client_data_parallelism_max`, default `min(64, hw_concurrency * 2)`). Used by **both** `complete_store` and `prepare_load` — the load path is no longer serial. As soon as a DN's metadata reply arrives, its data tasks dispatch; the slowest DN bounds wall-clock latency, not the sum.
-6. **Group becomes a routing index, not a parallelism unit.** `(dn_id, store_id)` is still the smallest co-locatable unit for a single combined "data + metadata" round-trip, but it is **not** the unit of concurrency. Concurrency is decoupled: metadata fans out per **DN**, data fans out per **block / stripe** (§29.5).
-
-These changes turn the data path into a byte mover whose ceiling is **DRAM bandwidth on the local SHM path** and **NIC bandwidth on the remote BRPC path**, not the global mutex / fixed-8 ThreadPool that capped v6.5.
-
-Detailed contract in §29. Cross-referenced from §12.1, §12.2, §12.6.3, §13.1, §13.2, §16.1, §25, §27.
-
-### Changelog (v6.5)
-
-Three design considerations that were under-specified in v6.4 are now made explicit:
-
-1. **Topology generality.** The cluster supports an arbitrary, configurable number of DN, Store, and Client instances, deployed in any colocation pattern. The 2-DN harness is a test convenience, not an architectural assumption. Each role is identified only by its `dn_id` / `store_node_id` / process identity, never by the count of peers; every configuration parameter that names a peer (DN endpoints on a Store, Store endpoints on a Client, etc.) is a list whose length is decided at deploy time. See §2.6 for the deployment matrix.
-
-2. **Colocation-aware data plane (Client↔Store ONLY, via POSIX shared memory).** The Store is **always a standalone daemon process** — never embedded in a Client (vLLM worker, FUSE process, future framework integrations). What "colocation" means in v6.5 is **same-host**, not same-process: the Store allocates its DRAM pool with `shm_open` + `mmap(MAP_SHARED)` and publishes a small discovery descriptor (segment name + region geometry + `store_epoch` + `brpc_address`) under a well-known runtime path. Any Client process running on the same host can mmap the same segment and access the Store's DRAM region directly as shared memory; Clients running off-host fall back to BRPC. Both reads and writes use the shared-memory path when available, exactly mirroring FalconFS's `StoreNode::IsLocal(nodeId)` shortcut for `ReadFile` / `WriteFile` in [`falcon_store/src/falcon_store/falcon_store.cpp`](../../falcon_store/src/falcon_store/falcon_store.cpp). The runtime selection between shared-memory and BRPC happens at exactly one place (`KVStoreFacadeRegistry`) and is identical for every Client caller — vLLM via the pybind11 API library, FUSE via `falcon_client`, or any future application. Detailed contract in §12.6 (`IKVStoreFacade` + `KVStoreFacadeRegistry` + the shared-memory discovery protocol).
-
-   **DN↔Store colocation is intentionally NOT optimized.** DN↔Store traffic is admin-only (`RegisterStoreRegion`, `Heartbeat`, `SpillBlockToSSD`) and never on the latency-critical path: registration runs once at startup, heartbeats are seconds-cadence, and spill runs at eviction-cycle frequency only. For simplicity the DN always reaches its registered Stores over BRPC, regardless of whether the Store happens to share a host. This keeps the DN code path topology-independent and reduces the surface area of `KVStoreFacadeRegistry` to one consumer (the Client).
-
-3. **Store admin RPCs are first-class.** A new BRPC service `KVStoreAdminService` hosted on the DN side carries `RegisterStoreRegion`, `Heartbeat`, and `SpillBlockToSSD`. v6.4 left `KVMetadataEngine::RegisterStoreRegion` as an in-process call only; v6.5 makes registration a network operation issued by every Store at startup, so the DN never assumes a hardcoded region geometry. `SpillBlockToSSD` is invoked by the DN's eviction worker against the Store that owns the eviction candidate; it is BRPC even if Store and DN happen to share a host (per the previous bullet). Detailed wire contract in §5.4.
-
-4. **CN is the single source of truth for cluster membership; KV cache shares DN identities with FalconFS file metadata.** The KV cache does not introduce a parallel DN list; it reuses `server_id` from the existing [`pg_catalog.falcon_foreign_server`](../../falcon/falcon--1.0.sql) and the existing `pg_catalog.falcon_shard_table(range_point, server_id)` for `block_hash → DN` routing. v6.5 adds two CN tables: `pg_catalog.falcon_dn_node` (one row per DN replication group, with **denormalized** `(host_node_name, pg_host, pg_port, kv_brpc_port, dn_epoch, healthy)` so a single `SELECT` suffices for routing — no JOIN on the hot path), and `pg_catalog.falcon_store_node` (one row per `falcon_kv_store` daemon — Stores have no FalconFS analogue). Physical-host identity uses the **`NODE_NAME`** environment variable already standardized by FalconFS CM and docker-compose configs (`cloud_native/falcon_cm/cm/falcon_cm.py:51`, `tests/regress/docker-compose-*.yaml`); `/etc/machine-id` is **not** used because it is unreliable in containers and has no FalconFS adoption. Each Client maintains the **full** DN and Store list locally and runs a **membership refresh loop (§3.4.7)** with three triggers — periodic (every `falcon_kv.membership_refresh_period_ms`, default 5000ms), reactive (on any DN/Store RPC failure / `STALE_EPOCH` / `STORE_NOT_REGISTERED`), and on-demand (`KVStoreFacadeRegistry::RefreshNow()` / `OffloadingManager.refresh_membership()`) — plus an optional `LISTEN/NOTIFY` push channel for sub-second propagation. The loop handles **late-joining Stores** (registered after the Client started — common in autoscale and ops-driven Store roll-out) and **rejoining Stores** (restart bumps `store_epoch` → Client `munmap`s the old segment and `shm_open`s the new one). Same-host Stores (matched by `host_node_name`) use the SHM fast path (§12.6), all others use BRPC. **DN replica handling** inherits FalconFS's CM-driven primary-failover pattern: CM elects a new primary, atomically updates both `falcon_foreign_server` and `falcon_dn_node` in one transaction, clients refresh and retry — `server_id` is stable, hash routing never changes. **Store failure model** is differentiated: stores are single-instance (volatile DRAM cannot be replicated cheaply), unhealthy/unreachable Stores cause client reads to return cache miss (vLLM tolerates miss → recompute), permanently dead Stores are removed from the cluster and DNs purge their KV-meta rows; on Store restart `store_epoch` bumps and DNs delete rows that were DRAM-only on the old epoch. All details in §3.4 (schemas, RPCs, refresh model, watchdog, failover semantics).
-
-5. **Allocation drops the `allow_fallback_store` knob.** v6.4 had a per-request `allow_fallback_store=true|false` flag on `BatchAllocateWithLease`. v6.5 removes it: allocation is always best-effort with the §5.3 priority order and automatic fallback to any healthy Store. The proto field is retired (kept reserved for one release for compatibility) and ignored by the engine.
-
-These additions do not change the hot-path metadata flow described in v6.4; they refine the deployment model, the data-plane affinity policy, and the topology discovery contract.
-
-The remainder of this document is rewritten where the architecture changed; sections that were unaffected (proto contract, error model, vLLM integration) are unchanged.
+- v6.1-v6.2 established BRPC-only metadata/data services, batch metadata APIs,
+  ownerless anti-eviction leases, Store registration, and epoch fencing for stale
+  DN/Store observations.
+- v6.3-v6.4 split volatile DRAM runtime state from durable catalog rows: the DN
+  `BackgroundPoolManager` owns bitmap/meta/lease/CLOCK state in-process, while
+  `falcon_kvblock_table` remains the durable catalog. Recovery scans rebuild
+  runtime state before serving.
+- v6.4 implementation lock-in fixed the code shape: catalog calls cross from the
+  BRPC plugin to `falcon.so` through POD wire structs and a C function pointer;
+  catalog operations use PG internal APIs; each DN owns one block table; DN
+  startup recovery and `EVICTING -> STORED` reconciliation are implemented.
+- v6.5 made topology general: arbitrary DN/Store/Client counts, same-host
+  Client↔Store SHM fast path, Store admin RPCs, CN membership tables, and
+  Store epoch-based rejoin fencing.
+- v6.6-v6.6.3 moved performance ownership to the Client: per-DN metadata fan-out,
+  CPU-aware data fan-out, bounded Store data micro-batches, BRPC attachments,
+  local SHM facade reads/writes, and checksum-default-off DRAM hot paths.
+- v6.6.4 closed release-hardening gaps: Store-restart catalog reconciliation,
+  Store-hosted `ValidateEvictedPaths`, metadata channel-cache stats/regression,
+  asynchronous promote-on-read admission metrics, adaptive batching metrics, and
+  path-specific microbenchmark JSONs.
 
 ---
 
@@ -209,46 +132,51 @@ The remainder of this document is rewritten where the architecture changed; sect
 
 ### 2.1 Logical Components
 
-```
-vLLM Scheduler / Block Manager
-        |
-        v
-FalconFS KV OffloadingManager (Python)
-        |
-        | BRPC metadata calls
-        v
-+-----------------------------------------------------+
-| Metadata DN (PostgreSQL extension)                   |
-|                                                      |
-|  +---------------------------------------------+     |
-|  | BackgroundPoolManager process (1 per DN)    |     |
-|  |  - BRPC server (KV metadata service)        |     |
-|  |  - libpq connection pool (N worker threads) |     |
-|  |  - DRAM Runtime Cache (in-process)          |     |
-|  |      * per-region bitmap (1 bit / block)    |     |
-|  |      * per-region meta array (1 slot/block) |     |
-|  |      * per-shard hash index                 |     |
-|  |      * per-region CLOCK hand                |     |
-|  |      * leases (inside meta slot)            |     |
-|  |  - Eviction coordinator (background thread) |     |
-|  +---------------------------------------------+     |
-|                  ^         |                         |
-|                  | libpq   | libpq SQL on            |
-|                  |         v falcon_kvblock_table    |
-|  +---------------------------------------------+     |
-|  | PostgreSQL backend(s) (catalog executors)   |     |
-|  |  - falcon_kvblock_table (durable rows)      |     |
-|  |  - shard table / OID cache                  |     |
-|  |  - per-call sub-transaction lifecycle       |     |
-|  +---------------------------------------------+     |
-+-----------------------------------------------------+
-        |
-        | BRPC data calls
-        v
-Falcon Store
-  - DRAM block pool
-  - SSD spill files
-  - Batch read/write service
+```mermaid
+flowchart LR
+  subgraph V["vLLM / application process"]
+    Sched["vLLM scheduler"]
+    Conn["FalconFSConnector\n(dynamic KVConnector)"]
+    OM["FalconFSOffloadingManager\n(Python standalone API)"]
+    Native["falconfs_kv_brpc pybind\nGIL released for native calls"]
+    Sched --> Conn
+    Conn --> Native
+    OM --> Native
+  end
+
+  subgraph CN["Coordinator / CN catalog"]
+    DNRows["falcon_dn_node"]
+    StoreRows["falcon_store_node"]
+  end
+
+  subgraph DN["Metadata DN PostgreSQL extension"]
+    BrpcMeta["KVMetadataService BRPC"]
+    Pool["BackgroundPoolManager\n+ libpq worker pool"]
+    Runtime["DRAM runtime cache\nbitmap + slot meta + leases + CLOCK"]
+    Catalog["falcon_kvblock_table\ndurable block rows"]
+    BrpcMeta --> Pool
+    Pool --> Runtime
+    Pool --> Catalog
+  end
+
+  subgraph Store["falcon_kv_store daemon"]
+    Facade["KVStoreFacadeRegistry"]
+    Shm["LocalKVStoreShmFacade\nPOSIX SHM mmap"]
+    Remote["RemoteKVStoreFacade\nBRPC attachment"]
+    Dram["DRAM pool\nmetadata-free byte plane"]
+    SSD["SSD spill root"]
+    Facade --> Shm
+    Facade --> Remote
+    Shm --> Dram
+    Remote --> Dram
+    Remote --> SSD
+  end
+
+  Native -- "membership_start/refresh" --> CN
+  Native -- "BatchLookup/Allocate/Renew/Update/Free" --> BrpcMeta
+  Native -- "Read/Write local or remote" --> Facade
+  DNRows --> Native
+  StoreRows --> Native
 ```
 
 Component ownership rules (v6.4):
@@ -307,21 +235,83 @@ The Store:
 
 Cache hit load:
 
-```
-Client -> DN:    BatchLookupWithLease(keys)
-DN -> Client:    status/location/lease/version
-Client -> Store: BatchReadBlock(offsets) or BatchReadFromSSD(paths)
-Store -> Client: block payloads
+```mermaid
+sequenceDiagram
+  participant V as vLLM / caller
+  participant M as OffloadingManager / Connector adapter
+  participant DN as Metadata DN BRPC
+  participant SF as KVStoreFacadeRegistry
+  participant ST as Store daemon / SHM segment
+
+  V->>M: prepare_load(keys)
+  M->>DN: BatchLookupWithLease(keys, renew=true)
+  DN-->>M: STORED/EVICTED locations + lease/version/epoch
+  M->>SF: Resolve(store_id)
+  alt STORED local Store
+    SF->>ST: LocalKVStoreShmFacade.ReadBlock(view/copy)
+  else STORED remote Store
+    SF->>ST: RemoteKVStoreFacade.ReadBlock attachment
+  else EVICTED
+    SF->>ST: ReadFromSSD(path) via Store service
+  end
+  ST-->>M: payload bytes or native read view
+  M-->>V: LoadStoreSpec.data
+  V->>M: complete_load(keys)
+  M->>DN: BatchRenewLease / release bookkeeping
 ```
 
 Store path:
 
+```mermaid
+sequenceDiagram
+  participant V as vLLM / caller
+  participant M as OffloadingManager / Connector adapter
+  participant DN as Metadata DN BRPC
+  participant SF as KVStoreFacadeRegistry
+  participant ST as Store daemon / SHM segment
+
+  V->>M: prepare_store(keys)
+  M->>DN: BatchLookupWithLease(drop redundant STORED)
+  M->>DN: BatchAllocateWithLease(keys_to_store)
+  DN-->>M: store_id + pool_offset + lease/version/epoch
+  V->>M: complete_store(keys, payload buffers)
+  M->>SF: Resolve(store_id)
+  alt local Store
+    SF->>ST: LocalKVStoreShmFacade.WriteBlock(memoryview)
+  else remote Store
+    SF->>ST: RemoteKVStoreFacade.WriteBlock attachment
+  end
+  ST-->>M: per-block write result
+  M->>DN: BatchUpdateBlockStatus(ALLOCATED -> STORED)
+  DN-->>M: status CAS result
 ```
-Client -> DN:    BatchAllocateWithLease(keys)
-DN -> Client:    store_id/pool_offset/lease/version
-Client -> Store: BatchWriteBlock(payloads)
-Store -> Client: per-key write result
-Client -> DN:    BatchUpdateBlockStatus(success_keys, ALLOCATED -> STORED)
+
+vLLM dynamic connector load path:
+
+```mermaid
+sequenceDiagram
+  participant Sch as vLLM scheduler
+  participant CS as FalconFSConnectorScheduler
+  participant CA as FalconFSOffloadingManagerAdapter
+  participant CW as FalconFSConnectorWorker
+  participant TH as _FalconFSTransferHandler
+  participant ST as FalconFS Store path
+
+  Sch->>CS: _maximal_prefix_lookup(candidate_keys)
+  CS->>CA: lookup_many(candidate_keys, req_context)
+  CA-->>CS: ordered hit/miss/defer map
+  Sch->>CW: start_load_kv(metadata)
+  CW->>TH: transfer_async(job_id, FalconFSLoadStoreSpec -> GPULoadStoreSpec)
+  alt whole-block load
+    TH->>ST: read_prepared_payloads(spec)
+    TH->>TH: _payloads_to_gpu(all layers)
+  else layer-wise load enabled
+    TH->>ST: payload_future = read_prepared_payloads(spec)
+    Sch->>CW: wait_for_layer_load(layer_name)
+    CW->>TH: wait_for_layer_load(layer_name)
+    TH->>TH: copy only layer slice into KV cache
+  end
+  CW-->>Sch: get_finished() reports completed receive job
 ```
 
 ### 2.6 Deployment topology
@@ -2862,83 +2852,24 @@ There is no owner claim step. Any client that obtains the current token through 
 
 ### 16.1 Required Methods
 
-The Python manager implements the upstream vLLM `OffloadingManager` interface (`vllm/v1/core/offloading_manager.py`). External method names stay singular; internal batching is hidden behind the C++ client.
+The standalone Python manager implements the upstream vLLM `OffloadingManager`
+shape while hiding FalconFS batching behind the native client:
 
-Externally exposed methods (must match upstream):
+| Method | FalconFS behavior |
+|---|---|
+| `lookup(key, req_context)` | Compatibility path; production scheduler paths use `lookup_many()` / batched lookup. |
+| `prepare_load(keys, req_context)` | DN `BatchLookupWithLease`, then parallel Store reads for `STORED` blocks and Store `ReadFromSSD` for `EVICTED` blocks. `ALLOCATED` is not a safe data hit. |
+| `complete_load(keys)` | Renews/releases lease bookkeeping and clears request lookup cache. |
+| `prepare_store(keys, req_context)` | Drops redundant `STORED` keys, allocates only missing keys, and returns ordered Store locations. |
+| `complete_store(keys, success=True)` | Writes payloads through local SHM or remote BRPC attachment, then CAS-updates `ALLOCATED -> STORED`; failed writes free allocated slots. |
+| `touch(keys)` | Updates CLOCK/hotness state without byte transfer. |
 
-1. `lookup(key: str, req_context) -> bool | None`
-2. `prepare_load(keys: list[str], req_context) -> LoadStoreSpec`
-3. `complete_load(keys: list[str])`
-4. `prepare_store(keys: list[str], req_context) -> Optional[PrepareStoreOutput]`
-5. `complete_store(keys: list[str], success: bool = True)`
-6. `touch(keys: list[str])`
-
-Internal helpers (implementation detail, not part of the upstream contract):
-
-- `_batch_lookup_impl(keys, req_context)` – groups by DN, then dispatches one `BatchLookupWithLease` per DN **in parallel** through the **metadata stage pool** (§29.5). Returns the per-key status (`STORED`/`EVICTED`/`ALLOCATED`/`EVICTING`/`NOT_FOUND`) so callers can short-circuit redundant stores.
-- `_meta_stage_pool` – per-DN ThreadPool of size `min(num_dns, falcon_kv.client_meta_parallelism_max)`, drained by `_batch_lookup_impl` / `_batch_prepare_store_impl` / `_batch_complete_store_impl` / `_batch_renew_impl` / `_free_allocated_for_keys`. Carries small protobuf RPCs only.
-- `_data_stage_pool` – CPU-aware ThreadPool of size `min(num_tasks, falcon_kv.client_data_parallelism_max, hw_concurrency * 2)`, drained by both **`prepare_load`** (parallel `Store.ReadBlock` / `BatchReadBlock` / `ReadFromSSD`) **and** `complete_store` (parallel `Store.WriteBlock` / `BatchWriteBlock`). **One task = one bounded Store data RPC** or one local SHM facade call; grouping is capped by read/write batch-size and target-byte knobs. SSD always uses **`ReadFromSSD`** to the owning Store (see §12.3.2, v6.6.2). The Store does not run an internal worker pool. All tasks call into the native facade with the GIL released. See §29.5 for dispatch rules and pipeline ordering against `_meta_stage_pool`.
-- `_batch_prepare_store_impl(keys, req_context)` – **drop-redundant-store wrapper around `BatchAllocateWithLease`**. Pseudocode:
-
-  ```python
-  def _batch_prepare_store_impl(keys, req_context):
-      # 1) Consult the local OffloadingManager cache first (fastest path).
-      local_hits = local_cache.lookup_many(keys)         # status per key
-      candidates = [k for k in keys if local_hits[k] != STORED]
-
-      # 2) For keys not locally STORED, ask the DN. This batch RPC follows
-      #    §13.1: cache hit short-circuit + libpq SELECT only on miss.
-      remote_hits = batch_lookup_with_lease(candidates, req_context)
-
-      # 3) Drop every key that is already STORED (locally or remotely).
-      #    These are "redundant stores": the cluster already holds the
-      #    bytes, so we report success without issuing a Store write.
-      to_allocate = []
-      already_stored = []
-      for k in keys:
-          if local_hits[k] == STORED or remote_hits.get(k) == STORED:
-              already_stored.append(k)
-          else:
-              to_allocate.append(k)
-
-      # 4) For everything else, issue exactly ONE BatchAllocateWithLease per
-      #    DN. The DN will return reused_existing_allocation=true for any
-      #    key that lost a concurrent allocate race; we still treat that
-      #    case as "no Store write needed" (§7.11.3).
-      alloc_rsp = batch_allocate_with_lease(to_allocate, req_context)
-
-      will_write   = []
-      drop_silently = list(already_stored)
-      for item in alloc_rsp.results:
-          if item.success and not item.reused_existing_allocation:
-              will_write.append(item)            # caller must Store-write
-          elif item.success and item.reused_existing_allocation:
-              drop_silently.append(item.block_hash)
-          else:
-              # CAS_CONFLICT / THROTTLED / etc. — surface to caller for retry
-              ...
-      return PrepareStoreOutput(will_write=will_write,
-                                drop_silently=drop_silently)
-  ```
-
-  The two drops together implement §7.11.4: redundant stores are eliminated **before** any Store byte transfer, and any that still slip through are folded onto the winner's slot at the DN.
-
-- `_batch_complete_store_impl(keys, success_keys, fail_keys)` – issues `BatchUpdateBlockStatus` **per DN in parallel** through `_meta_stage_pool` for `success_keys` with `allow_noop_if_already_target=true` so a concurrent winner that already moved the row to `STORED` does not turn this client's transition into an error. Optionally calls `BatchFreeAllocated` (also per-DN parallel) for `fail_keys`. Treats DN-returned `current_status == STORED` as success even when `success=false`/`error_code=CAS_CONFLICT`. Note that the **byte writes themselves** are dispatched by `_data_stage_pool` per block; `_batch_complete_store_impl` only handles the trailing metadata CAS.
-- `_batch_load_impl(keys)` – v6.6.3 **parallel load**. After `_batch_lookup_impl` returns the per-key status, group DRAM-resident keys by `(dn_id, store_id)`, split each group by configured batch caps, and dispatch bounded data tasks into `_data_stage_pool`. Each task issues one unary or batch facade call; there is no Store-side worker pool and no Store-side stripe-splitting:
-  - **`STORED`** keys → `KVStoreFacadeRegistry::Resolve(store_id).ReadBlock(item)` (LocalKVStoreShmFacade if same-host, else Remote BRPC `ReadBlock`) — disjoint `pool_offset`s run truly in parallel (§29.4 / §12.6.3).
-  - **`EVICTED`** keys → `Store.ReadFromSSD(item)` on the owning Store (§12.3.2, v6.6.2). SSD reads are dispatched per block so multiple Store RPCs overlap.
-  - **`ALLOCATED`** keys → skipped or deferred (empty spec / retry / policy) per §7.11.6.
-  - Does **not** call allocate or `BatchUpdateBlockStatus` inside the SSD read (§12.3.1). After each successful `EVICTED` read, hands `(block_hash, version, buffer)` to the **promote queue** (§12.3.3 / §13.4) so the block can be asynchronously rehydrated to DRAM without extending foreground load latency.
-  - Foreground load latency = `max_dn(BatchLookupWithLease) + max_block(ReadBlock or SSD read)`, **not** the sum across DNs and **not** the sum across blocks.
-- `_promote_worker()` – background coroutine pool that drains the bounded promote queue. Talks to **two** distinct BRPC servers (DN for metadata, Store for bytes — see the ownership table in §12.3.1). For each batch drained it issues:
-  1. `DN.BatchAllocateWithLease(items, hint=PROMOTE_FROM_EVICTED)` against the per-key **DN** (Metadata DN BRPC, §11); treats `reused_existing_allocation=true` and `CAS_CONFLICT(retryable=true)` as **drop without retry**;
-  2. `Store.WriteBlock` / `BatchWriteBlock` against the **Store** (Store BRPC, §12) selected by the DN response, for items whose allocate succeeded with a fresh slot. Failures call `DN.BatchFreeAllocated` to release the slot and drop the buffer;
-  3. `DN.BatchUpdateBlockStatus(ALLOCATED → STORED, allow_noop_if_already_target=true)` back on the **DN** to publish; treats `current_status=STORED` as success.
-
-  Admission filter applied **before** enqueue (§12.3.3 step 4): hot-key access sketch (`promote_min_access_count`), free-DRAM watermark (`promote_when_pressure_below`), and inflight cap (`promote_max_inflight`). When the queue is full the new item is dropped, not blocked, so the load path is never throttled by promote backpressure.
-- `_batch_renew_impl(keys)` – calls `BatchRenewLease`. On `LEASE_EXPIRED(retryable=true)`, falls through `_batch_lookup_impl` to refresh and may re-renew.
-
-The upstream `lookup(key)` is implemented as: maintain a small request-coalescing buffer; flush when full or when `prepare_load` is called, so the per-key `lookup` cost amortizes across one batch RPC. The same buffering applies to `_batch_prepare_store_impl`'s lookup probe, so the drop-redundant-store check costs at most one extra RPC per flush window.
+Implementation helpers are intentionally not part of the public API: `_batch_lookup_impl`,
+`_batch_prepare_store_impl`, `_batch_load_impl`, `_batch_complete_store_impl`,
+`_batch_renew_impl`, `_meta_stage_pool`, `_data_stage_pool`, and the promote worker.
+The dispatch contract is summarized in §29.5: metadata tasks fan out per DN, data
+tasks fan out by bounded Store/locality groups, and SSD reads remain Store-service
+reads rather than client-side filesystem shortcuts.
 
 ### 16.2 Local Cache
 
@@ -2971,114 +2902,125 @@ vLLM can call batch lookup for all candidate hashes, then compute longest contig
 
 This avoids one lookup RTT per block.
 
----
+### 16.4 vLLM V1 KVConnector Integration
 
-## 17. Implementation File Layout
+FalconFS is integrated as a **dynamic** vLLM V1 KVConnector. The recommended
+activation shape is:
 
-Recommended layout:
-
-```text
-vllm_kv_cache/
-  proto/
-    kv_common.proto
-    kv_metadata_service.proto
-    kv_data_service.proto
-  python/falconfs_kv/
-    __init__.py
-    offloading_manager.py
-    dn_client.py
-    store_client.py
-    router.py
-  src/
-    metadata/
-      kv_metadata_service_impl.h/.cpp        # BRPC handler shells (BRPC threads)
-      kv_metadata_engine.h/.cpp              # Engine running in pool-worker threads
-      kv_dram_cache.h/.cpp                   # KVDramCache, KVRegion, ShardHashIndex, DropSlot
-      kv_bitmap_allocator.h/.cpp             # Per-region bitmap (paired with meta[] in KVRegion)
-      kv_lease.h/.cpp                        # Lease op helpers on DramMetaSlot
-      kv_clock_evictor.h/.cpp                # CLOCK candidate scan + eviction coordinator thread
-      kv_meta_catalog_accessor.h/.cpp        # PG-backend-side catalog SQL helpers (catalog only)
-      kv_catalog_rpc.h/.cpp                  # libpq client + falcon_kv_metadata_catalog_call_by_serialized_shmem_internal binding
-    store/
-      kv_data_service_impl.h/.cpp
-      dram_block_pool.h/.cpp
-      ssd_spill_manager.h/.cpp
-      checksum.h/.cpp
-    common/
-      kv_types.h
-      error_codes.h
-      time_utils.h
-      hash_utils.h
-  test/
-    test_bitmap_allocator.cpp
-    test_lease_manager.cpp
-    test_metadata_dn.cpp
-    test_store_kv_memory_pool.cpp
-    test_dn_brpc_service.cpp
-    test_offloading_manager.py
+```bash
+--kv-transfer-config '{
+  "kv_connector":"FalconFSConnector",
+  "kv_role":"kv_both",
+  "kv_connector_module_path":"falconfs_kv.vllm_kv_connector",
+  "kv_connector_extra_config":{
+    "cn_conninfo":"host=... port=... dbname=postgres user=...",
+    "falconfs_namespace":"default",
+    "falconfs_tenant":"default",
+    "falconfs_model_id":"model-or-fingerprint"
+  }
+}'
 ```
 
+No vLLM source patch is required. `FalconFSConnector` subclasses
+`KVConnectorBase_V1`, uses `FalconFSConnectorScheduler` on the scheduler side,
+and uses `FalconFSConnectorWorker` plus `_FalconFSTransferHandler` on the worker
+side. The connector reuses vLLM's `kv_offload` worker abstractions but replaces
+the expensive per-key prefix probe with a batched FalconFS lookup:
+
+1. `FalconFSConnectorScheduler._maximal_prefix_lookup()` and
+   `_sliding_window_lookup()` build the candidate key list.
+2. They call `FalconFSOffloadingManagerAdapter.lookup_many(keys, req_context)`
+   once per candidate prefix/window.
+3. `lookup_many()` groups by DN through the existing FalconFS metadata path,
+   caches request-local lookup results, and returns an ordered hit/miss/defer map.
+4. `lookup(key)` remains only as a compatibility fallback and increments
+   `forbidden_single_key_lookup_count`; FalconFS scheduler code must not use it
+   for prefix probing.
+
+Role behavior:
+
+| `kv_role` | Lookup/load | Store on finish | Intended use |
+|---|---:|---:|---|
+| `kv_both` | yes | yes | single-engine offload + prefix reuse |
+| `kv_producer` | no | yes | prefill/producer in shared-cache PD |
+| `kv_consumer` | yes | no | decode/consumer in shared-cache PD |
+
+Shared prefix cache and shared-cache PD require identical namespacing inputs on
+all instances: key version, namespace, tenant, model id/fingerprint, hash
+algorithm, cache salt, KV layout version, vLLM block size, LoRA identity, KV
+group index, and vLLM block hash. The final FalconFS key is a deterministic hash
+of those fields. Legacy raw `OffloadKey.hex()` keys are supported only when
+`falconfs_legacy_unnamespaced_keys=true`.
+
+### 16.5 Async Load and Layer-Wise Load
+
+Connector load execution has two independent flags:
+
+```text
+falconfs_async_load            env FALCON_KV_VLLM_ASYNC_LOAD       default true
+falconfs_layerwise_load        env FALCON_KV_VLLM_LAYERWISE_LOAD   default false
+falconfs_layer_prefetch_depth  env FALCON_KV_VLLM_LAYER_PREFETCH_DEPTH default 2
+```
+
+The four supported modes are:
+
+| async load | layer-wise load | Behavior |
+|---:|---:|---|
+| off | off | `_run_transfer()` performs whole-block load inline and `get_finished()` reports it immediately. |
+| on | off | Current default: `transfer_async()` submits whole-block read + copy to the transfer executor. |
+| off | on | `transfer_async()` records a layer job; the first `wait_for_layer_load(layer)` fetches payloads once and copies that layer slice synchronously. |
+| on | on | `transfer_async()` starts `payload_future`; `wait_for_layer_load(layer)` waits for or schedules that layer copy and advances a bounded prefetch window. |
+
+Important boundaries:
+
+- FalconFS still stores one whole offloaded payload per key. Layer-wise load is a
+  **copy scheduling** feature, not a new per-layer object format.
+- The handler derives layer byte spans from vLLM's canonical KV cache layout. In
+  cross-layer-cache mode, one tensor row is split into contiguous layer slices;
+  in normal registered-cache mode, the per-layer reference list is used.
+- `wait_for_layer_load(layer_name)` is no longer a no-op when layer-wise load is
+  enabled. It blocks only for the requested layer's copied bytes.
+- `save_kv_layer()` remains a no-op. Store is still whole-block at
+  `wait_for_save()` / `prepare_store_kv()` time.
+- Preemption drains active load jobs before GPU blocks are reused.
+- Metrics include `async_load_enabled`, `layerwise_load_enabled`,
+  `layer_prefetch_depth`, `whole_block_loads`, `layerwise_loads`,
+  `layerwise_async_jobs`, `layerwise_sync_waits`, `payload_fetch_ms`,
+  `payload_cache_bytes`, `layer_copy_ms`, `layer_wait_ms`, `load_failures`, and
+  fallback counters.
+
+GPU load still requires a host-to-device copy into vLLM KV pages. Local SHM
+zero-copy views are useful as host-side sources, but the connector does not make
+GPU KV pages alias Store DRAM.
+
 ---
 
-## 18. Development Phases
+## 17. Implementation File Map
 
-### Phase 1: Proto and build integration
+This is a current-orienting map, not an exhaustive file inventory:
 
-1. finalize proto,
-2. generate BRPC/protobuf code,
-3. compile empty DN/Store services,
-4. add basic service startup tests.
+| Area | Main files/directories | Notes |
+|---|---|---|
+| Metadata DN engine | `vllm_kv_cache/src/metadata/`, `falcon/metadb/`, `falcon/brpc_comm_adapter/` | Runtime cache, catalog accessor, recovery runner, BRPC-to-pool-worker bridge. |
+| Store daemon and facade | `vllm_kv_cache/src/store/`, `vllm_kv_cache/python_ext/falconfs_kv_brpc.cpp` | DRAM pool, SSD spill, local SHM facade, remote BRPC attachment path, pybind APIs. |
+| Python OffloadingManager | `vllm_kv_cache/python/falconfs_kv/offloading_manager.py`, `store_client.py`, `dn_client.py`, `promote_worker.py` | Cluster/reference mode, metadata/data pools, batching, zero-copy/prealloc policies, promote-on-read. |
+| vLLM dynamic connector | `vllm_kv_cache/python/falconfs_kv/vllm_kv_connector.py` | Scheduler `lookup_many`, namespaced keys, roles, transfer handlers, async/layer-wise load. |
+| Tests and benchmarks | `vllm_kv_cache/test/`, `scripts/falcon_kv_regression.sh`, `docs/falcon_kv_precommit_regression.md` | Unit, cluster, mixed E2E, connector, microbench, and commit gate. |
 
-### Phase 2: Store memory pool
+## 18. Implementation Status
 
-1. implement DRAM block pool,
-2. implement batch write/read,
-3. implement checksum validation,
-4. implement SSD read/write helpers.
+The old phase-by-phase build plan is retired; see
+`falconfs_kv_cache_development_test_plan.md` for historical execution logs. Current
+status by subsystem:
 
-### Phase 3: DN DRAM Runtime Cache (in-process)
-
-1. `KVRegion` with bitmap + dense `meta[]` array,
-2. per-shard `ShardHashIndex` (striped),
-3. lease + CLOCK on `DramMetaSlot`,
-4. `DropSlot` and ordered free path.
-
-### Phase 4: PostgreSQL catalog accessor + libpq client
-
-1. table OID resolution,
-2. catalog `BatchLookupByHash` / `BatchInsertAllocated` / `BatchCASStatusUpdate` / `BatchDeleteOrMarkFailed`,
-3. `ScanShardForRecovery` SQL,
-4. catalog-only SQL function `falcon_kv_metadata_catalog_call_by_serialized_shmem_internal`,
-5. pool-worker-side libpq client wrapping the SQL function.
-
-### Phase 5: DN BRPC service + engine wiring
-
-1. connect service handlers to engine running in pool-worker threads,
-2. cache-hit short-circuit + cache-miss libpq fallback,
-3. write-through for allocate/update/free,
-4. add per-item results,
-5. add latency metrics.
-
-### Phase 6: Python client/offloading manager
-
-1. DN client pool,
-2. Store client pool,
-3. router,
-4. vLLM-facing batch APIs.
-
-### Phase 7: eviction/recovery
-
-1. eviction worker,
-2. restart recovery,
-3. EVICTING reconciliation,
-4. Store restart handling.
-
-### Phase 8: performance hardening
-
-1. chunk tuning,
-2. queue/backpressure tuning,
-3. p99 regression tests,
-4. fault injection.
+- **Implemented:** metadata engine, Store data plane, Store admin RPCs, recovery,
+  eviction, promote-on-read, local/remote facades, Python OffloadingManager,
+  dynamic vLLM connector, metrics persistence, and regression scripts.
+- **Flag-gated:** adaptive batching, zero-copy read views, preallocated load
+  buffers, connector layer-wise load.
+- **Release-validation pending:** repeated full-profile performance stability, live
+  GPU vLLM serve/offload, shared-cache PD acceptance, and zero-copy consumer
+  lifetime/materialization validation.
 
 ---
 
@@ -3344,7 +3286,7 @@ This appendix maps every architectural concept to existing FalconFS code so a re
 | DRAM cache data model | `vllm_kv_cache/src/metadata/kv_dram_cache.h` (`KVDramCache`, `KVRegion`, `DramMetaSlot`, `ShardHashIndex`) | Pure C++ in-process structures; no PG shmem. |
 | DRAM cache ops | `vllm_kv_cache/src/metadata/kv_dram_cache.cpp` (`Allocate`, `LookupHit`, `UpdateStatus`, `RenewLease`, `DropSlot`, `Free`) | Uses `std::atomic`, `std::shared_mutex`, striped locks. |
 | CLOCK eviction thread | `vllm_kv_cache/src/metadata/kv_clock_evictor.cpp` (`KVClockEvictor`) | Dedicated thread inside BackgroundPoolManager; iterates `KVRegion`s and calls catalog CAS via libpq. |
-| Catalog SQL boundary | `falcon/connection_pool/kv_backend_rpc.cpp` (`falcon_kv_metadata_catalog_call_by_serialized_shmem_internal`) | Catalog-only SQL function; reduced to table accessor calls. |
+| Catalog SQL boundary | `falcon/connection_pool/kv_backend_rpc.cpp` (`falcon_kv_metadata_catalog_call`) | Catalog-only SQL function carrying POD request/response bytes; reduced to table accessor calls. |
 | Catalog accessor | `vllm_kv_cache/src/metadata/kv_meta_catalog_accessor.cpp` (`BatchLookupByHash`, `BatchInsertAllocated`, `BatchCASStatusUpdate`, `BatchDeleteOrMarkFailed`, `ScanShardForRecovery`) | Runs entirely inside PG backend; no runtime cache state. |
 | Engine integration | `vllm_kv_cache/src/metadata/kv_metadata_engine.cpp` | Runs in pool-worker threads; calls `KVDramCache::*` first and uses `KVCatalogClient` (libpq) only on miss/write-through paths. |
 | Recovery driver | `vllm_kv_cache/src/metadata/kv_metadata_recovery.cpp` | Schedules per-shard `ScanShardForRecovery` jobs in parallel on the pool, populates `KVDramCache` before BRPC turns ready. |
@@ -3412,7 +3354,7 @@ BackgroundPoolManager startup phase (inside the bgworker process, after libpq po
 
 a. Read KV GUCs and the Store registry from CN (or from a small KV registry catalog).
 b. Construct empty `KVDramCache` with one `ShardHashIndex` per shard owned by this DN.
-c. Bind catalog SQL callable: prepare `falcon_kv_metadata_catalog_call_by_serialized_shmem_internal` on every libpq connection.
+c. Bind catalog SQL callable: prepare `falcon_kv_metadata_catalog_call` on every libpq connection.
 d. Bump `dn_epoch` via a libpq CAS on the small KV epoch row.
 e. Start `KVStoreRegistryListener` so Stores can register regions; on each `RegisterStoreRegion`, allocate the corresponding `KVRegion` (zeroed bitmap + meta array, fresh `store_epoch`).
 f. Once at least one healthy region is registered, start `KVMetadataRecoveryDriver`: schedule one `ScanShardForRecovery(shard)` job per shard (§15.1, §6.5). The driver is idempotent and can re-run.
@@ -3847,6 +3789,16 @@ performance policy from unary-only to bounded attachment micro-batching.
   smoke gate, restarts after destructive fault drills before Python E2E, aligns
   Python block size with Store block size, and `scripts/falcon_distributed_test.sh`
   waits for all BRPC pooler ports before declaring the cluster ready.
+- **Dynamic vLLM KVConnector.** `falconfs_kv.vllm_kv_connector.FalconFSConnector`
+  implements scheduler/worker roles without patching vLLM. Prefix probing uses
+  `lookup_many()` instead of per-key `lookup()`, connector roles support
+  producer/consumer/both, and namespaced deterministic keys enable cross-instance
+  prefix sharing and shared-cache PD when namespace inputs match.
+- **Independent async and layer-wise load.** The connector now supports whole-sync,
+  whole-async, layer-sync, and layer-async load modes. Layer-wise mode fetches the
+  current whole-block FalconFS payload once, caches it for the active request job,
+  and copies only the requested layer slice when vLLM calls
+  `wait_for_layer_load(layer_name)`.
 
 #### 29.10.2 Current default policy
 
@@ -3868,6 +3820,10 @@ FALCON_KV_CLIENT_BATCH_WRITE_TARGET_BYTES default 4 MiB
 FALCON_KV_CLIENT_ADAPTIVE_BATCHING      default 0 (experimental)
 FALCON_KV_CLIENT_PREALLOC_LOAD_BUFFERS  default 0 (reuse client load buffers; opt-in)
 FALCON_KV_CLIENT_ZERO_COPY_READS        default 0 (return read-only native views; opt-in)
+FALCON_KV_VLLM_ASYNC_LOAD               default 1 (current connector behavior)
+FALCON_KV_VLLM_LAYERWISE_LOAD           default 0 (opt-in copy scheduling)
+FALCON_KV_VLLM_LAYER_PREFETCH_DEPTH     default 2
+FALCON_KV_VLLM_TRANSFER_WORKERS         default 4
 ```
 
 Trade-off:
@@ -3913,6 +3869,11 @@ regress against the saved baseline JSON.
 - **Recovery stress breadth.** Unit coverage includes large DN recovery, late Store registration parking/replay, and DN-startup `EVICTING -> STORED` reconciliation. Cluster Store-restart reconciliation covers `ALLOCATED`, `STORED`, `EVICTING`, valid `EVICTED`, empty-path `EVICTED`, and missing-path `EVICTED` rows. Remaining release work is larger full-profile scale and richer Store-local SSD validation stress (out-of-root, non-regular, unreadable) against a real Store root.
 - **Full-profile regression.** Smoke is the required pre-commit gate; the full
   topology/failover/mixed/promote gate must run before declaring a release.
+- **Live vLLM GPU serving validation.** Direct connector unit tests cover the
+  transfer handler and scheduler fast path. Production GPU acceptance still needs
+  a CUDA/XPU-capable host where real vLLM KV pages are stored to FalconFS and
+  later loaded back without output drift. The local WSL Arc stack is not a release
+  acceptance substitute.
 
 #### 29.10.5 Required metrics for every performance run
 
@@ -3937,66 +3898,60 @@ because those answer different performance questions.
 
 ---
 
-## 30. Next Moves to Finish the Full Design
+## 30. Current Release Status and Remaining Gates
 
-This plan is ordered by risk and dependency. Do not start later throughput tuning
-until the earlier correctness and observability gates are stable.
+The implementation now matches the v6 storage/backend design for metadata, Store
+DRAM/SSD, local/remote data facades, Store-restart reconciliation, promote-on-read,
+path-specific performance instrumentation, dynamic vLLM KVConnector plumbing, and
+flag-gated adaptive/zero-copy policies. Remaining work is release validation and
+default-policy promotion, not a different core architecture.
 
-### 30.1 Close correctness and design-alignment gaps
+### 30.1 Implemented and Commit-Gated
 
-1. **Metadata BRPC channel reuse regression — DONE.** The channel cache exposes
-   stats/reset hooks and Python unittest coverage checks successful reuse plus
-   failure-driven eviction.
-2. **Harden Store restart SSD preservation — DONE for smoke.** Runtime fencing,
-   durable catalog reconciliation, Store-hosted `ValidateEvictedPaths`, and
-   invalid-row catalog cleanup are implemented. Full profile should add larger
-   spill-root GC stress, but the correctness path is no longer a design gap.
-3. **Promote-on-read metrics/admission — DONE for smoke.** Foreground SSD load
-   returns before promote completion; queue-full, pressure, hotness, and failure
-   metrics are exposed and tested.
-4. **Recovery stress — PARTIALLY DONE.** DN startup recovery scans, large-row unit stress, late Store registration parking/replay, DN-startup `EVICTING -> STORED`, and Store-restart `EVICTING` deletion are covered. Full-profile release work is larger cluster scale and real Store SSD validation edge cases (out-of-root, non-regular, unreadable).
+- Metadata DN runtime cache, catalog write-through, leases, epoch fencing,
+  eviction, DN recovery, and Store-restart reconciliation with SSD path validation.
+- Store daemon data plane with local SHM facade, remote BRPC attachments, checksum
+  default-off for DRAM hot paths, SSD reads through Store service, and Store admin
+  RPCs.
+- Python `FalconFSOffloadingManager` cluster mode with per-DN metadata fan-out,
+  CPU-aware data fan-out, bounded read/write batching, promote-on-read,
+  preallocated load buffers, zero-copy read views, adaptive batching scaffolding,
+  and persisted metrics JSON.
+- Dynamic `FalconFSConnector` for vLLM V1 with batched `lookup_many()` prefix
+  probing, namespaced keys, producer/consumer/both roles, whole-block async load,
+  and opt-in layer-wise load.
+- Regression assets: `ctest -L kv-unit`, Python policy/connector tests,
+  `scripts/falcon_kv_regression.sh`, path-specific microbench JSONs, and the
+  canonical commit gate in `docs/falcon_kv_precommit_regression.md`.
 
-### 30.2 Make performance policy adaptive but safe
+### 30.2 Remaining Release Gates
 
-1. **Keep adaptive batching flag-gated.** The per-path probe/rollback controller is implemented behind `FALCON_KV_CLIENT_ADAPTIVE_BATCHING=1`; defaults remain static.
-2. **Repeat adaptive-on full runs.** Promote an adaptive policy only after at least three full-profile runs show no regression versus static defaults and improved or equal p95.
-3. **Do not promote write batching by default yet.** Write batch max stays `1` until batched writes improve both Store throughput and p95 versus unary writes.
-4. **Persist policy evidence.** Mixed E2E JSON must keep selected batch, previous batch, decision reason, rollback count, latency, throughput before/after, CPU count, data parallelism, and inflight bytes.
+1. **Regression stability.** Smoke regression is the pre-commit gate. Full profile
+   is required before declaring a release. Any failure must be explained by logs
+   and either fixed or recorded as an environment/setup issue.
+2. **Performance baseline enforcement.** Keep static defaults until saved mixed
+   E2E baselines show no store/load regression. Path-correct comparisons must use
+   `native_memcpy_bound`, `local_shm_upper_bound`,
+   `local_shm_prealloc_write_bound`, and `remote_brpc_upper_bound`, not a single
+   generic “DRAM bandwidth” number.
+3. **Adaptive batching promotion.** `FALCON_KV_CLIENT_ADAPTIVE_BATCHING=1` remains
+   experimental until at least three repeated full-profile runs match or beat
+   static defaults on throughput and p95 latency.
+4. **Zero-copy default decision.** `FALCON_KV_CLIENT_ZERO_COPY_READS=1` and
+   preallocated load buffers remain opt-in until real vLLM consumer paths prove no
+   accidental materialization and no lifetime bugs.
+5. **GPU/live vLLM acceptance.** Production readiness requires a CUDA/XPU-capable
+   host or CI job that stores real vLLM KV pages to FalconFS, loads them back,
+   validates outputs against recompute, and reports GPU copy latency separately
+   from FalconFS metadata/data latency.
+6. **Shared-cache PD acceptance.** Producer and consumer engines must share the
+   same namespace config; producer metrics must show store-only, consumer metrics
+   lookup/load-only, and consumer hits must be positive for repeated prefixes.
 
-### 30.3 Strengthen benchmark and regression gates
-
-1. **Persist baselines.** Every mixed offloading run must write JSON under
-   `logs/` with baseline path, current policy, Store micro-bench upper bound,
-   percent of upper bound, and percent change vs baseline.
-2. **Run both block sizes under memory pressure.** Use 1 MiB as the default local
-   smoke size and 512 KiB for low-memory fallback; keep 2 MiB release coverage
-   when DRAM allows.
-3. **Promote path-specific micro-benchmarks into the gate.** The regression runner persists separate native/local-read/local-write/remote/mixed JSON files and mixed E2E merges all of them. Local E2E comparisons must not be null when a local Store is exercised. Optional baseline gating fails on >10% store/load regression when `FALCON_MIX_BASELINE_JSON` is set, unless explicitly overridden with `FALCON_MIX_ALLOW_PERF_REGRESSION=1`.
-4. **Full profile before release.** `REGRESSION_PROFILE=smoke` is the pre-commit
-   gate; `REGRESSION_PROFILE=full` is required before declaring the full design
-   done because it covers failover/topology/mixed-colocation/promote drills.
-
-### 30.4 Final performance targets
-
-Use measured upper bounds, not theoretical DRAM bandwidth alone:
-
-1. Native copy bound from the micro-benchmark.
-2. Store facade bound from multi-threaded local/remote Store micro-benchmark.
-3. End-to-end offloading throughput including metadata.
-
-Release target:
-
-- End-to-end store and load must not regress vs the saved baseline.
-- End-to-end throughput should reach a documented percentage of the Store facade
-  upper bound for the same block size, path mix, and parallelism.
-- Read throughput should no longer be structurally worse than write throughput
-  unless metrics show the difference is due to response payload materialization
-  or a specific BRPC/attachment copy that is documented in the run output.
-
-### 30.5 Commit gate
+### 30.3 Commit Gate
 
 Before commit, run the explicit gate documented in
-`docs/falcon_kv_precommit_regression.md`. At minimum this is the smoke wrapper:
+`docs/falcon_kv_precommit_regression.md`. Minimum smoke command:
 
 ```bash
 env REGRESSION_PROFILE=smoke \
@@ -4010,4 +3965,5 @@ env REGRESSION_PROFILE=smoke \
 ```
 
 The basic FalconFS FS test inside `scripts/falcon_distributed_test.sh test` is
-required; do not commit if it is skipped or stale-mounted.
+required; do not commit if it is skipped, stale-mounted, or hidden behind a
+partial cluster run.

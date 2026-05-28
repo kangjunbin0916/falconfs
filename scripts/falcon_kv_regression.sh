@@ -258,6 +258,9 @@ suite_kv_cluster_promote_test() {
 
 suite_python_unittest() {
     cd "$PROJECT_DIR"
+    if [ -x /usr/local/pgsql/bin/pg_config ]; then
+        export PATH="/usr/local/pgsql/bin:${PATH:-}"
+    fi
     export PYTHONPATH="$PROJECT_DIR/vllm_kv_cache/python:$PROJECT_DIR/vllm_kv_cache/test:${PYTHONPATH:-}"
     # Keep Python OffloadingManager block sizing aligned with the running store.
     # Regression runs often lower FALCON_KV_STORE_BLOCK_SIZE to fit local DRAM.

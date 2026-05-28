@@ -8,7 +8,7 @@ import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -90,6 +90,33 @@ def _truthy(value: Any) -> bool:
     if value is None:
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _config_bool(
+    extra: dict[str, Any],
+    key: str,
+    env_name: str,
+    default: bool,
+) -> bool:
+    if key in extra:
+        return _truthy(extra.get(key))
+    raw = os.environ.get(env_name)
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+    return _truthy(raw)
+
+
+def _config_int(
+    extra: dict[str, Any],
+    key: str,
+    env_name: str,
+    default: int,
+) -> int:
+    raw = extra.get(key, os.environ.get(env_name, default))
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def _config_attr(obj: Any, name: str, default: Any = "") -> Any:
@@ -301,6 +328,27 @@ class FalconFSOffloadingManagerAdapter(OffloadingManager):
                 "falconfs_load_failure_policy must be 'recompute' or 'fail', "
                 f"got {self.load_failure_policy!r}"
             )
+        self.async_load_enabled = _config_bool(
+            self.extra_config,
+            "falconfs_async_load",
+            "FALCON_KV_VLLM_ASYNC_LOAD",
+            True,
+        )
+        self.layerwise_load_enabled = _config_bool(
+            self.extra_config,
+            "falconfs_layerwise_load",
+            "FALCON_KV_VLLM_LAYERWISE_LOAD",
+            False,
+        )
+        self.layer_prefetch_depth = max(
+            1,
+            _config_int(
+                self.extra_config,
+                "falconfs_layer_prefetch_depth",
+                "FALCON_KV_VLLM_LAYER_PREFETCH_DEPTH",
+                2,
+            ),
+        )
         self.manager = inner_manager or self._build_manager()
         self.metrics_label = metrics_label
         self.medium = FalconFSLoadStoreSpec.medium()
@@ -338,6 +386,17 @@ class FalconFSOffloadingManagerAdapter(OffloadingManager):
             "transfer_failures": 0,
             "load_failures": 0,
             "store_failures": 0,
+            "whole_block_loads": 0,
+            "layerwise_loads": 0,
+            "layerwise_async_jobs": 0,
+            "layerwise_sync_waits": 0,
+            "payload_fetch_ms": 0,
+            "layer_copy_ms": 0,
+            "layer_wait_ms": 0,
+            "payload_cache_bytes": 0,
+            "layerwise_fallbacks": 0,
+            "fallback_invalid_layout": 0,
+            "fallback_unknown_layer": 0,
         }
 
     def _build_manager(self) -> FalconFSOffloadingManager:
@@ -381,6 +440,9 @@ class FalconFSOffloadingManagerAdapter(OffloadingManager):
         labels: dict[str, Any] = self.key_namespace.metric_labels()
         labels["kv_role"] = self.kv_role
         labels["load_failure_policy"] = self.load_failure_policy
+        labels["async_load_enabled"] = self.async_load_enabled
+        labels["layerwise_load_enabled"] = self.layerwise_load_enabled
+        labels["layer_prefetch_depth"] = self.layer_prefetch_depth
         return labels
 
     def _bump(self, key: str, count: int = 1) -> None:
@@ -771,6 +833,31 @@ class _TorchHostBufferPool:
             self._free.setdefault(key, []).append(buf)
 
 
+@dataclass(frozen=True)
+class _LayerCopySpan:
+    layer_name: str
+    payload_offset: int
+    tensor_idx: int
+    tensor_offset: int
+    nbytes: int
+
+
+@dataclass
+class _LayerLoadJob:
+    job_id: int
+    transfer_spec: TransferSpec
+    layer_names: list[str]
+    start_time: float
+    payload_future: Future[dict[OffloadKey, bytes | memoryview]] | None = None
+    payloads: dict[OffloadKey, bytes | memoryview] | None = None
+    payload_size: int = 0
+    copied_layers: set[str] = field(default_factory=set)
+    copy_futures: dict[str, Future[None]] = field(default_factory=dict)
+    completed_result: TransferResult | None = None
+    failed: bool = False
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
 class _FalconFSTransferHandler(OffloadingHandler):
     def __init__(
         self,
@@ -789,6 +876,9 @@ class _FalconFSTransferHandler(OffloadingHandler):
             thread_name_prefix="falconfs-vllm-xfer",
         )
         self._futures: dict[int, Future[TransferResult]] = {}
+        self._completed_results: list[TransferResult] = []
+        self._layer_jobs: dict[int, _LayerLoadJob] = {}
+        self._layer_layout: dict[str, list[_LayerCopySpan]] | None | bool = None
         self._failed_load_block_ids: set[int] = set()
         self._lock = threading.Lock()
         self._host_pool = _TorchHostBufferPool(adapter)
@@ -798,6 +888,9 @@ class _FalconFSTransferHandler(OffloadingHandler):
         if callable(bump):
             bump(key, count)
 
+    def _bump_ms(self, key: str, start: float) -> None:
+        self._bump(key, max(1, int((time.perf_counter() - start) * 1000)))
+
     def _group_refs(self):
         if len(self.kv_caches.group_data_refs) != 1:
             raise NotImplementedError(
@@ -805,6 +898,70 @@ class _FalconFSTransferHandler(OffloadingHandler):
                 "multi-group/HMA models must be gated before serving."
             )
         return self.kv_caches.group_data_refs[0]
+
+    def _layer_names(self) -> list[str]:
+        groups = getattr(self.adapter.kv_cache_config, "kv_cache_groups", None)
+        if not groups:
+            return []
+        return list(getattr(groups[0], "layer_names", ()) or ())
+
+    def _payload_bytes_per_gpu_block(self) -> int:
+        return sum(int(ref.page_size_bytes) for ref in self._group_refs())
+
+    def _get_layer_layout(self) -> dict[str, list[_LayerCopySpan]] | None:
+        if self._layer_layout is False:
+            return None
+        if isinstance(self._layer_layout, dict):
+            return self._layer_layout
+
+        layer_names = self._layer_names()
+        refs = self._group_refs()
+        if not layer_names or not refs:
+            self._layer_layout = False
+            return None
+
+        layout: dict[str, list[_LayerCopySpan]] = {name: [] for name in layer_names}
+        if len(refs) == 1 and len(layer_names) > 1:
+            # Cross-layer cache: one row contains all layers contiguously.
+            total = int(refs[0].page_size_bytes)
+            if total <= 0 or total % len(layer_names) != 0:
+                self._layer_layout = False
+                return None
+            per_layer = total // len(layer_names)
+            for idx, layer_name in enumerate(layer_names):
+                offset = idx * per_layer
+                layout[layer_name].append(
+                    _LayerCopySpan(
+                        layer_name=layer_name,
+                        payload_offset=offset,
+                        tensor_idx=int(refs[0].tensor_idx),
+                        tensor_offset=offset,
+                        nbytes=per_layer,
+                    )
+                )
+            self._layer_layout = layout
+            return layout
+
+        if len(refs) % len(layer_names) != 0:
+            self._layer_layout = False
+            return None
+        refs_per_layer = len(refs) // len(layer_names)
+        payload_offset = 0
+        for layer_name in layer_names:
+            for ref in refs[:refs_per_layer]:
+                layout[layer_name].append(
+                    _LayerCopySpan(
+                        layer_name=layer_name,
+                        payload_offset=payload_offset,
+                        tensor_idx=int(ref.tensor_idx),
+                        tensor_offset=0,
+                        nbytes=int(ref.page_size_bytes),
+                    )
+                )
+                payload_offset += int(ref.page_size_bytes)
+            refs = refs[refs_per_layer:]
+        self._layer_layout = layout
+        return layout
 
     @staticmethod
     def _sync_device(device: torch.device) -> None:
@@ -871,6 +1028,7 @@ class _FalconFSTransferHandler(OffloadingHandler):
         tensor: torch.Tensor,
         block_id: int,
         nbytes: int,
+        tensor_offset: int = 0,
     ) -> None:
         view = payload[offset: offset + nbytes]
         try:
@@ -880,7 +1038,8 @@ class _FalconFSTransferHandler(OffloadingHandler):
                 src = torch.frombuffer(view, dtype=torch.uint8)
         except Exception:
             src = torch.tensor(bytearray(view), dtype=torch.uint8)
-        dst = self._as_byte_tensor(tensor[int(block_id)], copy_if_needed=False)[:nbytes]
+        dst_row = self._as_byte_tensor(tensor[int(block_id)], copy_if_needed=False)
+        dst = dst_row[int(tensor_offset): int(tensor_offset) + nbytes]
         if dst.device.type == "cpu":
             dst.copy_(src[:nbytes])
             return
@@ -913,6 +1072,178 @@ class _FalconFSTransferHandler(OffloadingHandler):
                     self._copy_payload_view_to_tensor(payload, offset, tensor, block_id, n)
                     offset += n
 
+    def _copy_layer_payloads_to_gpu(
+        self,
+        falcon_spec: FalconFSLoadStoreSpec,
+        gpu_spec: GPULoadStoreSpec,
+        payloads: dict[OffloadKey, bytes | memoryview],
+        layer_name: str,
+    ) -> None:
+        layout = self._get_layer_layout()
+        if layout is None or layer_name not in layout:
+            self._bump("fallback_unknown_layer")
+            raise KeyError(f"Unknown FalconFS layer layout for {layer_name!r}")
+        block_ids = list(int(x) for x in gpu_spec.block_ids.tolist())
+        expected = len(falcon_spec.keys) * self.block_size_factor
+        if len(block_ids) != expected:
+            raise ValueError(f"Expected {expected} GPU block ids for {len(falcon_spec.keys)} FalconFS blocks, got {len(block_ids)}")
+        bytes_per_gpu_block = self._payload_bytes_per_gpu_block()
+        block_pos = 0
+        for key in falcon_spec.keys:
+            payload = memoryview(payloads[key])
+            for factor_idx in range(self.block_size_factor):
+                block_id = block_ids[block_pos]
+                block_pos += 1
+                base = factor_idx * bytes_per_gpu_block
+                for span in layout[layer_name]:
+                    tensor = self.kv_caches.tensors[span.tensor_idx].tensor
+                    self._copy_payload_view_to_tensor(
+                        payload,
+                        base + span.payload_offset,
+                        tensor,
+                        block_id,
+                        span.nbytes,
+                        tensor_offset=span.tensor_offset,
+                    )
+
+    def _record_failed_load_spec(self, transfer_spec: TransferSpec) -> None:
+        if self.gpu_to_falconfs:
+            return
+        try:
+            _, dst = transfer_spec
+            if isinstance(dst, GPULoadStoreSpec):
+                with self._lock:
+                    self._failed_load_block_ids.update(int(x) for x in dst.block_ids.tolist())
+        except Exception:
+            return
+
+    def _read_payloads_for_layer_job(
+        self, state: _LayerLoadJob
+    ) -> dict[OffloadKey, bytes | memoryview]:
+        with state.lock:
+            if state.payloads is not None:
+                return state.payloads
+            future = state.payload_future
+        if future is None:
+            start = time.perf_counter()
+            src, _ = state.transfer_spec
+            assert isinstance(src, FalconFSLoadStoreSpec)
+            payloads = self.adapter.read_prepared_payloads(src)
+            self._bump_ms("payload_fetch_ms", start)
+        else:
+            start = time.perf_counter()
+            payloads = future.result()
+            self._bump_ms("payload_fetch_ms", start)
+        payload_size = sum(len(memoryview(v)) for v in payloads.values())
+        with state.lock:
+            if state.payloads is None:
+                state.payloads = payloads
+                state.payload_size = payload_size
+                self._bump("payload_cache_bytes", payload_size)
+            return state.payloads
+
+    def _copy_layer_for_state(self, state: _LayerLoadJob, layer_name: str) -> None:
+        with state.lock:
+            if state.failed or layer_name in state.copied_layers:
+                return
+        start = time.perf_counter()
+        src, dst = state.transfer_spec
+        assert isinstance(src, FalconFSLoadStoreSpec)
+        assert isinstance(dst, GPULoadStoreSpec)
+        payloads = self._read_payloads_for_layer_job(state)
+        if len(payloads) != len(src.keys):
+            raise RuntimeError("FalconFS layer-wise load did not return all requested payloads")
+        self._copy_layer_payloads_to_gpu(src, dst, payloads, layer_name)
+        self._bump_ms("layer_copy_ms", start)
+        with state.lock:
+            state.copied_layers.add(layer_name)
+
+    def _finalize_layer_job_if_ready(self, state: _LayerLoadJob) -> TransferResult | None:
+        with state.lock:
+            futures = list(state.copy_futures.values())
+        for future in futures:
+            if future.done():
+                try:
+                    exc = future.exception()
+                except BaseException as err:  # cancelled futures report failure here.
+                    exc = err
+                if exc is not None:
+                    self._mark_layer_job_failed(state, exc)
+                    break
+        with state.lock:
+            if state.completed_result is not None:
+                return state.completed_result
+            if state.failed:
+                state.completed_result = TransferResult(
+                    job_id=state.job_id,
+                    success=False,
+                    transfer_type=self.transfer_type,
+                )
+                return state.completed_result
+            for future in state.copy_futures.values():
+                if not future.done():
+                    return None
+            if set(state.layer_names) - state.copied_layers:
+                return None
+            state.completed_result = TransferResult(
+                job_id=state.job_id,
+                success=True,
+                transfer_size=int(state.payload_size),
+                transfer_time=time.perf_counter() - state.start_time,
+                transfer_type=self.transfer_type,
+            )
+            return state.completed_result
+
+    def _mark_layer_job_failed(self, state: _LayerLoadJob, exc: BaseException | None = None) -> None:
+        del exc
+        with state.lock:
+            state.failed = True
+        self._bump("load_failures")
+        self._bump("transfer_failures")
+        self._record_failed_load_spec(state.transfer_spec)
+
+    def _schedule_layer_prefetch_locked(self, state: _LayerLoadJob, through_layer: str | None = None) -> None:
+        if not bool(getattr(self.adapter, "async_load_enabled", True)):
+            return
+        depth = max(1, int(getattr(self.adapter, "layer_prefetch_depth", 2)))
+        target_idx = 0
+        if through_layer in state.layer_names:
+            target_idx = state.layer_names.index(through_layer) + 1
+        scheduled = len(state.copy_futures)
+        limit = min(len(state.layer_names), max(scheduled, target_idx) + depth)
+        for idx in range(scheduled, limit):
+            layer_name = state.layer_names[idx]
+            if layer_name not in state.copy_futures:
+                state.copy_futures[layer_name] = self.executor.submit(
+                    self._copy_layer_for_state, state, layer_name
+                )
+
+    def _start_layerwise_load(self, job_id: int, transfer_spec: TransferSpec) -> bool:
+        layout = self._get_layer_layout()
+        if layout is None:
+            self._bump("layerwise_fallbacks")
+            self._bump("fallback_invalid_layout")
+            return False
+        state = _LayerLoadJob(
+            job_id=job_id,
+            transfer_spec=transfer_spec,
+            layer_names=list(layout.keys()),
+            start_time=time.perf_counter(),
+        )
+        if bool(getattr(self.adapter, "async_load_enabled", True)):
+            src, _ = transfer_spec
+            assert isinstance(src, FalconFSLoadStoreSpec)
+            state.payload_future = self.executor.submit(self.adapter.read_prepared_payloads, src)
+            self._bump("layerwise_async_jobs")
+        with self._lock:
+            if job_id in self._layer_jobs or job_id in self._futures:
+                return False
+            if state.payload_future is not None:
+                self._schedule_layer_prefetch_locked(state)
+            self._layer_jobs[job_id] = state
+        self._bump("layerwise_loads")
+        return True
+
     def _run_transfer(self, job_id: int, transfer_spec: TransferSpec) -> TransferResult:
         start = time.perf_counter()
         acquired: list[torch.Tensor] = []
@@ -929,6 +1260,7 @@ class _FalconFSTransferHandler(OffloadingHandler):
             else:
                 assert isinstance(src, FalconFSLoadStoreSpec)
                 assert isinstance(dst, GPULoadStoreSpec)
+                self._bump("whole_block_loads")
                 payloads = self.adapter.read_prepared_payloads(src)
                 self._payloads_to_gpu(src, dst, payloads)
                 success = len(payloads) == len(src.keys)
@@ -938,13 +1270,7 @@ class _FalconFSTransferHandler(OffloadingHandler):
         except Exception:
             self._bump("transfer_failures")
             if not self.gpu_to_falconfs:
-                try:
-                    _, dst = transfer_spec
-                    if isinstance(dst, GPULoadStoreSpec):
-                        with self._lock:
-                            self._failed_load_block_ids.update(int(x) for x in dst.block_ids.tolist())
-                except Exception:
-                    pass
+                self._record_failed_load_spec(transfer_spec)
                 if getattr(self.adapter, "load_failure_policy", "recompute") == "fail":
                     raise
             return TransferResult(job_id=job_id, success=False, transfer_type=self.transfer_type)
@@ -960,8 +1286,19 @@ class _FalconFSTransferHandler(OffloadingHandler):
         )
 
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
+        if not self.gpu_to_falconfs and bool(getattr(self.adapter, "layerwise_load_enabled", False)):
+            if self._start_layerwise_load(job_id, spec):
+                return True
+        if not self.gpu_to_falconfs and not bool(getattr(self.adapter, "async_load_enabled", True)):
+            with self._lock:
+                if job_id in self._futures or job_id in self._layer_jobs:
+                    return False
+            result = self._run_transfer(job_id, spec)
+            with self._lock:
+                self._completed_results.append(result)
+            return True
         with self._lock:
-            if job_id in self._futures:
+            if job_id in self._futures or job_id in self._layer_jobs:
                 return False
             self._futures[job_id] = self.executor.submit(self._run_transfer, job_id, spec)
         return True
@@ -969,10 +1306,17 @@ class _FalconFSTransferHandler(OffloadingHandler):
     def get_finished(self) -> list[TransferResult]:
         finished: list[TransferResult] = []
         with self._lock:
+            finished.extend(self._completed_results)
+            self._completed_results.clear()
             for job_id, fut in list(self._futures.items()):
                 if fut.done():
                     finished.append(fut.result())
                     del self._futures[job_id]
+            for job_id, state in list(self._layer_jobs.items()):
+                result = self._finalize_layer_job_if_ready(state)
+                if result is not None:
+                    finished.append(result)
+                    del self._layer_jobs[job_id]
         return finished
 
     def take_failed_load_block_ids(self) -> set[int]:
@@ -986,6 +1330,43 @@ class _FalconFSTransferHandler(OffloadingHandler):
             fut = self._futures.get(job_id)
             if fut is not None:
                 fut.result()
+            state = self._layer_jobs.get(job_id)
+            if state is not None:
+                for layer_name in state.layer_names:
+                    self.wait_for_layer_load(layer_name)
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        if self.gpu_to_falconfs:
+            return
+        wait_start = time.perf_counter()
+        states: list[_LayerLoadJob]
+        with self._lock:
+            states = list(self._layer_jobs.values())
+        for state in states:
+            if layer_name not in state.layer_names:
+                self._bump("fallback_unknown_layer")
+                continue
+            with state.lock:
+                future = state.copy_futures.get(layer_name)
+                if future is None:
+                    if bool(getattr(self.adapter, "async_load_enabled", True)):
+                        future = self.executor.submit(self._copy_layer_for_state, state, layer_name)
+                        state.copy_futures[layer_name] = future
+                    else:
+                        self._bump("layerwise_sync_waits")
+            try:
+                if future is None:
+                    self._copy_layer_for_state(state, layer_name)
+                else:
+                    future.result()
+            except Exception as exc:
+                self._mark_layer_job_failed(state, exc)
+                if getattr(self.adapter, "load_failure_policy", "recompute") == "fail":
+                    raise
+            with state.lock:
+                self._schedule_layer_prefetch_locked(state, through_layer=layer_name)
+            self._finalize_layer_job_if_ready(state)
+        self._bump_ms("layer_wait_ms", wait_start)
 
     def shutdown(self) -> None:
         self.executor.shutdown(wait=False, cancel_futures=True)
@@ -995,6 +1376,19 @@ class FalconFSConnectorWorker(OffloadingConnectorWorker):
     def __init__(self, spec: OffloadingSpec):
         super().__init__(spec)
         self._failed_load_block_ids: set[int] = set()
+
+    def handle_preemptions(self, kv_connector_metadata):
+        super().handle_preemptions(kv_connector_metadata)
+        for req_id in kv_connector_metadata.reqs_to_flush or ():
+            job_id = self._load_job.get(req_id)
+            if job_id is not None:
+                self.worker.wait({job_id})
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        for handler in self.worker.handlers:
+            method = getattr(handler, "wait_for_layer_load", None)
+            if callable(method):
+                method(layer_name)
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         finished_sending = set()
@@ -1136,8 +1530,8 @@ class FalconFSConnector(KVConnectorBase_V1):
         self.connector_worker.start_kv_transfers(self._get_connector_metadata())  # type: ignore[arg-type]
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        del layer_name
-        return None
+        assert self.connector_worker is not None
+        self.connector_worker.wait_for_layer_load(layer_name)
 
     def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: AttentionMetadata, **kwargs: Any) -> None:
         del layer_name, kv_layer, attn_metadata, kwargs
