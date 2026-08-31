@@ -25,7 +25,7 @@
 #include "metadb/meta_process_info.h"
 #include "metadb/meta_serialize_interface_helper.h"
 #include "metadb/shard_table.h"
-#include "perf_counter/perf_macros.h"
+#include "perf_counter/falcon_per_request_stat.h"
 #include "utils/path_parse.h"
 #include "utils/utils_standalone.h"
 
@@ -66,11 +66,159 @@ static bool InsertIntoInodeTable(Relation relation,
         return;                               \
     }
 
+/*
+ * Single clock_gettime, same timestamp to all requests.
+ * Batch-level ops: broadcast gaps show min == max in aggregated output.
+ */
+static void
+StatBroadcastArray(MetaProcessInfo *infoArray, int count, int checkpointIdx)
+{
+    if (count <= 0 || g_FalconPerRequestStatShmem == NULL ||
+        !g_FalconPerRequestStatShmem->enabled ||
+        checkpointIdx < 0 || checkpointIdx >= STAT_MAX_CHECKPOINTS)
+        return;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+
+    for (int i = 0; i < count; i++) {
+        int32_t si = infoArray[i]->statArrayIndex;
+        if (si < 0 || si >= STAT_ARRAY_SIZE)
+            continue;
+        RequestStat *rs = &g_FalconPerRequestStatShmem->statArray[si];
+        rs->timestamps[checkpointIdx] = now;
+        if (checkpointIdx >= rs->checkpointCount)
+            rs->checkpointCount = checkpointIdx + 1;
+    }
+}
+
+static void
+StatBroadcastList(List *list, int checkpointIdx)
+{
+    int count = list_length(list);
+    if (count <= 0 || g_FalconPerRequestStatShmem == NULL ||
+        !g_FalconPerRequestStatShmem->enabled ||
+        checkpointIdx < 0 || checkpointIdx >= STAT_MAX_CHECKPOINTS)
+        return;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+
+    for (int i = 0; i < count; i++) {
+        MetaProcessInfo info = (MetaProcessInfo)list_nth(list, i);
+        int32_t si = info->statArrayIndex;
+        if (si < 0 || si >= STAT_ARRAY_SIZE)
+            continue;
+        RequestStat *rs = &g_FalconPerRequestStatShmem->statArray[si];
+        rs->timestamps[checkpointIdx] = now;
+        if (checkpointIdx >= rs->checkpointCount)
+            rs->checkpointCount = checkpointIdx + 1;
+    }
+}
+
+static void
+StatBroadcastSliceList(List *list, int checkpointIdx)
+{
+    int count = list_length(list);
+    if (count <= 0 || g_FalconPerRequestStatShmem == NULL ||
+        !g_FalconPerRequestStatShmem->enabled ||
+        checkpointIdx < 0 || checkpointIdx >= STAT_MAX_CHECKPOINTS)
+        return;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+
+    for (int i = 0; i < count; i++) {
+        SliceProcessInfo info = (SliceProcessInfo)list_nth(list, i);
+        int32_t si = info->statArrayIndex;
+        if (si < 0 || si >= STAT_ARRAY_SIZE)
+            continue;
+        RequestStat *rs = &g_FalconPerRequestStatShmem->statArray[si];
+        rs->timestamps[checkpointIdx] = now;
+        if (checkpointIdx >= rs->checkpointCount)
+            rs->checkpointCount = checkpointIdx + 1;
+    }
+}
+
+static void
+StatBroadcastSliceArray(SliceProcessInfo *infoArray, int count, int checkpointIdx)
+{
+    if (count <= 0 || g_FalconPerRequestStatShmem == NULL ||
+        !g_FalconPerRequestStatShmem->enabled ||
+        checkpointIdx < 0 || checkpointIdx >= STAT_MAX_CHECKPOINTS)
+        return;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+
+    for (int i = 0; i < count; i++) {
+        int32_t si = infoArray[i]->statArrayIndex;
+        if (si < 0 || si >= STAT_ARRAY_SIZE)
+            continue;
+        RequestStat *rs = &g_FalconPerRequestStatShmem->statArray[si];
+        rs->timestamps[checkpointIdx] = now;
+        if (checkpointIdx >= rs->checkpointCount)
+            rs->checkpointCount = checkpointIdx + 1;
+    }
+}
+
+static void
+StatBroadcastKvArray(KvMetaProcessInfo *infoArray, int count, int checkpointIdx)
+{
+    if (count <= 0 || g_FalconPerRequestStatShmem == NULL ||
+        !g_FalconPerRequestStatShmem->enabled ||
+        checkpointIdx < 0 || checkpointIdx >= STAT_MAX_CHECKPOINTS)
+        return;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+
+    for (int i = 0; i < count; i++) {
+        int32_t si = infoArray[i]->statArrayIndex;
+        if (si < 0 || si >= STAT_ARRAY_SIZE)
+            continue;
+        RequestStat *rs = &g_FalconPerRequestStatShmem->statArray[si];
+        rs->timestamps[checkpointIdx] = now;
+        if (checkpointIdx >= rs->checkpointCount)
+            rs->checkpointCount = checkpointIdx + 1;
+    }
+}
+
+static void
+StatBroadcastKvList(List *list, int checkpointIdx)
+{
+    int count = list_length(list);
+    if (count <= 0 || g_FalconPerRequestStatShmem == NULL ||
+        !g_FalconPerRequestStatShmem->enabled ||
+        checkpointIdx < 0 || checkpointIdx >= STAT_MAX_CHECKPOINTS)
+        return;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+
+    for (int i = 0; i < count; i++) {
+        KvMetaProcessInfo info = (KvMetaProcessInfo)list_nth(list, i);
+        int32_t si = info->statArrayIndex;
+        if (si < 0 || si >= STAT_ARRAY_SIZE)
+            continue;
+        RequestStat *rs = &g_FalconPerRequestStatShmem->statArray[si];
+        rs->timestamps[checkpointIdx] = now;
+        if (checkpointIdx >= rs->checkpointCount)
+            rs->checkpointCount = checkpointIdx + 1;
+    }
+}
+
 void FalconMkdirHandle(MetaProcessInfo *infoArray, int count)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
-    OpcodeLatencyBreakdown *op = perf ? &perf->mkdirOp : NULL;
-    PERF_SCOPED_TIMER(mkdir_timer, op ? &op->total : NULL);
+
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START);
 
     if (GetLocalServerId() != FALCON_CN_SERVER_ID)
         FALCON_ELOG_ERROR(WRONG_WORKER, "mkdir can only be called on CN.");
@@ -82,30 +230,30 @@ void FalconMkdirHandle(MetaProcessInfo *infoArray, int count)
         info->errorMsg = NULL;
 
         int32_t property;
-        PERF_LATENCY_BEGIN(path_verify, op ? &op->pathVerify : NULL);
         FalconErrorCode errorCode =
             VerifyPathValidity(info->path, VERIFY_PATH_VALIDITY_REQUIREMENT_MUST_BE_DIRECTORY, &property);
-        PERF_LATENCY_END(path_verify);
         CHECK_ERROR_CODE_WITH_CONTINUE(errorCode);
     }
     pg_qsort(infoArray, count, sizeof(MetaProcessInfo), pg_qsort_meta_process_info_by_path_cmp);
 
     RegisterLocalProcessFlag(false);
 
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 1);
+
     int32_t *validInputIndexArray = palloc(sizeof(int32_t) * count);
     int validInputIndexArraySize = 0;
-    PERF_LATENCY_BEGIN(table_open, op ? &op->tableOpen : NULL);
     Relation directoryRel = table_open(DirectoryRelationId(), RowExclusiveLock);
-    PERF_LATENCY_END(table_open);
-    PERF_LATENCY_BEGIN(index_open, op ? &op->indexOpen : NULL);
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 2);
     CatalogIndexState indexState = CatalogOpenIndexes(directoryRel);
-    PERF_LATENCY_END(index_open);
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 3);
     for (int i = 0; i < count; ++i) {
         MetaProcessInfo info = infoArray[i];
         if (info->errorCode != SUCCESS)
             continue;
 
-        PERF_LATENCY_BEGIN(path_parse, op ? &op->pathParse : NULL);
         FalconErrorCode errorCode =
             PathParseTreeInsert(NULL,
                                 directoryRel,
@@ -115,9 +263,8 @@ void FalconMkdirHandle(MetaProcessInfo *infoArray, int count)
                                 &info->parentId,
                                 &info->name,
                                 &info->inodeId);
-        PERF_LATENCY_END(path_parse);
         CHECK_ERROR_CODE_WITH_CONTINUE(errorCode);
-        PERF_LATENCY_BEGIN(mkdir_insert, op ? &op->tableModify : NULL);
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 4);
         InsertDirectoryByDirectoryHashTable(directoryRel,
                                             indexState,
                                             info->parentId,
@@ -125,18 +272,20 @@ void FalconMkdirHandle(MetaProcessInfo *infoArray, int count)
                                             info->inodeId,
                                             DEFAULT_SUBPART_NUM,
                                             DIR_LOCK_NONE);
-        PERF_LATENCY_END(mkdir_insert);
         validInputIndexArray[validInputIndexArraySize] = i;
         ++validInputIndexArraySize;
     }
-    PERF_LATENCY_BEGIN(index_close, op ? &op->indexClose : NULL);
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 5);
     CatalogCloseIndexes(indexState);
-    PERF_LATENCY_END(index_close);
-    PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 6);
     table_close(directoryRel, RowExclusiveLock);
-    PERF_LATENCY_END(table_close);
-    if (validInputIndexArraySize == 0)
+    if (validInputIndexArraySize == 0) {
+        for (int _si = 0; _si < count; ++_si)
+            STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 7);
         return;
+    }
 
     // 2.
     SerializedData subMkdirParam;
@@ -210,9 +359,7 @@ void FalconMkdirHandle(MetaProcessInfo *infoArray, int count)
     }
 
     // 4.
-    PERF_LATENCY_BEGIN(remote_call, op ? &op->remoteCall : NULL);
     MultipleServerRemoteCommandResult totalRemoteRes = FalconSendCommandAndWaitForResult();
-    PERF_LATENCY_END(remote_call);
 
     MetaProcessInfoData *resArray = palloc(sizeof(MetaProcessInfoData) * validInputIndexArraySize);
     for (int i = 0; i < list_length(totalRemoteRes); ++i) {
@@ -272,26 +419,27 @@ void FalconMkdirHandle(MetaProcessInfo *infoArray, int count)
                                   "MkdirSubCreate is supposed to be successful, "
                                   "but it failed.");
     }
+
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 7);
 }
 
 void FalconMkdirSubMkdirHandle(MetaProcessInfo *infoArray, int count)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
-    OpcodeLatencyBreakdown *op = perf ? &perf->mkdirOp : NULL;
 
-    PERF_LATENCY_BEGIN(table_open, op ? &op->tableOpen : NULL);
+    StatBroadcastArray(infoArray, count, CKPT_HANDLER_START);
+
+    StatBroadcastArray(infoArray, count, CKPT_HANDLER_START + 1);
     Relation directoryRel = table_open(DirectoryRelationId(), RowExclusiveLock);
-    PERF_LATENCY_END(table_open);
-    PERF_LATENCY_BEGIN(index_open, op ? &op->indexOpen : NULL);
     CatalogIndexState indexState = CatalogOpenIndexes(directoryRel);
-    PERF_LATENCY_END(index_open);
+    StatBroadcastArray(infoArray, count, CKPT_HANDLER_START + 2);
     for (int i = 0; i < count; ++i) {
         MetaProcessInfo info = infoArray[i];
 
         //
         if (info->parentId == -1 || info->name == NULL)
             FALCON_ELOG_ERROR(ARGUMENT_ERROR, "FalconMkdirSubMkdir has received invalid input.");
-        PERF_LATENCY_BEGIN(table_modify, op ? &op->tableModify : NULL);
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 3);
         InsertDirectoryByDirectoryHashTable(directoryRel,
                                             indexState,
                                             info->parentId,
@@ -299,22 +447,25 @@ void FalconMkdirSubMkdirHandle(MetaProcessInfo *infoArray, int count)
                                             info->inodeId,
                                             DEFAULT_SUBPART_NUM,
                                             DIR_LOCK_EXCLUSIVE);
-        PERF_LATENCY_END(table_modify);
 
         info->errorCode = SUCCESS;
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 4);
     }
-    PERF_LATENCY_BEGIN(index_close, op ? &op->indexClose : NULL);
     CatalogCloseIndexes(indexState);
-    PERF_LATENCY_END(index_close);
-    PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
+    StatBroadcastArray(infoArray, count, CKPT_HANDLER_START + 5);
     table_close(directoryRel, RowExclusiveLock);
-    PERF_LATENCY_END(table_close);
+
+    StatBroadcastArray(infoArray, count, CKPT_HANDLER_START + 6);
 }
 
 void FalconMkdirSubCreateHandle(MetaProcessInfo *infoArray, int count)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
-    OpcodeLatencyBreakdown *op = perf ? &perf->mkdirOp : NULL;
+
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START);
+
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 1);
 
     HASHCTL info;
     memset(&info, 0, sizeof(info));
@@ -349,13 +500,18 @@ void FalconMkdirSubCreateHandle(MetaProcessInfo *infoArray, int count)
     HASH_SEQ_STATUS status;
     hash_seq_init(&status, batchMetaProcessInfoListPerShard);
     while ((entry = hash_seq_search(&status)) != 0) {
-        PERF_LATENCY_BEGIN(table_open, op ? &op->tableOpen : NULL);
+        for (int i = 0; i < list_length(entry->info); ++i) {
+            MetaProcessInfo info = list_nth(entry->info, i);
+            STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 2);
+        }
         Relation workerInodeRel =
             table_open(GetRelationOidByName_FALCON(GetInodeShardName(entry->shardId)->data), RowExclusiveLock);
-        PERF_LATENCY_END(table_open);
-        PERF_LATENCY_BEGIN(index_open, op ? &op->indexOpen : NULL);
         CatalogIndexState indexState = CatalogOpenIndexes(workerInodeRel);
-        PERF_LATENCY_END(index_open);
+
+        for (int i = 0; i < list_length(entry->info); ++i) {
+            MetaProcessInfo info = list_nth(entry->info, i);
+            STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 3);
+        }
 
         for (int i = 0; i < list_length(entry->info); ++i) {
             MetaProcessInfo info = list_nth(entry->info, i);
@@ -386,20 +542,22 @@ void FalconMkdirSubCreateHandle(MetaProcessInfo *infoArray, int count)
             info->errorCode = SUCCESS;
         }
 
-        PERF_LATENCY_BEGIN(index_close, op ? &op->indexClose : NULL);
+        for (int i = 0; i < list_length(entry->info); ++i) {
+            MetaProcessInfo info = list_nth(entry->info, i);
+            STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 4);
+        }
         CatalogCloseIndexes(indexState);
-        PERF_LATENCY_END(index_close);
-        PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
         table_close(workerInodeRel, RowExclusiveLock);
-        PERF_LATENCY_END(table_close);
     }
+
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 5);
 }
 
 void FalconCreateHandle(MetaProcessInfo *infoArray, int count, bool updateExisted)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
-    OpcodeLatencyBreakdown *op = perf ? &perf->createOp : NULL;
-    PERF_SCOPED_TIMER(create_timer, op ? &op->total : NULL);
+
+    StatBroadcastArray(infoArray, count, CKPT_HANDLER_START);
 
     for (int i = 0; i < count; ++i) {
         MetaProcessInfo info = infoArray[i];
@@ -409,12 +567,11 @@ void FalconCreateHandle(MetaProcessInfo *infoArray, int count, bool updateExiste
 
         int32_t property;
         //
-        PERF_LATENCY_BEGIN(path_verify, op ? &op->pathVerify : NULL);
         FalconErrorCode errorCode =
             VerifyPathValidity(info->path, VERIFY_PATH_VALIDITY_REQUIREMENT_MUST_BE_FILE, &property);
-        PERF_LATENCY_END(path_verify);
         CHECK_ERROR_CODE_WITH_CONTINUE(errorCode);
     }
+    StatBroadcastArray(infoArray, count, CKPT_HANDLER_START + 1);
     pg_qsort(infoArray, count, sizeof(MetaProcessInfo), pg_qsort_meta_process_info_by_path_cmp);
 
     HASHCTL info;
@@ -426,15 +583,13 @@ void FalconCreateHandle(MetaProcessInfo *infoArray, int count, bool updateExiste
     HTAB *batchMetaProcessInfoListPerShard =
         hash_create("Batch Meta Process Info List Per Shard Hash Table", GetShardTableSize(), &info, hashFlags);
     ShardHashInfo *entry;
-    PERF_LATENCY_BEGIN(table_open, op ? &op->tableOpen : NULL);
+    StatBroadcastArray(infoArray, count, CKPT_HANDLER_START + 2);
     Relation directoryRel = table_open(DirectoryRelationId(), AccessShareLock);
-    PERF_LATENCY_END(table_open);
     for (int i = 0; i < count; ++i) {
         MetaProcessInfo info = infoArray[i];
         if (info->errorCode != SUCCESS)
             continue;
 
-        PERF_LATENCY_BEGIN(path_parse, op ? &op->pathParse : NULL);
         FalconErrorCode errorCode = PathParseTreeInsert(NULL,
                                                         directoryRel,
                                                         info->path,
@@ -442,7 +597,6 @@ void FalconCreateHandle(MetaProcessInfo *infoArray, int count, bool updateExiste
                                                         &info->parentId,
                                                         &info->name,
                                                         &info->inodeId);
-        PERF_LATENCY_END(path_parse);
         CHECK_ERROR_CODE_WITH_CONTINUE(errorCode);
 
         uint16_t partId = HashPartId(info->name);
@@ -452,7 +606,7 @@ void FalconCreateHandle(MetaProcessInfo *infoArray, int count, bool updateExiste
         info->st_atim = info->st_mtim;
         info->st_ctim = info->st_mtim;
         info->st_size = 0;
-        info->node_id = GetLocalServerId();
+        info->node_id = -1;
         info->st_nlink = 1;
         info->etag = (char *)"";
         info->st_dev = 0;
@@ -475,9 +629,9 @@ void FalconCreateHandle(MetaProcessInfo *infoArray, int count, bool updateExiste
         }
         entry->info = lappend(entry->info, info);
     }
-    PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
+    StatBroadcastArray(infoArray, count, CKPT_HANDLER_START + 3);
     table_close(directoryRel, AccessShareLock);
-    PERF_LATENCY_END(table_close);
+    StatBroadcastArray(infoArray, count, CKPT_HANDLER_START + 4);
 
     HASH_SEQ_STATUS status;
     hash_seq_init(&status, batchMetaProcessInfoListPerShard);
@@ -495,23 +649,20 @@ void FalconCreateHandle(MetaProcessInfo *infoArray, int count, bool updateExiste
             toHandleMetaProcessList = lappend(toHandleMetaProcessList, info);
         }
 
-        MetaProcessInfo info = NULL;
+        volatile MetaProcessInfo info = NULL;
         while (list_length(toHandleMetaProcessList) != 0) {
             BeginInternalSubTransaction(NULL);
-            PERF_LATENCY_BEGIN(table_open, op ? &op->tableOpen : NULL);
+            StatBroadcastList(toHandleMetaProcessList, CKPT_HANDLER_START + 5);
             Relation workerInodeRel = table_open(GetRelationOidByName_FALCON(inodeShardName->data), RowExclusiveLock);
-            PERF_LATENCY_END(table_open);
-            PERF_LATENCY_BEGIN(index_open, op ? &op->indexOpen : NULL);
             CatalogIndexState indexState = CatalogOpenIndexes(workerInodeRel);
-            PERF_LATENCY_END(index_open);
+            StatBroadcastList(toHandleMetaProcessList, CKPT_HANDLER_START + 6);
             PG_TRY();
             {
                 int currentGroupHandled = BATCH_OPERATION_GROUP_SIZE;
                 int toHandleMetaProcessIndex = list_length(toHandleMetaProcessList) - 1;
                 while (currentGroupHandled > 0 && toHandleMetaProcessIndex >= 0) {
                     // force the info writen to memory
-                    *(volatile MetaProcessInfo *)(&info) = list_nth(toHandleMetaProcessList, toHandleMetaProcessIndex);
-                    // info = list_nth(toHandleMetaProcessList, toHandleMetaProcessIndex);
+                    info = list_nth(toHandleMetaProcessList, toHandleMetaProcessIndex);
                     --toHandleMetaProcessIndex;
                     if (info->errorCode != SUCCESS) {
                         if (info->errorCode == FILE_EXISTS) {
@@ -538,12 +689,13 @@ void FalconCreateHandle(MetaProcessInfo *infoArray, int count, bool updateExiste
                                                           NULL,
                                                           &info->node_id,
                                                           NULL,
+                                                          NULL,
                                                           NULL);
                         }
                         continue;
                     }
 
-                    PERF_LATENCY_BEGIN(create_insert, op ? &op->tableModify : NULL);
+                    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 7);
                     InsertIntoInodeTable(workerInodeRel,
                                          indexState,
                                          info->inodeId,
@@ -565,18 +717,13 @@ void FalconCreateHandle(MetaProcessInfo *infoArray, int count, bool updateExiste
                                          0,
                                          info->node_id,
                                          -1);
-                    PERF_LATENCY_END(create_insert);
+                    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 8);
                     --currentGroupHandled;
                 }
-                PERF_LATENCY_BEGIN(index_close, op ? &op->indexClose : NULL);
+                StatBroadcastList(toHandleMetaProcessList, CKPT_HANDLER_START + 9);
                 CatalogCloseIndexes(indexState);
-                PERF_LATENCY_END(index_close);
-                PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
                 table_close(workerInodeRel, RowExclusiveLock);
-                PERF_LATENCY_END(table_close);
-                PERF_LATENCY_BEGIN(commit, op ? &op->commit : NULL);
                 ReleaseCurrentSubTransaction();
-                PERF_LATENCY_END(commit);
 
                 toHandleMetaProcessList->length = toHandleMetaProcessIndex + 1;
             }
@@ -610,6 +757,7 @@ void FalconCreateHandle(MetaProcessInfo *infoArray, int count, bool updateExiste
                                                   &info->st_mtim,
                                                   NULL,
                                                   NULL,
+                                                  NULL,
                                                   NULL);
                 } else {
                     info->errorCode = FILE_EXISTS;
@@ -618,13 +766,15 @@ void FalconCreateHandle(MetaProcessInfo *infoArray, int count, bool updateExiste
             PG_END_TRY();
         }
     }
+
+    StatBroadcastArray(infoArray, count, CKPT_HANDLER_START + 10);
 }
 
 void FalconStatHandle(MetaProcessInfo *infoArray, int count)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
-    OpcodeLatencyBreakdown *op = perf ? &perf->statOp : NULL;
-    PERF_SCOPED_TIMER(stat_timer, op ? &op->total : NULL);
+
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START);
 
     for (int i = 0; i < count; ++i) {
         MetaProcessInfo info = infoArray[i];
@@ -632,11 +782,11 @@ void FalconStatHandle(MetaProcessInfo *infoArray, int count)
         info->errorMsg = NULL;
         
         int32_t property;
-        PERF_LATENCY_BEGIN(path_verify, op ? &op->pathVerify : NULL);
         FalconErrorCode errorCode = VerifyPathValidity(info->path, 0, &property);
-        PERF_LATENCY_END(path_verify);
         CHECK_ERROR_CODE_WITH_CONTINUE(errorCode);
     }
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 1);
     pg_qsort(infoArray, count, sizeof(MetaProcessInfo), pg_qsort_meta_process_info_by_path_cmp);
 
     SetUpScanCaches();
@@ -650,18 +800,16 @@ void FalconStatHandle(MetaProcessInfo *infoArray, int count)
     HTAB *batchMetaProcessInfoListPerShard =
         hash_create("Batch Meta Process Info List Per Shard Hash Table", GetShardTableSize(), &info, hashFlags);
     ShardHashInfo *entry;
-    PERF_LATENCY_BEGIN(table_open, op ? &op->tableOpen : NULL);
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 2);
     Relation directoryRel = table_open(DirectoryRelationId(), AccessShareLock);
-    PERF_LATENCY_END(table_open);
     for (int i = 0; i < count; ++i) {
         MetaProcessInfo info = infoArray[i];
         if (info->errorCode != SUCCESS)
             continue;
 
-        PERF_LATENCY_BEGIN(path_parse, op ? &op->pathParse : NULL);
         FalconErrorCode errorCode =
             PathParseTreeInsert(NULL, directoryRel, info->path, 0, &(info->parentId), &(info->name), NULL);
-        PERF_LATENCY_END(path_parse);
         CHECK_ERROR_CODE_WITH_CONTINUE(errorCode);
 
         uint16_t partId = HashPartId(info->name);
@@ -679,28 +827,25 @@ void FalconStatHandle(MetaProcessInfo *infoArray, int count)
         }
         entry->info = lappend(entry->info, info);
     }
-    PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 3);
     table_close(directoryRel, AccessShareLock);
-    PERF_LATENCY_END(table_close);
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 4);
 
     HASH_SEQ_STATUS status;
     hash_seq_init(&status, batchMetaProcessInfoListPerShard);
     while ((entry = hash_seq_search(&status)) != 0) {
         StringInfo inodeShardName = GetInodeShardName(entry->shardId);
         StringInfo inodeIndexShardName = GetInodeIndexShardName(entry->shardId);
-        PERF_LATENCY_BEGIN(stat_inode_table_open, op ? &op->tableOpen : NULL);
         Relation workerInodeRel = table_open(GetRelationOidByName_FALCON(inodeShardName->data), AccessShareLock);
         Oid workerInodeIndexOid = GetRelationOidByName_FALCON(inodeIndexShardName->data);
-        PERF_LATENCY_END(stat_inode_table_open);
 
         for (int i = 0; i < list_length(entry->info); ++i) {
             MetaProcessInfo info = list_nth(entry->info, i);
 
-            elog(LOG, "[DEBUG] FalconStatHandle query: shardId=%d, parentId_partId=%lu, name=%s, name_len=%zu",
-                 entry->shardId, info->parentId_partId, info->name, strlen(info->name));
-
             /* Time the index scan for this item */
-            PERF_LATENCY_BEGIN(scan, op ? &op->indexScan : NULL);
+            STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 5);
 
             ScanKeyData scanKey[2];
             int scanKeyCount = 2;
@@ -722,7 +867,6 @@ void FalconStatHandle(MetaProcessInfo *infoArray, int count)
             TupleDesc tupleDesc = RelationGetDescr(workerInodeRel);
             if (!HeapTupleIsValid(heapTuple)) {
                 info->errorCode = FILE_NOT_EXISTS;
-                elog(LOG, "[DEBUG] FalconStatHandle result: NOT FOUND for name=%s", info->name);
             } else {
                 Datum datumArray[Natts_pg_dfs_inode_table];
                 bool isNullArray[Natts_pg_dfs_inode_table];
@@ -746,21 +890,21 @@ void FalconStatHandle(MetaProcessInfo *infoArray, int count)
                 }
             }
             systable_endscan(scanDescriptor);
+            STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 6);
 
-            PERF_LATENCY_END(scan);
         }
 
-        PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
         table_close(workerInodeRel, AccessShareLock);
-        PERF_LATENCY_END(table_close);
     }
+
+    StatBroadcastArray(infoArray, count, CKPT_HANDLER_START + 7);
 }
 
 void FalconOpenHandle(MetaProcessInfo *infoArray, int count)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
-    OpcodeLatencyBreakdown *op = perf ? &perf->openOp : NULL;
-    PERF_SCOPED_TIMER(open_timer, op ? &op->total : NULL);
+
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START);
 
     for (int i = 0; i < count; ++i) {
         MetaProcessInfo info = infoArray[i];
@@ -768,11 +912,11 @@ void FalconOpenHandle(MetaProcessInfo *infoArray, int count)
         info->errorMsg = NULL;
 
         int32_t property;
-        PERF_LATENCY_BEGIN(path_verify, op ? &op->pathVerify : NULL);
         FalconErrorCode errorCode = VerifyPathValidity(info->path, 0, &property);
-        PERF_LATENCY_END(path_verify);
         CHECK_ERROR_CODE_WITH_CONTINUE(errorCode);
     }
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 1);
     pg_qsort(infoArray, count, sizeof(MetaProcessInfo), pg_qsort_meta_process_info_by_path_cmp);
 
     HASHCTL info;
@@ -784,15 +928,14 @@ void FalconOpenHandle(MetaProcessInfo *infoArray, int count)
     HTAB *batchMetaProcessInfoListPerShard =
         hash_create("Batch Meta Process Info List Per Shard Hash Table", GetShardTableSize(), &info, hashFlags);
     ShardHashInfo *entry;
-    PERF_LATENCY_BEGIN(table_open, op ? &op->tableOpen : NULL);
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 2);
     Relation directoryRel = table_open(DirectoryRelationId(), AccessShareLock);
-    PERF_LATENCY_END(table_open);
     for (int i = 0; i < count; ++i) {
         MetaProcessInfo info = infoArray[i];
         if (info->errorCode != SUCCESS)
             continue;
 
-        PERF_LATENCY_BEGIN(path_parse, op ? &op->pathParse : NULL);
         FalconErrorCode errorCode = PathParseTreeInsert(NULL,
                                                         directoryRel,
                                                         info->path,
@@ -800,7 +943,6 @@ void FalconOpenHandle(MetaProcessInfo *infoArray, int count)
                                                         &info->parentId,
                                                         &info->name,
                                                         NULL);
-        PERF_LATENCY_END(path_parse);
         CHECK_ERROR_CODE_WITH_CONTINUE(errorCode);
 
         uint16_t partId = HashPartId(info->name);
@@ -818,9 +960,11 @@ void FalconOpenHandle(MetaProcessInfo *infoArray, int count)
         }
         entry->info = lappend(entry->info, info);
     }
-    PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 3);
     table_close(directoryRel, AccessShareLock);
-    PERF_LATENCY_END(table_close);
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 4);
 
     HASH_SEQ_STATUS status;
     hash_seq_init(&status, batchMetaProcessInfoListPerShard);
@@ -834,7 +978,12 @@ void FalconOpenHandle(MetaProcessInfo *infoArray, int count)
             if (info->errorCode != SUCCESS)
                 continue;
 
-            PERF_LATENCY_BEGIN(open_scan, op ? &op->indexScan : NULL);
+            InodeSearchStatContext statContext = {
+                .statArrayIndex = info->statArrayIndex,
+                .requestStartCheckpoint = CKPT_HANDLER_START + 5,
+                .opDoneCheckpoint = CKPT_HANDLER_START + 6,
+            };
+
             bool fileExist = SearchAndUpdateInodeTableInfo(inodeShardName->data,
                                                            NULL,
                                                            inodeIndexShardName->data,
@@ -858,8 +1007,8 @@ void FalconOpenHandle(MetaProcessInfo *infoArray, int count)
                                                            NULL,
                                                            &info->node_id,
                                                            NULL,
-                                                           NULL);
-            PERF_LATENCY_END(open_scan);
+                                                           NULL,
+                                                           &statContext);
             info->st_dev = 0;
             info->st_uid = 0;
             info->st_gid = 0;
@@ -874,15 +1023,18 @@ void FalconOpenHandle(MetaProcessInfo *infoArray, int count)
                 info->errorCode = FILE_NOT_EXISTS;
             else
                 info->errorCode = SUCCESS;
+
         }
     }
+
+    StatBroadcastArray(infoArray, count, CKPT_HANDLER_START + 7);
 }
 
 void FalconCloseHandle(MetaProcessInfo *infoArray, int count)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
-    OpcodeLatencyBreakdown *op = perf ? &perf->closeOp : NULL;
-    PERF_SCOPED_TIMER(close_timer, op ? &op->total : NULL);
+
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START);
 
     for (int i = 0; i < count; ++i) {
         MetaProcessInfo info = infoArray[i];
@@ -890,11 +1042,11 @@ void FalconCloseHandle(MetaProcessInfo *infoArray, int count)
         info->errorMsg = NULL;
 
         int32_t property;
-        PERF_LATENCY_BEGIN(path_verify, op ? &op->pathVerify : NULL);
         FalconErrorCode errorCode = VerifyPathValidity(info->path, 0, &property);
-        PERF_LATENCY_END(path_verify);
         CHECK_ERROR_CODE_WITH_CONTINUE(errorCode);
     }
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 1);
     pg_qsort(infoArray, count, sizeof(MetaProcessInfo), pg_qsort_meta_process_info_by_path_cmp);
 
     HASHCTL info;
@@ -906,15 +1058,14 @@ void FalconCloseHandle(MetaProcessInfo *infoArray, int count)
     HTAB *batchMetaProcessInfoListPerShard =
         hash_create("Batch Meta Process Info List Per Shard Hash Table", GetShardTableSize(), &info, hashFlags);
     ShardHashInfo *entry;
-    PERF_LATENCY_BEGIN(table_open, op ? &op->tableOpen : NULL);
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 2);
     Relation directoryRel = table_open(DirectoryRelationId(), AccessShareLock);
-    PERF_LATENCY_END(table_open);
     for (int i = 0; i < count; ++i) {
         MetaProcessInfo info = infoArray[i];
         if (info->errorCode != SUCCESS)
             continue;
 
-        PERF_LATENCY_BEGIN(path_parse, op ? &op->pathParse : NULL);
         FalconErrorCode errorCode = PathParseTreeInsert(NULL,
                                                         directoryRel,
                                                         info->path,
@@ -922,7 +1073,6 @@ void FalconCloseHandle(MetaProcessInfo *infoArray, int count)
                                                         &info->parentId,
                                                         &info->name,
                                                         NULL);
-        PERF_LATENCY_END(path_parse);
         CHECK_ERROR_CODE_WITH_CONTINUE(errorCode);
 
         uint16_t partId = HashPartId(info->name);
@@ -940,9 +1090,11 @@ void FalconCloseHandle(MetaProcessInfo *infoArray, int count)
         }
         entry->info = lappend(entry->info, info);
     }
-    PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 3);
     table_close(directoryRel, AccessShareLock);
-    PERF_LATENCY_END(table_close);
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 4);
 
     HASH_SEQ_STATUS status;
     hash_seq_init(&status, batchMetaProcessInfoListPerShard);
@@ -956,10 +1108,15 @@ void FalconCloseHandle(MetaProcessInfo *infoArray, int count)
             if (info->errorCode != SUCCESS)
                 continue;
 
+            InodeSearchStatContext statContext = {
+                .statArrayIndex = info->statArrayIndex,
+                .requestStartCheckpoint = CKPT_HANDLER_START + 5,
+                .opDoneCheckpoint = CKPT_HANDLER_START + 6,
+            };
+
             int64_t size = info->st_size;
             int64_t mtime = GetCurrentTimestamp();
             int32_t nodeId = info->node_id;
-            PERF_LATENCY_BEGIN(close_modify, op ? &op->tableModify : NULL);
             bool fileExist = SearchAndUpdateInodeTableInfo(inodeShardName->data,
                                                            NULL,
                                                            inodeIndexShardName->data,
@@ -983,21 +1140,24 @@ void FalconCloseHandle(MetaProcessInfo *infoArray, int count)
                                                            &mtime,
                                                            NULL,
                                                            &nodeId,
-                                                           NULL);
-            PERF_LATENCY_END(close_modify);
+                                                           NULL,
+                                                           &statContext);
             if (!fileExist)
                 info->errorCode = FILE_NOT_EXISTS;
             else
                 info->errorCode = SUCCESS;
+
         }
     }
+
+    StatBroadcastArray(infoArray, count, CKPT_HANDLER_START + 7);
 }
 
 void FalconUnlinkHandle(MetaProcessInfo *infoArray, int count)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
-    OpcodeLatencyBreakdown *op = perf ? &perf->unlinkOp : NULL;
-    PERF_SCOPED_TIMER(unlink_timer, op ? &op->total : NULL);
+
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START);
 
     for (int i = 0; i < count; ++i) {
         MetaProcessInfo info = infoArray[i];
@@ -1005,12 +1165,12 @@ void FalconUnlinkHandle(MetaProcessInfo *infoArray, int count)
         info->errorMsg = NULL;
 
         int32_t property;
-        PERF_LATENCY_BEGIN(path_verify, op ? &op->pathVerify : NULL);
         FalconErrorCode errorCode =
             VerifyPathValidity(info->path, VERIFY_PATH_VALIDITY_REQUIREMENT_MUST_BE_FILE, &property);
-        PERF_LATENCY_END(path_verify);
         CHECK_ERROR_CODE_WITH_CONTINUE(errorCode);
     }
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 1);
     pg_qsort(infoArray, count, sizeof(MetaProcessInfo), pg_qsort_meta_process_info_by_path_cmp);
 
     HASHCTL info;
@@ -1022,18 +1182,16 @@ void FalconUnlinkHandle(MetaProcessInfo *infoArray, int count)
     HTAB *batchMetaProcessInfoListPerShard =
         hash_create("Batch Meta Process Info List Per Shard Hash Table", GetShardTableSize(), &info, hashFlags);
     ShardHashInfo *entry;
-    PERF_LATENCY_BEGIN(table_open, op ? &op->tableOpen : NULL);
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 2);
     Relation directoryRel = table_open(DirectoryRelationId(), AccessShareLock);
-    PERF_LATENCY_END(table_open);
     for (int i = 0; i < count; ++i) {
         MetaProcessInfo info = infoArray[i];
         if (info->errorCode != SUCCESS)
             continue;
 
-        PERF_LATENCY_BEGIN(path_parse, op ? &op->pathParse : NULL);
         FalconErrorCode errorCode =
             PathParseTreeInsert(NULL, directoryRel, info->path, 0, &info->parentId, &info->name, NULL);
-        PERF_LATENCY_END(path_parse);
         CHECK_ERROR_CODE_WITH_CONTINUE(errorCode);
 
         uint16_t partId = HashPartId(info->name);
@@ -1051,9 +1209,11 @@ void FalconUnlinkHandle(MetaProcessInfo *infoArray, int count)
         }
         entry->info = lappend(entry->info, info);
     }
-    PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 3);
     table_close(directoryRel, AccessShareLock);
-    PERF_LATENCY_END(table_close);
+    for (int _si = 0; _si < count; ++_si)
+        STAT_CKPT(infoArray[_si]->statArrayIndex, CKPT_HANDLER_START + 4);
 
     HASH_SEQ_STATUS status;
     hash_seq_init(&status, batchMetaProcessInfoListPerShard);
@@ -1067,9 +1227,14 @@ void FalconUnlinkHandle(MetaProcessInfo *infoArray, int count)
             if (info->errorCode != SUCCESS)
                 continue;
 
+            InodeSearchStatContext statContext = {
+                .statArrayIndex = info->statArrayIndex,
+                .requestStartCheckpoint = CKPT_HANDLER_START + 5,
+                .opDoneCheckpoint = CKPT_HANDLER_START + 6,
+            };
+
             uint64_t nlink;
             mode_t mode;
-            PERF_LATENCY_BEGIN(unlink_modify, op ? &op->tableModify : NULL);
             bool fileExist = SearchAndUpdateInodeTableInfo(inodeShardName->data,
                                                            NULL,
                                                            inodeIndexShardName->data,
@@ -1093,8 +1258,8 @@ void FalconUnlinkHandle(MetaProcessInfo *infoArray, int count)
                                                            NULL,
                                                            &info->node_id,
                                                            NULL,
-                                                           NULL);
-            PERF_LATENCY_END(unlink_modify);
+                                                           NULL,
+                                                           &statContext);
             if (!fileExist)
                 info->errorCode = FILE_NOT_EXISTS;
             else if (!S_ISREG(mode))
@@ -1103,15 +1268,17 @@ void FalconUnlinkHandle(MetaProcessInfo *infoArray, int count)
                 info->errorCode = PROGRAM_ERROR;
             else
                 info->errorCode = SUCCESS;
+
         }
     }
+
+    StatBroadcastArray(infoArray, count, CKPT_HANDLER_START + 7);
 }
 
 void FalconReadDirHandle(MetaProcessInfo info)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
-    OpcodeLatencyBreakdown *op = perf ? &perf->readdirOp : NULL;
-    PERF_SCOPED_TIMER(readdir_timer, op ? &op->total : NULL);
+
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START);
 
     const char *path = info->path;
     int32_t maxReadCount = info->readDirMaxReadCount;
@@ -1121,16 +1288,12 @@ void FalconReadDirHandle(MetaProcessInfo info)
     const char *lastFileName = info->readDirLastFileName;
 
     int32_t property;
-    PERF_LATENCY_BEGIN(path_verify, op ? &op->pathVerify : NULL);
     VerifyPathValidity(path, VERIFY_PATH_VALIDITY_REQUIREMENT_MUST_BE_DIRECTORY, &property);
-    PERF_LATENCY_END(path_verify);
 
     uint64_t directoryId;
     uint64_t parentId;
-    PERF_LATENCY_BEGIN(table_open, op ? &op->tableOpen : NULL);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 1);
     Relation directoryRel = table_open(DirectoryRelationId(), AccessShareLock);
-    PERF_LATENCY_END(table_open);
-    PERF_LATENCY_BEGIN(path_parse, op ? &op->pathParse : NULL);
     FalconErrorCode errorCode = PathParseTreeInsert(NULL,
                                                     directoryRel,
                                                     path,
@@ -1139,12 +1302,10 @@ void FalconReadDirHandle(MetaProcessInfo info)
                                                     &parentId,
                                                     NULL,
                                                     &directoryId);
-    PERF_LATENCY_END(path_parse);
     if (errorCode != SUCCESS)
         FALCON_ELOG_ERROR(errorCode, "path parse error.");
-    PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
     table_close(directoryRel, AccessShareLock);
-    PERF_LATENCY_END(table_close);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 2);
 
     bool firstCall = lastShardIndex == -1;
 
@@ -1209,12 +1370,9 @@ void FalconReadDirHandle(MetaProcessInfo info)
         }
 
         /* Time table open for inode shard */
-        PERF_LATENCY_BEGIN(readdir_table_open, op ? &op->tableOpen : NULL);
         Relation workerInodeRel = table_open(GetRelationOidByName_FALCON(inodeShardName->data), AccessShareLock);
-        PERF_LATENCY_END(readdir_table_open);
 
         /* Time the index scan for this shard */
-        PERF_LATENCY_BEGIN(readdir_scan, op ? &op->indexScan : NULL);
         SysScanDesc scanDescriptor = systable_beginscan(workerInodeRel,
                                                         GetRelationOidByName_FALCON(inodeIndexShardName->data),
                                                         true,
@@ -1248,7 +1406,6 @@ void FalconReadDirHandle(MetaProcessInfo info)
         systable_endscan(scanDescriptor);
         table_close(workerInodeRel, AccessShareLock);
 
-        PERF_LATENCY_END(readdir_scan);
 
         if (readCount >= maxReadCount)
             break;
@@ -1256,6 +1413,7 @@ void FalconReadDirHandle(MetaProcessInfo info)
         if (state == NEW_SHARD)
             ++shardIndex;
     }
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 3);
 
     bool lastCall = readCount < maxReadCount;
     if (lastCall) {
@@ -1271,24 +1429,22 @@ void FalconReadDirHandle(MetaProcessInfo info)
         info->readDirResultList = NULL;
     info->readDirResultCount = list_length(resultList);
     info->errorCode = SUCCESS;
+
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 4);
 }
 void FalconOpenDirHandle(MetaProcessInfo info)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
-    OpcodeLatencyBreakdown *op = perf ? &perf->opendirOp : NULL;
-    PERF_SCOPED_TIMER(opendir_timer, op ? &op->total : NULL);
+
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START);
 
     const char *path = info->path;
     int32_t property;
-    PERF_LATENCY_BEGIN(path_verify, op ? &op->pathVerify : NULL);
     VerifyPathValidity(path, VERIFY_PATH_VALIDITY_REQUIREMENT_MUST_BE_DIRECTORY, &property);
-    PERF_LATENCY_END(path_verify);
 
-    PERF_LATENCY_BEGIN(table_open, op ? &op->tableOpen : NULL);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 1);
     Relation directoryRel = table_open(DirectoryRelationId(), AccessShareLock);
-    PERF_LATENCY_END(table_open);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 2);
     uint64_t directoryId;
-    PERF_LATENCY_BEGIN(path_parse, op ? &op->pathParse : NULL);
     FalconErrorCode errorCode = PathParseTreeInsert(NULL,
                                                     directoryRel,
                                                     path,
@@ -1297,22 +1453,20 @@ void FalconOpenDirHandle(MetaProcessInfo info)
                                                     NULL,
                                                     NULL,
                                                     &directoryId);
-    PERF_LATENCY_END(path_parse);
     if (errorCode != SUCCESS)
         FALCON_ELOG_ERROR(errorCode, "path parse error.");
-    PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
     table_close(directoryRel, AccessShareLock);
-    PERF_LATENCY_END(table_close);
 
     info->inodeId = directoryId;
     info->errorCode = SUCCESS;
+
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 3);
 }
 
 void FalconRmdirHandle(MetaProcessInfo info)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
-    OpcodeLatencyBreakdown *op = perf ? &perf->rmdirOp : NULL;
-    PERF_SCOPED_TIMER(rmdir_timer, op ? &op->total : NULL);
+
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START);
 
     const char *path = info->path;
 
@@ -1321,18 +1475,15 @@ void FalconRmdirHandle(MetaProcessInfo info)
 
     // 1.
     int32_t property;
-    PERF_LATENCY_BEGIN(path_verify, op ? &op->pathVerify : NULL);
     FalconErrorCode errorCode = VerifyPathValidity(path, VERIFY_PATH_VALIDITY_REQUIREMENT_MUST_BE_DIRECTORY, &property);
-    PERF_LATENCY_END(path_verify);
     if (errorCode != SUCCESS)
         FALCON_ELOG_ERROR(errorCode, "path verify error.");
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 1);
 
     RegisterLocalProcessFlag(false);
 
-    PERF_LATENCY_BEGIN(table_open, op ? &op->tableOpen : NULL);
     Relation directoryRel = table_open(DirectoryRelationId(), RowExclusiveLock);
-    PERF_LATENCY_END(table_open);
-    PERF_LATENCY_BEGIN(path_parse, op ? &op->pathParse : NULL);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 2);
     errorCode = PathParseTreeInsert(NULL,
                                     directoryRel,
                                     info->path,
@@ -1341,15 +1492,12 @@ void FalconRmdirHandle(MetaProcessInfo info)
                                     &info->parentId,
                                     &info->name,
                                     &info->inodeId);
-    PERF_LATENCY_END(path_parse);
     if (errorCode != SUCCESS)
         FALCON_ELOG_ERROR(errorCode, "path parse error.");
-    PERF_LATENCY_BEGIN(table_modify, op ? &op->tableModify : NULL);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 3);
     DeleteDirectoryByDirectoryHashTable(directoryRel, info->parentId, info->name, DIR_LOCK_NONE);
-    PERF_LATENCY_END(table_modify);
-    PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 4);
     table_close(directoryRel, RowExclusiveLock);
-    PERF_LATENCY_END(table_close);
 
     // 2.
     SerializedData subRmdirParam;
@@ -1374,9 +1522,7 @@ void FalconRmdirHandle(MetaProcessInfo info)
                                list_make1_int(workerId));
 
     // 4.
-    PERF_LATENCY_BEGIN(remote_call, op ? &op->remoteCall : NULL);
     MultipleServerRemoteCommandResult totalRemoteRes = FalconSendCommandAndWaitForResult();
-    PERF_LATENCY_END(remote_call);
 
     MetaProcessInfoData responseInfo;
     for (int i = 0; i < list_length(totalRemoteRes); ++i) {
@@ -1431,29 +1577,29 @@ void FalconRmdirHandle(MetaProcessInfo info)
     }
 
     info->errorCode = SUCCESS;
+
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 5);
 }
 
 void FalconRmdirSubRmdirHandle(MetaProcessInfo info)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
-    OpcodeLatencyBreakdown *op = perf ? &perf->rmdirOp : NULL;
+
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START);
 
     uint64_t parentId = info->parentId;
     char *name = info->name;
 
     // 1.
-    PERF_LATENCY_BEGIN(table_open, op ? &op->tableOpen : NULL);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 1);
     Relation rel = table_open(DirectoryRelationId(), RowExclusiveLock);
-    PERF_LATENCY_END(table_open);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 2);
     uint64_t directoryId = SearchDirectoryByDirectoryHashTable(rel, parentId, name, DIR_LOCK_EXCLUSIVE);
     if (directoryId == DIR_HASH_TABLE_PATH_NOT_EXIST)
         FALCON_ELOG_ERROR(FILE_NOT_EXISTS, "FalconRmdirSubRmdirHandle: unexpected.");
-    PERF_LATENCY_BEGIN(table_modify, op ? &op->tableModify : NULL);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 3);
     DeleteDirectoryByDirectoryHashTable(rel, parentId, name, DIR_LOCK_NONE);
-    PERF_LATENCY_END(table_modify);
-    PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 4);
     table_close(rel, RowExclusiveLock);
-    PERF_LATENCY_END(table_close);
 
     // 2.
     SetUpScanCaches();
@@ -1476,10 +1622,7 @@ void FalconRmdirSubRmdirHandle(MetaProcessInfo info)
         scanKey[0].sk_argument = UInt64GetDatum(lowerId);
         scanKey[1] = InodeTableScanKey[INODE_TABLE_PARENT_ID_PART_ID_LE];
         scanKey[1].sk_argument = UInt64GetDatum(upperId);
-        PERF_LATENCY_BEGIN(table_open, op ? &op->tableOpen : NULL);
         Relation workerInodeRel = table_open(GetRelationOidByName_FALCON(inodeShardName->data), AccessShareLock);
-        PERF_LATENCY_END(table_open);
-        PERF_LATENCY_BEGIN(index_scan, op ? &op->indexScan : NULL);
         SysScanDesc scanDescriptor = systable_beginscan(workerInodeRel,
                                                         GetRelationOidByName_FALCON(inodeIndexShardName->data),
                                                         true,
@@ -1494,21 +1637,23 @@ void FalconRmdirSubRmdirHandle(MetaProcessInfo info)
                                        name);
 
         systable_endscan(scanDescriptor);
-        PERF_LATENCY_END(index_scan);
-        PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
         table_close(workerInodeRel, AccessShareLock);
-        PERF_LATENCY_END(table_close);
     }
 
     info->errorCode = SUCCESS;
+
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 5);
 }
 
 void FalconRmdirSubUnlinkHandle(MetaProcessInfo info)
 {
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START);
+
     uint64_t parentId_partId = info->parentId_partId;
     char *name = info->name;
 
     int shardId, workerId;
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 1);
     SearchShardInfoByShardValue(parentId_partId, &shardId, &workerId);
     if (workerId != GetLocalServerId())
         FALCON_ELOG_ERROR(ARGUMENT_ERROR, "FalconRmdirSubUnlinkHandle has received invalid input.");
@@ -1516,6 +1661,7 @@ void FalconRmdirSubUnlinkHandle(MetaProcessInfo info)
     StringInfo inodeShardName = GetInodeShardName(shardId);
     StringInfo inodeIndexShardName = GetInodeIndexShardName(shardId);
     uint64_t nlink;
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 2);
     bool fileExist = SearchAndUpdateInodeTableInfo(inodeShardName->data,
                                                    NULL,
                                                    inodeIndexShardName->data,
@@ -1539,6 +1685,7 @@ void FalconRmdirSubUnlinkHandle(MetaProcessInfo info)
                                                    NULL,
                                                    NULL,
                                                    NULL,
+                                                   NULL,
                                                    NULL);
     if (!fileExist)
         FALCON_ELOG_ERROR_EXTENDED(FILE_NOT_EXISTS,
@@ -1549,30 +1696,29 @@ void FalconRmdirSubUnlinkHandle(MetaProcessInfo info)
         FALCON_ELOG_ERROR(PROGRAM_ERROR, "unexpected.");
 
     info->errorCode = SUCCESS;
+
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 3);
 }
 
 void FalconRenameHandle(MetaProcessInfo info)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
-    OpcodeLatencyBreakdown *op = perf ? &perf->renameOp : NULL;
-    PERF_SCOPED_TIMER(rename_timer, op ? &op->total : NULL);
+
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START);
 
     const char *srcPath = info->path;
     const char *dstPath = info->dstPath;
 
     int32_t srcProperty, dstProperty;
-    PERF_LATENCY_BEGIN(path_verify, op ? &op->pathVerify : NULL);
     VerifyPathValidity(srcPath, 0, &srcProperty);
     VerifyPathValidity(dstPath, 0, &dstProperty);
-    PERF_LATENCY_END(path_verify);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 1);
 
     if (GetLocalServerId() != 0)
         FALCON_ELOG_ERROR(WRONG_WORKER, "rename can only be called on CN.");
 
     // 1.
-    PERF_LATENCY_BEGIN(table_open, op ? &op->tableOpen : NULL);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 2);
     Relation directoryRel = table_open(DirectoryRelationId(), RowExclusiveLock);
-    PERF_LATENCY_END(table_open);
     uint64_t srcDirectoryId = CheckWhetherPathExistsInDirectoryTable(directoryRel, srcPath);
     bool renameDirectory = (srcDirectoryId != DIR_HASH_TABLE_PATH_NOT_EXIST);
     if (renameDirectory && !(srcProperty & VERIFY_PATH_VALIDITY_PROPERTY_CAN_BE_DIRECTORY))
@@ -1596,7 +1742,6 @@ void FalconRenameHandle(MetaProcessInfo info)
         srcIndex = 1;
         dstIndex = 0;
     }
-    PERF_LATENCY_BEGIN(path_parse, op ? &op->pathParse : NULL);
     for (int i = 0; i < 2; ++i) {
         uint32_t flag = PATH_PARSE_FLAG_NOT_ROOT;
         if (renameDirectory)
@@ -1611,19 +1756,14 @@ void FalconRenameHandle(MetaProcessInfo info)
         if (errorCode != SUCCESS)
             FALCON_ELOG_ERROR(errorCode, "path parse error.");
     }
-    PERF_LATENCY_END(path_parse);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 3);
 
     // 3.
     if (renameDirectory) {
-        PERF_LATENCY_BEGIN(rename_modify, op ? &op->tableModify : NULL);
         DeleteDirectoryByDirectoryHashTable(directoryRel, parentId[srcIndex], name[srcIndex], DIR_LOCK_NONE);
         CommandCounterIncrement();
-        PERF_LATENCY_END(rename_modify);
 
-        PERF_LATENCY_BEGIN(index_open, op ? &op->indexOpen : NULL);
         CatalogIndexState indexState = CatalogOpenIndexes(directoryRel);
-        PERF_LATENCY_END(index_open);
-        PERF_LATENCY_BEGIN(rename_insert, op ? &op->tableModify : NULL);
         InsertDirectoryByDirectoryHashTable(directoryRel,
                                             indexState,
                                             parentId[dstIndex],
@@ -1632,14 +1772,10 @@ void FalconRenameHandle(MetaProcessInfo info)
                                             DEFAULT_SUBPART_NUM,
                                             DIR_LOCK_NONE);
         CommandCounterIncrement();
-        PERF_LATENCY_END(rename_insert);
-        PERF_LATENCY_BEGIN(index_close, op ? &op->indexClose : NULL);
         CatalogCloseIndexes(indexState);
-        PERF_LATENCY_END(index_close);
     }
-    PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 4);
     table_close(directoryRel, RowExclusiveLock);
-    PERF_LATENCY_END(table_close);
 
     // 4.
     info->targetIsDirectory = renameDirectory;
@@ -1656,9 +1792,12 @@ void FalconRenameHandle(MetaProcessInfo info)
     uint16_t dstPartId = HashPartId(name[dstIndex]);
     uint64_t dstParentIdPartId = CombineParentIdWithPartId(parentId[dstIndex], dstPartId);
 
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 5);
+
     int srcShardId, srcWorkerId, dstShardId, dstWorkerId;
     SearchShardInfoByShardValue(srcParentIdPartId, &srcShardId, &srcWorkerId);
     SearchShardInfoByShardValue(dstParentIdPartId, &dstShardId, &dstWorkerId);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 6);
 
     SerializedData subRenameLocallyParam;
     // 4.1
@@ -1692,10 +1831,10 @@ void FalconRenameHandle(MetaProcessInfo info)
                                subRenameLocallyParam,
                                REMOTE_COMMAND_FLAG_WRITE,
                                foreignServerIdList);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 7);
 
-    PERF_LATENCY_BEGIN(remote_call, op ? &op->remoteCall : NULL);
     MultipleServerRemoteCommandResult totalRemoteRes = FalconSendCommandAndWaitForResult();
-    PERF_LATENCY_END(remote_call);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 8);
 
     // 5.
     MetaProcessInfoData responseInfo;
@@ -1724,6 +1863,7 @@ void FalconRenameHandle(MetaProcessInfo info)
             FALCON_ELOG_ERROR(PROGRAM_ERROR,
                               "RenameSubRenameLocally is supposed to be successful, "
                               "but it failed.");
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 9);
 
         if (srcWorkerId != dstWorkerId && serverId == srcWorkerId) {
             responseInfo.parentId_partId = dstParentIdPartId;
@@ -1746,9 +1886,7 @@ void FalconRenameHandle(MetaProcessInfo info)
 
     // 6.
     if (srcWorkerId != dstWorkerId) {
-        PERF_LATENCY_BEGIN(remote_call2, perf ? &perf->remoteCallLatency : NULL);
         totalRemoteRes = FalconSendCommandAndWaitForResult();
-        PERF_LATENCY_END(remote_call2);
         if (list_length(totalRemoteRes) != 1)
             FALCON_ELOG_ERROR(PROGRAM_ERROR, "unexpected situation 1.");
         RemoteCommandResultPerServerData *remoteRes = list_nth(totalRemoteRes, 0);
@@ -1773,28 +1911,28 @@ void FalconRenameHandle(MetaProcessInfo info)
                               "RenameSubRenameLocally is supposed to be successful, "
                               "but it failed.");
     }
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 10);
 
     info->errorCode = SUCCESS;
+
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 11);
 }
 
 void FalconRenameSubRenameLocallyHandle(MetaProcessInfo info)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
-    OpcodeLatencyBreakdown *op = perf ? &perf->renameOp : NULL;
+
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START);
 
     // 1.
     if (info->targetIsDirectory) {
         if (info->srcLockOrder < 0 || info->srcLockOrder > 1)
             FALCON_ELOG_ERROR(ARGUMENT_ERROR, "no expected input.");
 
-        PERF_LATENCY_BEGIN(table_open, op ? &op->tableOpen : NULL);
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 1);
         Relation directoryRel = table_open(DirectoryRelationId(), RowExclusiveLock);
-        PERF_LATENCY_END(table_open);
-        PERF_LATENCY_BEGIN(index_open, op ? &op->indexOpen : NULL);
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 2);
         CatalogIndexState indexState = CatalogOpenIndexes(directoryRel);
-        PERF_LATENCY_END(index_open);
         for (int i = 0; i < 2; ++i) {
-            PERF_LATENCY_BEGIN(table_modify, op ? &op->tableModify : NULL);
             if (i == info->srcLockOrder)
                 DeleteDirectoryByDirectoryHashTable(directoryRel, info->parentId, info->name, DIR_LOCK_EXCLUSIVE);
             else
@@ -1806,18 +1944,17 @@ void FalconRenameSubRenameLocallyHandle(MetaProcessInfo info)
                                                     DEFAULT_SUBPART_NUM,
                                                     DIR_LOCK_EXCLUSIVE);
             CommandCounterIncrement();
-            PERF_LATENCY_END(table_modify);
         }
-        PERF_LATENCY_BEGIN(index_close, op ? &op->indexClose : NULL);
         CatalogCloseIndexes(indexState);
-        PERF_LATENCY_END(index_close);
-        PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 3);
         table_close(directoryRel, RowExclusiveLock);
-        PERF_LATENCY_END(table_close);
     }
+
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 4);
 
     if (info->parentId_partId == 0) {
         info->errorCode = SUCCESS;
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 10);
         return;
     }
 
@@ -1834,38 +1971,33 @@ void FalconRenameSubRenameLocallyHandle(MetaProcessInfo info)
     StringInfo srcInodeIndexShardName = GetInodeIndexShardName(srcShardId);
 
     SetUpScanCaches();
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 5);
     ScanKeyData scanKey[2];
     scanKey[0] = InodeTableScanKey[INODE_TABLE_PARENT_ID_PART_ID_EQ];
     scanKey[0].sk_argument = UInt64GetDatum(info->parentId_partId);
     scanKey[1] = InodeTableScanKey[INODE_TABLE_NAME_EQ];
     scanKey[1].sk_argument = CStringGetTextDatum(info->name);
-    PERF_LATENCY_BEGIN(table_open, op ? &op->tableOpen : NULL);
     Relation srcInodeRel = table_open(GetRelationOidByName_FALCON(srcInodeShardName->data), RowExclusiveLock);
-    PERF_LATENCY_END(table_open);
-    PERF_LATENCY_BEGIN(index_scan, op ? &op->indexScan : NULL);
     SysScanDesc scanDescriptor = systable_beginscan(srcInodeRel,
                                                     GetRelationOidByName_FALCON(srcInodeIndexShardName->data),
                                                     true,
                                                     GetTransactionSnapshot(),
                                                     2,
                                                     scanKey);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 6);
     HeapTuple heapTuple = systable_getnext(scanDescriptor);
     TupleDesc tupleDesc = RelationGetDescr(srcInodeRel);
-    PERF_LATENCY_END(index_scan);
 
     if (!HeapTupleIsValid(heapTuple))
         FALCON_ELOG_ERROR(FILE_NOT_EXISTS, "unexpected.");
 
     heap_deform_tuple(heapTuple, tupleDesc, fileInfo, fileInfoNulls);
-    PERF_LATENCY_BEGIN(table_modify, op ? &op->tableModify : NULL);
     CatalogTupleDelete(srcInodeRel, &heapTuple->t_self);
-    PERF_LATENCY_END(table_modify);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 7);
     CommandCounterIncrement();
 
     systable_endscan(scanDescriptor);
-    PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
     table_close(srcInodeRel, RowExclusiveLock);
-    PERF_LATENCY_END(table_close);
 
     // 3.
     if (info->dstParentIdPartId != 0) {
@@ -1875,23 +2007,18 @@ void FalconRenameSubRenameLocallyHandle(MetaProcessInfo info)
             FALCON_ELOG_ERROR(WRONG_WORKER, "wrong worker.");
 
         StringInfo dstInodeShardName = GetInodeShardName(dstShardId);
-        PERF_LATENCY_BEGIN(table_open, op ? &op->tableOpen : NULL);
         Relation dstInodeRel = table_open(GetRelationOidByName_FALCON(dstInodeShardName->data), RowExclusiveLock);
-        PERF_LATENCY_END(table_open);
 
         fileInfo[Anum_pg_dfs_file_parentid_partid - 1] = UInt64GetDatum(info->dstParentIdPartId);
         fileInfo[Anum_pg_dfs_file_name - 1] = CStringGetTextDatum(info->dstName);
 
-        PERF_LATENCY_BEGIN(table_modify, op ? &op->tableModify : NULL);
         heapTuple = heap_form_tuple(tupleDesc, fileInfo, fileInfoNulls);
         CatalogTupleInsert(dstInodeRel, heapTuple);
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 8);
         heap_freetuple(heapTuple);
         CommandCounterIncrement();
-        PERF_LATENCY_END(table_modify);
 
-        PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
         table_close(dstInodeRel, RowExclusiveLock);
-        PERF_LATENCY_END(table_close);
     } else {
         info->inodeId = DatumGetUInt64(fileInfo[Anum_pg_dfs_file_st_ino - 1]);
         info->st_dev = DatumGetUInt64(fileInfo[Anum_pg_dfs_file_st_dev - 1]);
@@ -1909,25 +2036,29 @@ void FalconRenameSubRenameLocallyHandle(MetaProcessInfo info)
         info->node_id = DatumGetInt32(fileInfo[Anum_pg_dfs_file_primary_nodeid - 1]);
     }
 
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 9);
+
     info->errorCode = SUCCESS;
+
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 10);
 }
 
 void FalconRenameSubCreateHandle(MetaProcessInfo info)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
-    OpcodeLatencyBreakdown *op = perf ? &perf->renameOp : NULL;
+
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START);
 
     int shardId, workerId;
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 1);
     SearchShardInfoByShardValue(info->parentId_partId, &shardId, &workerId);
     if (workerId != GetLocalServerId())
         FALCON_ELOG_ERROR(WRONG_WORKER, "wrong worker.");
 
     StringInfo inodeShardName = GetInodeShardName(shardId);
 
-    PERF_LATENCY_BEGIN(table_open, op ? &op->tableOpen : NULL);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 2);
     Relation workerInodeRel = table_open(GetRelationOidByName_FALCON(inodeShardName->data), RowExclusiveLock);
-    PERF_LATENCY_END(table_open);
-    PERF_LATENCY_BEGIN(table_modify, op ? &op->tableModify : NULL);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 3);
     InsertIntoInodeTable(workerInodeRel,
                          NULL,
                          info->inodeId,
@@ -1949,16 +2080,18 @@ void FalconRenameSubCreateHandle(MetaProcessInfo info)
                          0,
                          info->node_id,
                          -1);
-    PERF_LATENCY_END(table_modify);
-    PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 4);
     table_close(workerInodeRel, RowExclusiveLock);
-    PERF_LATENCY_END(table_close);
 
     info->errorCode = SUCCESS;
+
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 5);
 }
 
 void FalconUtimeNsHandle(MetaProcessInfo info)
 {
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START);
+
     const char *path = info->path;
 
     TimestampTz accessTime;
@@ -1973,9 +2106,11 @@ void FalconUtimeNsHandle(MetaProcessInfo info)
 
     int32_t property;
     VerifyPathValidity(path, 0, &property);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 1);
 
     uint64_t parentId = 0;
     char *fileName;
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 2);
     Relation directoryRel = table_open(DirectoryRelationId(), AccessShareLock);
     FalconErrorCode errorCode = PathParseTreeInsert(NULL,
                                                     directoryRel,
@@ -1986,6 +2121,7 @@ void FalconUtimeNsHandle(MetaProcessInfo info)
                                                     NULL);
     if (errorCode != SUCCESS)
         FALCON_ELOG_ERROR(errorCode, "path parse error.");
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 3);
     table_close(directoryRel, AccessShareLock);
 
     uint16_t partId = HashPartId(fileName);
@@ -1997,6 +2133,7 @@ void FalconUtimeNsHandle(MetaProcessInfo info)
 
     StringInfo inodeShardName = GetInodeShardName(shardId);
     StringInfo inodeIndexShardName = GetInodeIndexShardName(shardId);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 4);
     bool fileExist = SearchAndUpdateInodeTableInfo(inodeShardName->data,
                                                    NULL,
                                                    inodeIndexShardName->data,
@@ -2020,22 +2157,30 @@ void FalconUtimeNsHandle(MetaProcessInfo info)
                                                    &modifyTime,
                                                    NULL,
                                                    NULL,
+                                                   NULL,
                                                    NULL);
     if (!fileExist)
         FALCON_ELOG_ERROR(FILE_NOT_EXISTS, "file doesn't exist.");
 
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 5);
     info->errorCode = SUCCESS;
+
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 6);
 }
 
 void FalconChownHandle(MetaProcessInfo info)
 {
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START);
+
     const char *path = info->path;
 
     int32_t property;
     VerifyPathValidity(path, 0, &property);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 1);
 
     uint64_t parentId = 0;
     char *fileName;
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 2);
     Relation directoryRel = table_open(DirectoryRelationId(), AccessShareLock);
     FalconErrorCode errorCode = PathParseTreeInsert(NULL,
                                                     directoryRel,
@@ -2046,6 +2191,7 @@ void FalconChownHandle(MetaProcessInfo info)
                                                     NULL);
     if (errorCode != SUCCESS)
         FALCON_ELOG_ERROR(errorCode, "path parse error.");
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 3);
     table_close(directoryRel, AccessShareLock);
 
     uint16_t partId = HashPartId(fileName);
@@ -2057,6 +2203,7 @@ void FalconChownHandle(MetaProcessInfo info)
 
     StringInfo inodeShardName = GetInodeShardName(shardId);
     StringInfo inodeIndexShardName = GetInodeIndexShardName(shardId);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 4);
     bool fileExist = SearchAndUpdateInodeTableInfo(inodeShardName->data,
                                                    NULL,
                                                    inodeIndexShardName->data,
@@ -2080,24 +2227,32 @@ void FalconChownHandle(MetaProcessInfo info)
                                                    NULL,
                                                    NULL,
                                                    NULL,
+                                                   NULL,
                                                    NULL);
     if (!fileExist)
         FALCON_ELOG_ERROR(FILE_NOT_EXISTS, "file doesn't exist.");
 
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 5);
     info->errorCode = SUCCESS;
+
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 6);
 }
 
 void FalconChmodHandle(MetaProcessInfo info)
 {
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START);
+
     const char *path = info->path;
     mode_t newExecMode = info->st_mode;
     newExecMode &= 0x1FF;
 
     int32_t property;
     VerifyPathValidity(path, 0, &property);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 1);
 
     uint64_t parentId = 0;
     char *fileName;
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 2);
     Relation directoryRel = table_open(DirectoryRelationId(), AccessShareLock);
     FalconErrorCode errorCode = PathParseTreeInsert(NULL,
                                                     directoryRel,
@@ -2108,6 +2263,7 @@ void FalconChmodHandle(MetaProcessInfo info)
                                                     NULL);
     if (errorCode != SUCCESS)
         FALCON_ELOG_ERROR(errorCode, "path parse error.");
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 3);
     table_close(directoryRel, AccessShareLock);
 
     uint16_t partId = HashPartId(fileName);
@@ -2119,6 +2275,7 @@ void FalconChmodHandle(MetaProcessInfo info)
 
     StringInfo inodeShardName = GetInodeShardName(shardId);
     StringInfo inodeIndexShardName = GetInodeIndexShardName(shardId);
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 4);
     bool fileExist = SearchAndUpdateInodeTableInfo(inodeShardName->data,
                                                    NULL,
                                                    inodeIndexShardName->data,
@@ -2142,11 +2299,15 @@ void FalconChmodHandle(MetaProcessInfo info)
                                                    NULL,
                                                    NULL,
                                                    NULL,
+                                                   NULL,
                                                    NULL);
     if (!fileExist)
         FALCON_ELOG_ERROR(FILE_NOT_EXISTS, "file doesn't exist.");
 
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 5);
     info->errorCode = SUCCESS;
+
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 6);
 }
 
 static bool InsertIntoInodeTable(Relation relation,
@@ -2171,8 +2332,6 @@ static bool InsertIntoInodeTable(Relation relation,
                                  int32_t primaryNodeId,
                                  int32_t backupNodeId)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
-    PERF_SCOPED_TIMER(insert_timer, perf ? &perf->tableInsertLatency : NULL);
 
     Datum values[Natts_pg_dfs_inode_table];
     bool isNulls[Natts_pg_dfs_inode_table];
@@ -2214,436 +2373,657 @@ static bool InsertIntoInodeTable(Relation relation,
 
 void FalconSlicePutHandle(SliceProcessInfo *infoArray, int count)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
+    HASHCTL hashInfo;
+    memset(&hashInfo, 0, sizeof(hashInfo));
+    hashInfo.keysize = sizeof(int32_t);
+    hashInfo.entrysize = sizeof(ShardHashInfo);
+    hashInfo.hcxt = CurrentMemoryContext;
+    int hashFlags = (HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+    HTAB *slicePerShard = hash_create("Slice Put Per Shard Hash Table", count, &hashInfo, hashFlags);
 
     for (int i = 0; i < count; ++i) {
-        PERF_SCOPED_TIMER(slice_put_timer, perf ? &perf->slicePutLatency : NULL);
-
         SliceProcessInfo info = infoArray[i];
         info->errorCode = SUCCESS;
+
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START);
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 1);
 
         int shardId, workerId;
         uint16_t partId = HashPartId(info->name);
         SearchShardInfoByShardValue(partId, &shardId, &workerId);
-        if (workerId != GetLocalServerId())
-            CHECK_ERROR_CODE_WITH_RETURN(WRONG_WORKER);
+        if (workerId != GetLocalServerId()) {
+            info->errorCode = WRONG_WORKER;
+            continue;
+        }
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 2);
 
-        StringInfo sliceShardName = GetSliceShardName(shardId);
+        bool found;
+        ShardHashInfo *entry = hash_search(slicePerShard, &shardId, HASH_ENTER, &found);
+        if (!found) {
+            entry->shardId = shardId;
+            entry->info = NIL;
+        }
+        entry->info = lappend(entry->info, info);
+    }
+
+    HASH_SEQ_STATUS status;
+    ShardHashInfo *entry;
+    hash_seq_init(&status, slicePerShard);
+    while ((entry = hash_seq_search(&status)) != NULL) {
+        StringInfo sliceShardName = GetSliceShardName(entry->shardId);
         Relation sliceRel = table_open(GetRelationOidByName_FALCON(sliceShardName->data), RowExclusiveLock);
         CatalogIndexState indexState = CatalogOpenIndexes(sliceRel);
         TupleDesc tupleDesc = RelationGetDescr(sliceRel);
-        for (int j = 0; j < info->count; ++j) {
-            Datum values[Natts_falcon_slice_table];
-            bool isNulls[Natts_falcon_slice_table];
-            memset(values, 0, sizeof(values));
-            memset(isNulls, false, sizeof(isNulls));
+        StatBroadcastSliceList(entry->info, CKPT_HANDLER_START + 3);
 
-            values[Anum_falcon_slice_table_inodeid - 1] = UInt64GetDatum(info->inodeIds[j]);
-            values[Anum_falcon_slice_table_chunkid - 1] = UInt32GetDatum(info->chunkIds[j]);
-            values[Anum_falcon_slice_table_sliceid - 1] = UInt64GetDatum(info->sliceIds[j]);
-            values[Anum_falcon_slice_table_slicesize - 1] = UInt32GetDatum(info->sliceSizes[j]);
-            values[Anum_falcon_slice_table_sliceoffset - 1] = UInt32GetDatum(info->sliceOffsets[j]);
-            values[Anum_falcon_slice_table_slicelen - 1] = UInt32GetDatum(info->sliceLens[j]);
-            values[Anum_falcon_slice_table_sliceloc1 - 1] = UInt32GetDatum(info->sliceLoc1s[j]);
-            values[Anum_falcon_slice_table_sliceloc2 - 1] = UInt32GetDatum(info->sliceloc2s[j]);
+        ListCell *lc;
+        foreach(lc, entry->info) {
+            SliceProcessInfo info = (SliceProcessInfo)lfirst(lc);
+            if (info->errorCode != SUCCESS)
+                continue;
+            STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 4);
 
-            HeapTuple heapTuple = heap_form_tuple(tupleDesc, values, isNulls);
-            CatalogTupleInsertWithInfo(sliceRel, heapTuple, indexState);
-            heap_freetuple(heapTuple);
+            for (uint32_t j = 0; j < info->count; ++j) {
+                Datum values[Natts_falcon_slice_table];
+                bool isNulls[Natts_falcon_slice_table];
+                memset(values, 0, sizeof(values));
+                memset(isNulls, false, sizeof(isNulls));
+
+                values[Anum_falcon_slice_table_inodeid - 1] = UInt64GetDatum(info->inodeIds[j]);
+                values[Anum_falcon_slice_table_chunkid - 1] = UInt32GetDatum(info->chunkIds[j]);
+                values[Anum_falcon_slice_table_sliceid - 1] = UInt64GetDatum(info->sliceIds[j]);
+                values[Anum_falcon_slice_table_slicesize - 1] = UInt32GetDatum(info->sliceSizes[j]);
+                values[Anum_falcon_slice_table_sliceoffset - 1] = UInt32GetDatum(info->sliceOffsets[j]);
+                values[Anum_falcon_slice_table_slicelen - 1] = UInt32GetDatum(info->sliceLens[j]);
+                values[Anum_falcon_slice_table_sliceloc1 - 1] = UInt32GetDatum(info->sliceLoc1s[j]);
+                values[Anum_falcon_slice_table_sliceloc2 - 1] = UInt32GetDatum(info->sliceloc2s[j]);
+
+                HeapTuple heapTuple = heap_form_tuple(tupleDesc, values, isNulls);
+                CatalogTupleInsertWithInfo(sliceRel, heapTuple, indexState);
+                heap_freetuple(heapTuple);
+            }
+
+            STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 5);
         }
 
         CatalogCloseIndexes(indexState);
         table_close(sliceRel, RowExclusiveLock);
     }
+
+    hash_destroy(slicePerShard);
+    StatBroadcastSliceArray(infoArray, count, CKPT_HANDLER_START + 6);
 }
 
 void FalconSliceGetHandle(SliceProcessInfo *infoArray, int count)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
     SetUpScanCaches();
 
-    for (int i = 0; i < count; ++i) {
-        PERF_SCOPED_TIMER(slice_get_timer, perf ? &perf->sliceGetLatency : NULL);
+    HASHCTL hashInfo;
+    memset(&hashInfo, 0, sizeof(hashInfo));
+    hashInfo.keysize = sizeof(int32_t);
+    hashInfo.entrysize = sizeof(ShardHashInfo);
+    hashInfo.hcxt = CurrentMemoryContext;
+    int hashFlags = (HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+    HTAB *slicePerShard = hash_create("Slice Get Per Shard Hash Table", count, &hashInfo, hashFlags);
 
+    for (int i = 0; i < count; ++i) {
         SliceProcessInfo info = infoArray[i];
+        info->errorCode = SUCCESS;
+
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START);
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 1);
 
         int shardId, workerId;
         uint16_t partId = HashPartId(info->name);
         SearchShardInfoByShardValue(partId, &shardId, &workerId);
-        if (workerId != GetLocalServerId())
-            CHECK_ERROR_CODE_WITH_RETURN(WRONG_WORKER);
-
-        ScanKeyData scanKey[LAST_FALCON_SLICE_TABLE_SCANKEY_TYPE];
-        scanKey[SLICE_TABLE_INODEID_EQ] = SliceTableScanKey[SLICE_TABLE_INODEID_EQ];
-        scanKey[SLICE_TABLE_INODEID_EQ].sk_argument = UInt64GetDatum(info->inputInodeid);
-        scanKey[SLICE_TABLE_CHUNKID_EQ] = SliceTableScanKey[SLICE_TABLE_CHUNKID_EQ];
-        scanKey[SLICE_TABLE_CHUNKID_EQ].sk_argument = UInt32GetDatum(info->inputChunkid);
-
-        StringInfo sliceShardName = GetSliceShardName(shardId);
-        StringInfo sliceIndexShardName = GetSliceIndexShardName(shardId);
-
-        Relation sliceRel = table_open(GetRelationOidByName_FALCON(sliceShardName->data), RowExclusiveLock);
-        SysScanDesc scanDesc = systable_beginscan(sliceRel,
-                                                GetRelationOidByName_FALCON(sliceIndexShardName->data),
-                                                true,
-                                                GetTransactionSnapshot(),
-                                                LAST_FALCON_SLICE_TABLE_SCANKEY_TYPE,
-                                                scanKey);
-        TupleDesc tupleDesc = RelationGetDescr(sliceRel);
-
-        bool isNull;
-        List *getResult = NIL;
-        HeapTuple heapTuple;
-        while (HeapTupleIsValid(heapTuple = systable_getnext(scanDesc))) {
-            SliceInfo *result = palloc(sizeof(SliceInfo));
-            result->inodeId = DatumGetUInt64(heap_getattr(heapTuple, Anum_falcon_slice_table_inodeid, tupleDesc, &isNull));
-            result->chunkId = DatumGetUInt32(heap_getattr(heapTuple, Anum_falcon_slice_table_chunkid, tupleDesc, &isNull));
-            result->sliceId = DatumGetUInt64(heap_getattr(heapTuple, Anum_falcon_slice_table_sliceid, tupleDesc, &isNull));
-            result->sliceSize = DatumGetUInt32(heap_getattr(heapTuple, Anum_falcon_slice_table_slicesize, tupleDesc, &isNull));
-            result->sliceOffset = DatumGetUInt32(heap_getattr(heapTuple, Anum_falcon_slice_table_sliceoffset, tupleDesc, &isNull));
-            result->sliceLen = DatumGetUInt32(heap_getattr(heapTuple, Anum_falcon_slice_table_slicelen, tupleDesc, &isNull));
-            result->sliceLoc1 = DatumGetUInt32(heap_getattr(heapTuple, Anum_falcon_slice_table_sliceloc1, tupleDesc, &isNull));
-            result->sliceLoc2 = DatumGetUInt32(heap_getattr(heapTuple, Anum_falcon_slice_table_sliceloc2, tupleDesc, &isNull));
-            getResult = lappend(getResult, result);
-        }
-
-        systable_endscan(scanDesc);
-        table_close(sliceRel, RowExclusiveLock);
-
-        /* if result is NIL */
-        if (getResult == NIL) {
-            info->errorCode = FILE_NOT_EXISTS;
-            info->count = 0;
+        if (workerId != GetLocalServerId()) {
+            info->errorCode = WRONG_WORKER;
             continue;
         }
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 2);
 
-        SliceInfo **infos = (SliceInfo **)getResult->elements;
-        info->count = list_length(getResult);
-        info->inodeIds = (uint64_t *)palloc(sizeof(uint64_t) * info->count);
-        info->chunkIds = (uint32_t *)palloc(sizeof(uint32_t) * info->count);
-        info->sliceIds = (uint64_t *)palloc(sizeof(uint64_t) * info->count);
-        info->sliceSizes = (uint32_t *)palloc(sizeof(uint32_t) * info->count);
-        info->sliceOffsets = (uint32_t *)palloc(sizeof(uint32_t) * info->count);
-        info->sliceLens = (uint32_t *)palloc(sizeof(uint32_t) * info->count);
-        info->sliceLoc1s = (uint32_t *)palloc(sizeof(uint32_t) * info->count);
-        info->sliceloc2s = (uint32_t *)palloc(sizeof(uint32_t) * info->count);
+        bool found;
+        ShardHashInfo *entry = hash_search(slicePerShard, &shardId, HASH_ENTER, &found);
+        if (!found) {
+            entry->shardId = shardId;
+            entry->info = NIL;
+        }
+        entry->info = lappend(entry->info, info);
+    }
 
-        for (uint32_t i = 0; i < info->count; ++i) {
-            info->inodeIds[i] = infos[i]->inodeId;
-            info->chunkIds[i] = infos[i]->chunkId;
-            info->sliceIds[i] = infos[i]->sliceId;
-            info->sliceSizes[i] = infos[i]->sliceSize;
-            info->sliceOffsets[i] = infos[i]->sliceOffset;
-            info->sliceLens[i] = infos[i]->sliceLen;
-            info->sliceLoc1s[i] = infos[i]->sliceLoc1;
-            info->sliceloc2s[i] = infos[i]->sliceLoc2;
+    HASH_SEQ_STATUS status;
+    ShardHashInfo *entry;
+    hash_seq_init(&status, slicePerShard);
+    while ((entry = hash_seq_search(&status)) != NULL) {
+        StringInfo sliceShardName = GetSliceShardName(entry->shardId);
+        StringInfo sliceIndexShardName = GetSliceIndexShardName(entry->shardId);
+        Relation sliceRel = table_open(GetRelationOidByName_FALCON(sliceShardName->data), RowExclusiveLock);
+        Oid indexOid = GetRelationOidByName_FALCON(sliceIndexShardName->data);
+        TupleDesc tupleDesc = RelationGetDescr(sliceRel);
+        StatBroadcastSliceList(entry->info, CKPT_HANDLER_START + 3);
+
+        ListCell *lc;
+        foreach(lc, entry->info) {
+            SliceProcessInfo info = (SliceProcessInfo)lfirst(lc);
+            if (info->errorCode != SUCCESS)
+                continue;
+            STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 4);
+
+            ScanKeyData scanKey[LAST_FALCON_SLICE_TABLE_SCANKEY_TYPE];
+            scanKey[SLICE_TABLE_INODEID_EQ] = SliceTableScanKey[SLICE_TABLE_INODEID_EQ];
+            scanKey[SLICE_TABLE_INODEID_EQ].sk_argument = UInt64GetDatum(info->inputInodeid);
+            scanKey[SLICE_TABLE_CHUNKID_EQ] = SliceTableScanKey[SLICE_TABLE_CHUNKID_EQ];
+            scanKey[SLICE_TABLE_CHUNKID_EQ].sk_argument = UInt32GetDatum(info->inputChunkid);
+
+            SysScanDesc scanDesc = systable_beginscan(sliceRel,
+                                                      indexOid,
+                                                      true,
+                                                      GetTransactionSnapshot(),
+                                                      LAST_FALCON_SLICE_TABLE_SCANKEY_TYPE,
+                                                      scanKey);
+
+            bool isNull;
+            List *getResult = NIL;
+            HeapTuple heapTuple;
+            while (HeapTupleIsValid(heapTuple = systable_getnext(scanDesc))) {
+                SliceInfo *result = palloc(sizeof(SliceInfo));
+                result->inodeId = DatumGetUInt64(heap_getattr(heapTuple, Anum_falcon_slice_table_inodeid, tupleDesc, &isNull));
+                result->chunkId = DatumGetUInt32(heap_getattr(heapTuple, Anum_falcon_slice_table_chunkid, tupleDesc, &isNull));
+                result->sliceId = DatumGetUInt64(heap_getattr(heapTuple, Anum_falcon_slice_table_sliceid, tupleDesc, &isNull));
+                result->sliceSize = DatumGetUInt32(heap_getattr(heapTuple, Anum_falcon_slice_table_slicesize, tupleDesc, &isNull));
+                result->sliceOffset = DatumGetUInt32(heap_getattr(heapTuple, Anum_falcon_slice_table_sliceoffset, tupleDesc, &isNull));
+                result->sliceLen = DatumGetUInt32(heap_getattr(heapTuple, Anum_falcon_slice_table_slicelen, tupleDesc, &isNull));
+                result->sliceLoc1 = DatumGetUInt32(heap_getattr(heapTuple, Anum_falcon_slice_table_sliceloc1, tupleDesc, &isNull));
+                result->sliceLoc2 = DatumGetUInt32(heap_getattr(heapTuple, Anum_falcon_slice_table_sliceloc2, tupleDesc, &isNull));
+                getResult = lappend(getResult, result);
+            }
+
+            systable_endscan(scanDesc);
+            STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 5);
+
+            if (getResult == NIL) {
+                info->errorCode = FILE_NOT_EXISTS;
+                info->count = 0;
+                STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 6);
+                continue;
+            }
+
+            SliceInfo **infos = (SliceInfo **)getResult->elements;
+            info->count = list_length(getResult);
+            info->inodeIds = (uint64_t *)palloc(sizeof(uint64_t) * info->count);
+            info->chunkIds = (uint32_t *)palloc(sizeof(uint32_t) * info->count);
+            info->sliceIds = (uint64_t *)palloc(sizeof(uint64_t) * info->count);
+            info->sliceSizes = (uint32_t *)palloc(sizeof(uint32_t) * info->count);
+            info->sliceOffsets = (uint32_t *)palloc(sizeof(uint32_t) * info->count);
+            info->sliceLens = (uint32_t *)palloc(sizeof(uint32_t) * info->count);
+            info->sliceLoc1s = (uint32_t *)palloc(sizeof(uint32_t) * info->count);
+            info->sliceloc2s = (uint32_t *)palloc(sizeof(uint32_t) * info->count);
+
+            for (uint32_t j = 0; j < info->count; ++j) {
+                info->inodeIds[j] = infos[j]->inodeId;
+                info->chunkIds[j] = infos[j]->chunkId;
+                info->sliceIds[j] = infos[j]->sliceId;
+                info->sliceSizes[j] = infos[j]->sliceSize;
+                info->sliceOffsets[j] = infos[j]->sliceOffset;
+                info->sliceLens[j] = infos[j]->sliceLen;
+                info->sliceLoc1s[j] = infos[j]->sliceLoc1;
+                info->sliceloc2s[j] = infos[j]->sliceLoc2;
+            }
+
+            info->errorCode = SUCCESS;
+            STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 6);
         }
 
-        info->errorCode = SUCCESS;
+        table_close(sliceRel, RowExclusiveLock);
     }
+
+    hash_destroy(slicePerShard);
+    StatBroadcastSliceArray(infoArray, count, CKPT_HANDLER_START + 7);
 }
 
 void FalconSliceDelHandle(SliceProcessInfo *infoArray, int count)
 {
     SetUpScanCaches();
 
+    HASHCTL hashInfo;
+    memset(&hashInfo, 0, sizeof(hashInfo));
+    hashInfo.keysize = sizeof(int32_t);
+    hashInfo.entrysize = sizeof(ShardHashInfo);
+    hashInfo.hcxt = CurrentMemoryContext;
+    int hashFlags = (HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+    HTAB *slicePerShard = hash_create("Slice Del Per Shard Hash Table", count, &hashInfo, hashFlags);
+
     for (int i = 0; i < count; ++i) {
         SliceProcessInfo info = infoArray[i];
         info->errorCode = SUCCESS;
 
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START);
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 1);
+
         int shardId, workerId;
         uint16_t partId = HashPartId(info->name);
         SearchShardInfoByShardValue(partId, &shardId, &workerId);
-        if (workerId != GetLocalServerId())
-            CHECK_ERROR_CODE_WITH_RETURN(WRONG_WORKER);
+        if (workerId != GetLocalServerId()) {
+            info->errorCode = WRONG_WORKER;
+            continue;
+        }
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 2);
 
-        ScanKeyData scanKey[LAST_FALCON_SLICE_TABLE_SCANKEY_TYPE];
-        scanKey[SLICE_TABLE_INODEID_EQ] = SliceTableScanKey[SLICE_TABLE_INODEID_EQ];
-        scanKey[SLICE_TABLE_INODEID_EQ].sk_argument = UInt64GetDatum(info->inputInodeid);
-        scanKey[SLICE_TABLE_CHUNKID_EQ] = SliceTableScanKey[SLICE_TABLE_CHUNKID_EQ];
-        scanKey[SLICE_TABLE_CHUNKID_EQ].sk_argument = UInt32GetDatum(info->inputChunkid);
+        bool found;
+        ShardHashInfo *entry = hash_search(slicePerShard, &shardId, HASH_ENTER, &found);
+        if (!found) {
+            entry->shardId = shardId;
+            entry->info = NIL;
+        }
+        entry->info = lappend(entry->info, info);
+    }
 
-        StringInfo sliceShardName = GetSliceShardName(shardId);
-        StringInfo sliceIndexShardName = GetSliceIndexShardName(shardId);
-
+    HASH_SEQ_STATUS status;
+    ShardHashInfo *entry;
+    hash_seq_init(&status, slicePerShard);
+    while ((entry = hash_seq_search(&status)) != NULL) {
+        StringInfo sliceShardName = GetSliceShardName(entry->shardId);
+        StringInfo sliceIndexShardName = GetSliceIndexShardName(entry->shardId);
         Relation sliceRel = table_open(GetRelationOidByName_FALCON(sliceShardName->data), RowExclusiveLock);
-        SysScanDesc scanDesc = systable_beginscan(sliceRel,
-                                                GetRelationOidByName_FALCON(sliceIndexShardName->data),
-                                                true,
-                                                GetTransactionSnapshot(),
-                                                LAST_FALCON_SLICE_TABLE_SCANKEY_TYPE,
-                                                scanKey);
-        HeapTuple heapTuple;
-        while (HeapTupleIsValid(heapTuple = systable_getnext(scanDesc))) {
-            FalconPerfLatencyShmem *perf_del = g_FalconPerfLatencyShmem;
-            PERF_LATENCY_BEGIN(table_delete, perf_del ? &perf_del->tableDeleteLatency : NULL);
-            CatalogTupleDelete(sliceRel, &heapTuple->t_self);
-            PERF_LATENCY_END(table_delete);
+        Oid indexOid = GetRelationOidByName_FALCON(sliceIndexShardName->data);
+        StatBroadcastSliceList(entry->info, CKPT_HANDLER_START + 3);
+
+        ListCell *lc;
+        foreach(lc, entry->info) {
+            SliceProcessInfo info = (SliceProcessInfo)lfirst(lc);
+            if (info->errorCode != SUCCESS)
+                continue;
+            STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 4);
+
+            ScanKeyData scanKey[LAST_FALCON_SLICE_TABLE_SCANKEY_TYPE];
+            scanKey[SLICE_TABLE_INODEID_EQ] = SliceTableScanKey[SLICE_TABLE_INODEID_EQ];
+            scanKey[SLICE_TABLE_INODEID_EQ].sk_argument = UInt64GetDatum(info->inputInodeid);
+            scanKey[SLICE_TABLE_CHUNKID_EQ] = SliceTableScanKey[SLICE_TABLE_CHUNKID_EQ];
+            scanKey[SLICE_TABLE_CHUNKID_EQ].sk_argument = UInt32GetDatum(info->inputChunkid);
+
+            SysScanDesc scanDesc = systable_beginscan(sliceRel,
+                                                      indexOid,
+                                                      true,
+                                                      GetTransactionSnapshot(),
+                                                      LAST_FALCON_SLICE_TABLE_SCANKEY_TYPE,
+                                                      scanKey);
+            HeapTuple heapTuple;
+            while (HeapTupleIsValid(heapTuple = systable_getnext(scanDesc))) {
+                CatalogTupleDelete(sliceRel, &heapTuple->t_self);
+            }
+
+            systable_endscan(scanDesc);
+            STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 5);
+            STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 6);
         }
 
-        systable_endscan(scanDesc);
         table_close(sliceRel, RowExclusiveLock);
     }
+
+    hash_destroy(slicePerShard);
+    StatBroadcastSliceArray(infoArray, count, CKPT_HANDLER_START + 7);
 }
 
-void FalconKvmetaPutHandle(KvMetaProcessInfo info)
+void FalconKvmetaPutHandle(KvMetaProcessInfo *infoArray, int count)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
-    OpcodeLatencyBreakdown *op = perf ? &perf->kvPutOp : NULL;
-    PERF_SCOPED_TIMER(kv_put_timer, op ? &op->total : NULL);
-
     MemoryContext oldcontext = CurrentMemoryContext;
+    HASHCTL hashInfo;
+    memset(&hashInfo, 0, sizeof(hashInfo));
+    hashInfo.keysize = sizeof(int32_t);
+    hashInfo.entrysize = sizeof(ShardHashInfo);
+    hashInfo.hcxt = CurrentMemoryContext;
+    int hashFlags = (HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+    HTAB *kvmetaPerShard = hash_create("KV Put Per Shard Hash Table", count, &hashInfo, hashFlags);
 
-    int shardId, workerId;
-    uint16_t partId = HashPartId(info->userkey);
-    SearchShardInfoByShardValue(partId, &shardId, &workerId);
-    if (workerId != GetLocalServerId())
-        CHECK_ERROR_CODE_WITH_RETURN(WRONG_WORKER);
-
-    StringInfo kvmetaShardName = GetKvmetaShardName(shardId);
-    Relation kvmetaRel = NULL;
-    TupleDesc tupleDesc = NULL;
-    Datum *dkeys = NULL;
-
-    PERF_LATENCY_BEGIN(table_open, op ? &op->tableOpen : NULL);
-    kvmetaRel = table_open(GetRelationOidByName_FALCON(kvmetaShardName->data), RowExclusiveLock);
-    PERF_LATENCY_END(table_open);
-    PERF_LATENCY_BEGIN(index_open, op ? &op->indexOpen : NULL);
-    CatalogIndexState indexState = CatalogOpenIndexes(kvmetaRel);
-    PERF_LATENCY_END(index_open);
-
-    PG_TRY();
-    {
-        tupleDesc = RelationGetDescr(kvmetaRel);
-
-        Datum values[Natts_falcon_kvmeta_table];
-        bool isNulls[Natts_falcon_kvmeta_table];
-        memset(values, 0, sizeof(values));
-        memset(isNulls, false, sizeof(isNulls));
-
-        values[Anum_falcon_kvmeta_table_userkey - 1] = CStringGetTextDatum(info->userkey);
-        values[Anum_falcon_kvmeta_table_valuelen - 1] = UInt32GetDatum(info->valuelen);
-        values[Anum_falcon_kvmeta_table_slicenum - 1] = UInt16GetDatum(info->slicenum);
-
-        ArrayType *arr = NULL;
-        int size = info->slicenum;
-        dkeys = palloc(size * sizeof(Datum));
-
-        for (int i = 0; i < size; i ++) {
-            dkeys[i] = UInt64GetDatum(info->valuekey[i]);
+    for (int i = 0; i < count; i++) {
+        KvMetaProcessInfo info = infoArray[i];
+        info->errorCode = SUCCESS;
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START);
+        int shardId, workerId;
+        uint16_t partId = HashPartId(info->userkey);
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 1);
+        SearchShardInfoByShardValue(partId, &shardId, &workerId);
+        if (workerId != GetLocalServerId()) {
+            info->errorCode = WRONG_WORKER;
+            continue;
         }
-        arr = construct_array(dkeys, size, INT8OID, sizeof(uint64_t), true, 'd');
-        values[Anum_falcon_kvmeta_table_valuekey - 1] = PointerGetDatum(arr);
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 2);
 
-        for (int i = 0; i < size; i ++) {
-            dkeys[i] = UInt64GetDatum(info->location[i]);
+        bool found;
+        ShardHashInfo *entry = hash_search(kvmetaPerShard, &shardId, HASH_ENTER, &found);
+        if (!found) {
+            entry->shardId = shardId;
+            entry->info = NIL;
         }
-        arr = construct_array(dkeys, size, INT8OID, sizeof(uint64_t), true, 'd');
-        values[Anum_falcon_kvmeta_table_location - 1] = PointerGetDatum(arr);
+        entry->info = lappend(entry->info, info);
+    }
 
-        for (int i = 0; i < size; i ++) {
-            dkeys[i] = UInt32GetDatum(info->slicelen[i]);
+    /* Step 2: Process each shard group */
+    HASH_SEQ_STATUS status;
+    ShardHashInfo *entry;
+    hash_seq_init(&status, kvmetaPerShard);
+    while ((entry = hash_seq_search(&status)) != NULL) {
+        StringInfo kvmetaShardName = GetKvmetaShardName(entry->shardId);
+        Relation kvmetaRel = NULL;
+        CatalogIndexState indexState = NULL;
+        Datum *dkeys = NULL;
+
+        kvmetaRel = table_open(GetRelationOidByName_FALCON(kvmetaShardName->data), RowExclusiveLock);
+        indexState = CatalogOpenIndexes(kvmetaRel);
+        TupleDesc tupleDesc = RelationGetDescr(kvmetaRel);
+        StatBroadcastKvList(entry->info, CKPT_HANDLER_START + 3);
+
+        ListCell *lc;
+        foreach(lc, entry->info) {
+            KvMetaProcessInfo info = (KvMetaProcessInfo)lfirst(lc);
+            if (info->errorCode != SUCCESS)
+                continue;
+            STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 4);
+
+            PG_TRY();
+            {
+                Datum values[Natts_falcon_kvmeta_table];
+                bool isNulls[Natts_falcon_kvmeta_table];
+                memset(values, 0, sizeof(values));
+                memset(isNulls, false, sizeof(isNulls));
+
+                values[Anum_falcon_kvmeta_table_userkey - 1] = CStringGetTextDatum(info->userkey);
+                values[Anum_falcon_kvmeta_table_valuelen - 1] = UInt32GetDatum(info->valuelen);
+                values[Anum_falcon_kvmeta_table_slicenum - 1] = UInt16GetDatum(info->slicenum);
+
+                ArrayType *arr = NULL;
+                int size = info->slicenum;
+                dkeys = palloc(size * sizeof(Datum));
+
+                for (int j = 0; j < size; j++) {
+                    dkeys[j] = UInt64GetDatum(info->valuekey[j]);
+                }
+                arr = construct_array(dkeys, size, INT8OID, sizeof(uint64_t), true, 'd');
+                values[Anum_falcon_kvmeta_table_valuekey - 1] = PointerGetDatum(arr);
+
+                for (int j = 0; j < size; j++) {
+                    dkeys[j] = UInt64GetDatum(info->location[j]);
+                }
+                arr = construct_array(dkeys, size, INT8OID, sizeof(uint64_t), true, 'd');
+                values[Anum_falcon_kvmeta_table_location - 1] = PointerGetDatum(arr);
+
+                for (int j = 0; j < size; j++) {
+                    dkeys[j] = UInt32GetDatum(info->slicelen[j]);
+                }
+                arr = construct_array(dkeys, size, INT4OID, sizeof(uint32_t), true, 'i');
+                values[Anum_falcon_kvmeta_table_slicelen - 1] = PointerGetDatum(arr);
+                STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 5);
+
+                pfree(dkeys);
+                dkeys = NULL;
+
+                HeapTuple heapTuple = heap_form_tuple(tupleDesc, values, isNulls);
+                CatalogTupleInsertWithInfo(kvmetaRel, heapTuple, indexState);
+                STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 6);
+                heap_freetuple(heapTuple);
+            }
+            PG_CATCH();
+            {
+                MemoryContextSwitchTo(oldcontext);
+                ErrorData *errorData = CopyErrorData();
+                FlushErrorState();
+
+                if (dkeys != NULL) {
+                    pfree(dkeys);
+                    dkeys = NULL;
+                }
+
+                info->errorCode = errorData->sqlerrcode == ERRCODE_UNIQUE_VIOLATION ? SUCCESS : UNKNOWN;
+                FreeErrorData(errorData);
+            }
+            PG_END_TRY();
         }
-        arr = construct_array(dkeys, size, INT4OID, sizeof(uint32_t), true, 'i');
-        values[Anum_falcon_kvmeta_table_slicelen - 1] = PointerGetDatum(arr);
 
-        pfree(dkeys);
-        dkeys = NULL;
-
-        HeapTuple heapTuple = heap_form_tuple(tupleDesc, values, isNulls);
-        PERF_LATENCY_BEGIN(kv_table_insert, op ? &op->tableModify : NULL);
-        CatalogTupleInsertWithInfo(kvmetaRel, heapTuple, indexState);
-        PERF_LATENCY_END(kv_table_insert);
-        heap_freetuple(heapTuple);
-
-        PERF_LATENCY_BEGIN(index_close, op ? &op->indexClose : NULL);
         CatalogCloseIndexes(indexState);
-        PERF_LATENCY_END(index_close);
-        PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
         table_close(kvmetaRel, RowExclusiveLock);
-        PERF_LATENCY_END(table_close);
     }
-    PG_CATCH();
-    {
-        MemoryContextSwitchTo(oldcontext);
-        ErrorData *errorData = CopyErrorData();
-        FlushErrorState();
-
-        if (dkeys != NULL) {
-            pfree(dkeys);
-            dkeys = NULL;
-        }
-
-        CatalogCloseIndexes(indexState);
-        if (kvmetaRel != NULL) {
-            table_close(kvmetaRel, RowExclusiveLock);
-        }
-
-        info->errorCode = errorData->sqlerrcode == ERRCODE_UNIQUE_VIOLATION ? SUCCESS : UNKNOWN;
-        FreeErrorData(errorData);
-    }
-    PG_END_TRY();
+    hash_destroy(kvmetaPerShard);
+    StatBroadcastKvArray(infoArray, count, CKPT_HANDLER_START + 7);
 }
 
-void FalconKvmetaGetHandle(KvMetaProcessInfo info)
+void FalconKvmetaGetHandle(KvMetaProcessInfo *infoArray, int count)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
-    OpcodeLatencyBreakdown *op = perf ? &perf->kvGetOp : NULL;
-    PERF_SCOPED_TIMER(kv_get_timer, op ? &op->total : NULL);
-
-    int shardId, workerId;
-    uint16_t partId = HashPartId(info->userkey);
-    SearchShardInfoByShardValue(partId, &shardId, &workerId);
-    if (workerId != GetLocalServerId())
-        CHECK_ERROR_CODE_WITH_RETURN(WRONG_WORKER);
-
     SetUpScanCaches();
 
-    ScanKeyData scanKey[LAST_FALCON_KVMETA_TABLE_SCANKEY_TYPE];
-    scanKey[KVMETA_TABLE_USERKEY_EQ] = KvmetaTableScanKey[KVMETA_TABLE_USERKEY_EQ];
-    scanKey[KVMETA_TABLE_USERKEY_EQ].sk_argument = CStringGetTextDatum(info->userkey);
+    HASHCTL hashInfo;
+    memset(&hashInfo, 0, sizeof(hashInfo));
+    hashInfo.keysize = sizeof(int32_t);
+    hashInfo.entrysize = sizeof(ShardHashInfo);
+    hashInfo.hcxt = CurrentMemoryContext;
+    int hashFlags = (HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+    HTAB *kvmetaPerShard = hash_create("KV Get Per Shard Hash Table", count, &hashInfo, hashFlags);
 
-    StringInfo kvmetaShardName = GetKvmetaShardName(shardId);
-    StringInfo kvmetaIndexShardName = GetKvmetaIndexShardName(shardId);
+    for (int i = 0; i < count; i++) {
+        KvMetaProcessInfo info = infoArray[i];
+        info->errorCode = SUCCESS;
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START);
+        int shardId, workerId;
+        uint16_t partId = HashPartId(info->userkey);
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 1);
+        SearchShardInfoByShardValue(partId, &shardId, &workerId);
+        if (workerId != GetLocalServerId()) {
+            info->errorCode = WRONG_WORKER;
+            continue;
+        }
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 2);
 
-    PERF_LATENCY_BEGIN(kv_get_table_open, op ? &op->tableOpen : NULL);
-    Relation kvmetaRel = table_open(GetRelationOidByName_FALCON(kvmetaShardName->data), AccessShareLock);
-    PERF_LATENCY_END(kv_get_table_open);
+        bool found;
+        ShardHashInfo *entry = hash_search(kvmetaPerShard, &shardId, HASH_ENTER, &found);
+        if (!found) {
+            entry->shardId = shardId;
+            entry->info = NIL;
+        }
+        entry->info = lappend(entry->info, info);
+    }
 
-    PERF_LATENCY_BEGIN(kv_get_index_scan, op ? &op->indexScan : NULL);
-    SysScanDesc scanDesc = systable_beginscan(kvmetaRel,
-                                              GetRelationOidByName_FALCON(kvmetaIndexShardName->data),
-                                              true,
-                                              GetTransactionSnapshot(),
-                                              LAST_FALCON_KVMETA_TABLE_SCANKEY_TYPE,
-                                              scanKey);
-    TupleDesc tupleDesc = RelationGetDescr(kvmetaRel);
-    HeapTuple heapTuple = systable_getnext(scanDesc);
-    PERF_LATENCY_END(kv_get_index_scan);
-    if (!HeapTupleIsValid(heapTuple)) {
-        systable_endscan(scanDesc);
+    /* Step 2: Process each shard group */
+    HASH_SEQ_STATUS status;
+    ShardHashInfo *entry;
+    hash_seq_init(&status, kvmetaPerShard);
+    while ((entry = hash_seq_search(&status)) != NULL) {
+        StringInfo kvmetaShardName = GetKvmetaShardName(entry->shardId);
+        StringInfo kvmetaIndexShardName = GetKvmetaIndexShardName(entry->shardId);
+
+        Relation kvmetaRel = table_open(GetRelationOidByName_FALCON(kvmetaShardName->data), AccessShareLock);
+        Oid indexOid = GetRelationOidByName_FALCON(kvmetaIndexShardName->data);
+        TupleDesc tupleDesc = RelationGetDescr(kvmetaRel);
+        StatBroadcastKvList(entry->info, CKPT_HANDLER_START + 3);
+
+        ListCell *lc;
+        foreach(lc, entry->info) {
+            KvMetaProcessInfo info = (KvMetaProcessInfo)lfirst(lc);
+            if (info->errorCode != SUCCESS)
+                continue;
+            STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 4);
+
+            ScanKeyData scanKey[LAST_FALCON_KVMETA_TABLE_SCANKEY_TYPE];
+            scanKey[KVMETA_TABLE_USERKEY_EQ] = KvmetaTableScanKey[KVMETA_TABLE_USERKEY_EQ];
+            scanKey[KVMETA_TABLE_USERKEY_EQ].sk_argument = CStringGetTextDatum(info->userkey);
+
+            SysScanDesc scanDesc = systable_beginscan(kvmetaRel,
+                                                      indexOid,
+                                                      true,
+                                                      GetTransactionSnapshot(),
+                                                      LAST_FALCON_KVMETA_TABLE_SCANKEY_TYPE,
+                                                      scanKey);
+
+            HeapTuple heapTuple = systable_getnext(scanDesc);
+
+            if (!HeapTupleIsValid(heapTuple)) {
+                systable_endscan(scanDesc);
+                info->errorCode = ARGUMENT_ERROR;
+                STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 5);
+                STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 6);
+                continue;
+            }
+
+            bool isNull;
+            ArrayType *arr = NULL;
+            info->valuelen = DatumGetUInt32(heap_getattr(heapTuple, Anum_falcon_kvmeta_table_valuelen, tupleDesc, &isNull));
+            info->slicenum = DatumGetUInt16(heap_getattr(heapTuple, Anum_falcon_kvmeta_table_slicenum, tupleDesc, &isNull));
+
+            int ndim;
+            int nitems;
+            int16 typlen;
+            bool typbyval;
+            char typalign;
+            int *dims = NULL;
+            Datum *array = NULL;
+
+            info->valuekey = palloc(info->slicenum * sizeof(uint64_t));
+            info->location = palloc(info->slicenum * sizeof(uint64_t));
+            info->slicelen = palloc(info->slicenum * sizeof(uint32_t));
+
+            arr = DatumGetArrayTypeP(heap_getattr(heapTuple, Anum_falcon_kvmeta_table_valuekey, tupleDesc, &isNull));
+            get_typlenbyvalalign(ARR_ELEMTYPE(arr), &typlen, &typbyval, &typalign);
+            ndim = ARR_NDIM(arr);
+            dims = ARR_DIMS(arr);
+            nitems = ArrayGetNItems(ndim, dims);
+            deconstruct_array(arr, INT8OID, typlen, typbyval, typalign, &array, NULL, &nitems);
+            for (int j = 0; j < nitems; j++) {
+                info->valuekey[j] = DatumGetUInt64(array[j]);
+            }
+            if (array != NULL) {
+                pfree(array);
+                array = NULL;
+            }
+
+            arr = DatumGetArrayTypeP(heap_getattr(heapTuple, Anum_falcon_kvmeta_table_location, tupleDesc, &isNull));
+            get_typlenbyvalalign(ARR_ELEMTYPE(arr), &typlen, &typbyval, &typalign);
+            ndim = ARR_NDIM(arr);
+            dims = ARR_DIMS(arr);
+            nitems = ArrayGetNItems(ndim, dims);
+            deconstruct_array(arr, INT8OID, typlen, typbyval, typalign, &array, NULL, &nitems);
+            for (int j = 0; j < nitems; j++) {
+                info->location[j] = DatumGetUInt64(array[j]);
+            }
+            if (array != NULL) {
+                pfree(array);
+                array = NULL;
+            }
+
+            arr = DatumGetArrayTypeP(heap_getattr(heapTuple, Anum_falcon_kvmeta_table_slicelen, tupleDesc, &isNull));
+            get_typlenbyvalalign(ARR_ELEMTYPE(arr), &typlen, &typbyval, &typalign);
+            ndim = ARR_NDIM(arr);
+            dims = ARR_DIMS(arr);
+            nitems = ArrayGetNItems(ndim, dims);
+            deconstruct_array(arr, INT4OID, typlen, typbyval, typalign, &array, NULL, &nitems);
+            for (int j = 0; j < nitems; j++) {
+                info->slicelen[j] = DatumGetUInt32(array[j]);
+            }
+            if (array != NULL) {
+                pfree(array);
+                array = NULL;
+            }
+
+            systable_endscan(scanDesc);
+            STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 5);
+            STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 6);
+        }
         table_close(kvmetaRel, AccessShareLock);
-        FALCON_ELOG_ERROR(ARGUMENT_ERROR, "FalconKvmetaGetHandle has received invalid input.");
     }
-
-    bool isNull;
-    ArrayType *arr = NULL;
-    info->valuelen = DatumGetUInt32(heap_getattr(heapTuple, Anum_falcon_kvmeta_table_valuelen, tupleDesc, &isNull));
-    info->slicenum = DatumGetUInt16(heap_getattr(heapTuple, Anum_falcon_kvmeta_table_slicenum, tupleDesc, &isNull));
-
-    int ndim;
-    int nitems;
-    int16 typlen;
-    bool typbyval;
-    char typalign;
-    int* dims = NULL;
-    Datum *array = NULL;
-
-    info->valuekey = palloc(info->slicenum * sizeof(uint64_t));
-    info->location = palloc(info->slicenum * sizeof(uint64_t));
-    info->slicelen = palloc(info->slicenum * sizeof(uint32_t));
-
-    arr = DatumGetArrayTypeP(heap_getattr(heapTuple, Anum_falcon_kvmeta_table_valuekey, tupleDesc, &isNull));
-    get_typlenbyvalalign(ARR_ELEMTYPE(arr), &typlen, &typbyval, &typalign);
-    ndim = ARR_NDIM(arr);
-    dims = ARR_DIMS(arr);
-    nitems = ArrayGetNItems(ndim, dims);
-    deconstruct_array(arr, INT8OID, typlen, typbyval, typalign, &array, NULL, &nitems);
-    for (int i = 0; i < nitems; i++) {
-        info->valuekey[i] = DatumGetUInt64(array[i]);
-    }
-    if (array != NULL) {
-        pfree(array);
-        array = NULL;
-    }
-
-    arr = DatumGetArrayTypeP(heap_getattr(heapTuple, Anum_falcon_kvmeta_table_location, tupleDesc, &isNull));
-    get_typlenbyvalalign(ARR_ELEMTYPE(arr), &typlen, &typbyval, &typalign);
-    ndim = ARR_NDIM(arr);
-    dims = ARR_DIMS(arr);
-    nitems = ArrayGetNItems(ndim, dims);
-    deconstruct_array(arr, INT8OID, typlen, typbyval, typalign, &array, NULL, &nitems);
-    for (int i = 0; i < nitems; i++) {
-        info->location[i] = DatumGetUInt64(array[i]);
-    }
-    if (array != NULL) {
-        pfree(array);
-        array = NULL;
-    }
-
-    arr = DatumGetArrayTypeP(heap_getattr(heapTuple, Anum_falcon_kvmeta_table_slicelen, tupleDesc, &isNull));
-    get_typlenbyvalalign(ARR_ELEMTYPE(arr), &typlen, &typbyval, &typalign);
-    ndim = ARR_NDIM(arr);
-    dims = ARR_DIMS(arr);
-    nitems = ArrayGetNItems(ndim, dims);
-    deconstruct_array(arr, INT4OID, typlen, typbyval, typalign, &array, NULL, &nitems);
-    for (int i = 0; i < nitems; i++) {
-        info->slicelen[i] = DatumGetUInt32(array[i]);
-    }
-    if (array != NULL) {
-        pfree(array);
-        array = NULL;
-    }
-
-    systable_endscan(scanDesc);
-    PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
-    table_close(kvmetaRel, AccessShareLock);
-    PERF_LATENCY_END(table_close);
+    hash_destroy(kvmetaPerShard);
+    StatBroadcastKvArray(infoArray, count, CKPT_HANDLER_START + 7);
 }
 
-void FalconKvmetaDelHandle(KvMetaProcessInfo info)
+void FalconKvmetaDelHandle(KvMetaProcessInfo *infoArray, int count)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
-    OpcodeLatencyBreakdown *op = perf ? &perf->kvDelOp : NULL;
-    PERF_SCOPED_TIMER(kv_del_timer, op ? &op->total : NULL);
-
-    int shardId, workerId;
-    uint16_t partId = HashPartId(info->userkey);
-    SearchShardInfoByShardValue(partId, &shardId, &workerId);
-    if (workerId != GetLocalServerId())
-        CHECK_ERROR_CODE_WITH_RETURN(WRONG_WORKER);
-
     SetUpScanCaches();
 
-    ScanKeyData scanKey[LAST_FALCON_KVMETA_TABLE_SCANKEY_TYPE];
-    scanKey[KVMETA_TABLE_USERKEY_EQ] = KvmetaTableScanKey[KVMETA_TABLE_USERKEY_EQ];
-    scanKey[KVMETA_TABLE_USERKEY_EQ].sk_argument = CStringGetTextDatum(info->userkey);
+    HASHCTL hashInfo;
+    memset(&hashInfo, 0, sizeof(hashInfo));
+    hashInfo.keysize = sizeof(int32_t);
+    hashInfo.entrysize = sizeof(ShardHashInfo);
+    hashInfo.hcxt = CurrentMemoryContext;
+    int hashFlags = (HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+    HTAB *kvmetaPerShard = hash_create("KV Del Per Shard Hash Table", count, &hashInfo, hashFlags);
 
-    StringInfo kvmetaShardName = GetKvmetaShardName(shardId);
-    StringInfo kvmetaIndexShardName = GetKvmetaIndexShardName(shardId);
+    for (int i = 0; i < count; i++) {
+        KvMetaProcessInfo info = infoArray[i];
+        info->errorCode = SUCCESS;
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START);
+        int shardId, workerId;
+        uint16_t partId = HashPartId(info->userkey);
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 1);
+        SearchShardInfoByShardValue(partId, &shardId, &workerId);
+        if (workerId != GetLocalServerId()) {
+            info->errorCode = WRONG_WORKER;
+            continue;
+        }
+        STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 2);
 
-    PERF_LATENCY_BEGIN(kv_del_table_open, op ? &op->tableOpen : NULL);
-    Relation kvmetaRel = table_open(GetRelationOidByName_FALCON(kvmetaShardName->data), RowExclusiveLock);
-    PERF_LATENCY_END(kv_del_table_open);
-
-    PERF_LATENCY_BEGIN(kv_del_index_scan, op ? &op->indexScan : NULL);
-    SysScanDesc scanDesc = systable_beginscan(kvmetaRel,
-                                              GetRelationOidByName_FALCON(kvmetaIndexShardName->data),
-                                              true,
-                                              GetTransactionSnapshot(),
-                                              LAST_FALCON_KVMETA_TABLE_SCANKEY_TYPE,
-                                              scanKey);
-
-    HeapTuple heapTuple = systable_getnext(scanDesc);
-    PERF_LATENCY_END(kv_del_index_scan);
-    if (!HeapTupleIsValid(heapTuple)) {
-        systable_endscan(scanDesc);
-        table_close(kvmetaRel, RowExclusiveLock);
-        FALCON_ELOG_ERROR(ARGUMENT_ERROR, "FalconKvmetaDelHandle has received invalid input.");
+        bool found;
+        ShardHashInfo *entry = hash_search(kvmetaPerShard, &shardId, HASH_ENTER, &found);
+        if (!found) {
+            entry->shardId = shardId;
+            entry->info = NIL;
+        }
+        entry->info = lappend(entry->info, info);
     }
 
-    PERF_LATENCY_BEGIN(table_delete, op ? &op->tableModify : NULL);
-    CatalogTupleDelete(kvmetaRel, &heapTuple->t_self);
-    PERF_LATENCY_END(table_delete);
+    /* Step 2: Process each shard group */
+    HASH_SEQ_STATUS status;
+    ShardHashInfo *entry;
+    hash_seq_init(&status, kvmetaPerShard);
+    while ((entry = hash_seq_search(&status)) != NULL) {
+        StringInfo kvmetaShardName = GetKvmetaShardName(entry->shardId);
+        StringInfo kvmetaIndexShardName = GetKvmetaIndexShardName(entry->shardId);
 
-    systable_endscan(scanDesc);
-    PERF_LATENCY_BEGIN(table_close, op ? &op->tableClose : NULL);
-    table_close(kvmetaRel, RowExclusiveLock);
-    PERF_LATENCY_END(table_close);
+        Relation kvmetaRel = table_open(GetRelationOidByName_FALCON(kvmetaShardName->data), RowExclusiveLock);
+        Oid indexOid = GetRelationOidByName_FALCON(kvmetaIndexShardName->data);
+        StatBroadcastKvList(entry->info, CKPT_HANDLER_START + 3);
+
+        ListCell *lc;
+        foreach(lc, entry->info) {
+            KvMetaProcessInfo info = (KvMetaProcessInfo)lfirst(lc);
+            if (info->errorCode != SUCCESS)
+                continue;
+            STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 4);
+
+            ScanKeyData scanKey[LAST_FALCON_KVMETA_TABLE_SCANKEY_TYPE];
+            scanKey[KVMETA_TABLE_USERKEY_EQ] = KvmetaTableScanKey[KVMETA_TABLE_USERKEY_EQ];
+            scanKey[KVMETA_TABLE_USERKEY_EQ].sk_argument = CStringGetTextDatum(info->userkey);
+
+            SysScanDesc scanDesc = systable_beginscan(kvmetaRel,
+                                                      indexOid,
+                                                      true,
+                                                      GetTransactionSnapshot(),
+                                                      LAST_FALCON_KVMETA_TABLE_SCANKEY_TYPE,
+                                                      scanKey);
+
+            HeapTuple heapTuple = systable_getnext(scanDesc);
+
+            if (!HeapTupleIsValid(heapTuple)) {
+                systable_endscan(scanDesc);
+                info->errorCode = ARGUMENT_ERROR;
+                STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 5);
+                STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 6);
+                continue;
+            }
+            STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 5);
+
+            CatalogTupleDelete(kvmetaRel, &heapTuple->t_self);
+            STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 6);
+
+            systable_endscan(scanDesc);
+        }
+
+        table_close(kvmetaRel, RowExclusiveLock);
+    }
+
+    hash_destroy(kvmetaPerShard);
+    StatBroadcastKvArray(infoArray, count, CKPT_HANDLER_START + 7);
 }
 
 void FalconFetchSliceIdHandle(SliceIdProcessInfo info)
 {
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START);
+
     SetUpScanCaches();
 
     ScanKeyData scanKey[LAST_FALCON_SLICEID_TABLE_SCANKEY_TYPE];
@@ -2651,8 +3031,13 @@ void FalconFetchSliceIdHandle(SliceIdProcessInfo info)
     scanKey[SLICEID_TABLE_SLICEID_EQ].sk_argument = CStringGetTextDatum("slice_id");
 
     Oid relationId = info->type == 0 ? KvSliceIdRelationId() : FileSliceIdRelationId();
-    Relation sliceIdRel = table_open(relationId, RowExclusiveLock);
-    SysScanDesc scanDesc = systable_beginscan(sliceIdRel, InvalidOid, true, GetTransactionSnapshot(),
+    /*
+     * FETCH_SLICE_ID updates a single global counter row. Use a transaction-
+     * scoped table lock so "scan old value -> update/insert -> commit" is
+     * serialized across backends.
+     */
+    Relation sliceIdRel = table_open(relationId, AccessExclusiveLock);
+    SysScanDesc scanDesc = systable_beginscan(sliceIdRel, InvalidOid, true, SnapshotSelf,
                                               LAST_FALCON_SLICEID_TABLE_SCANKEY_TYPE, scanKey);
     TupleDesc tupleDesc = RelationGetDescr(sliceIdRel);
     HeapTuple heapTuple = systable_getnext(scanDesc);
@@ -2664,6 +3049,7 @@ void FalconFetchSliceIdHandle(SliceIdProcessInfo info)
     memset(isNulls, false, sizeof(isNulls));
     memset(updates, 0, sizeof(updates));
 
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 1);
     if (HeapTupleIsValid(heapTuple)) {
         bool isNull;
         info->start = DatumGetUInt64(heap_getattr(heapTuple, Anum_falcon_sliceid_table_sliceid, tupleDesc, &isNull));
@@ -2689,7 +3075,13 @@ void FalconFetchSliceIdHandle(SliceIdProcessInfo info)
         heap_freetuple(heapTuple);
     }
 
-    table_close(sliceIdRel, RowExclusiveLock);
+    /*
+     * Keep the relation lock until transaction end so other backends cannot
+     * observe and update the old counter row before this transaction commits.
+     */
+    table_close(sliceIdRel, NoLock);
 
     info->errorCode = SUCCESS;
+
+    STAT_CKPT(info->statArrayIndex, CKPT_HANDLER_START + 2);
 }

@@ -11,6 +11,21 @@ License:        Apache-2.0
 URL:            https://gitee.com/openeuler/FalconFS.git
 Source0:        falconfs-%{version}.tar.gz
 
+# Runtime third-party shared libraries (zookeeper/brpc/etc.) are prepared
+# out-of-band under /usr/local for this package flow.
+# Disable RPM automatic ELF dependency/provides generation to avoid forcing
+# repository-provided soname packages that may not exist on openEuler.
+# AutoReqProv:    no
+
+Requires:       bash
+Requires:       sudo
+Requires:       findutils
+Requires:       glibc-all-langpacks
+Requires:       python3
+Requires:       python3-requests python3-psycopg2 python3-kazoo
+Requires:       postgresql-17 postgresql-17-server
+Requires:       brpc zookeeper-client-c
+
 BuildRequires:  bash gcc gcc-c++ make
 BuildRequires:  cmake ninja-build
 BuildRequires:  autoconf automake libtool
@@ -34,7 +49,9 @@ BuildRequires:  gtest-devel gmock-devel
 BuildRequires:  python3-devel
 BuildRequires:  maven java-11-openjdk-devel
 BuildRequires:  wget tar rsync
-BuildRequires:  libstdc++-static libpq-devel zstd-devel
+BuildRequires:  libstdc++-static zstd-devel
+BuildRequires:  brpc-devel zookeeper-client-c-devel
+BuildRequires:  postgresql-17-server-devel
 BuildRequires:  perl
 BuildRequires:  chrpath
 BuildRequires:  python3-requests python3-psycopg2 python3-kazoo
@@ -49,29 +66,47 @@ It integrates seamlessly with cloud environments.
 
 %prep
 %if 0%{?release_pkg}
-%setup -q -n falconfs-%{version}
+%setup -c falconfs-%{version}
 %else
-%setup -q
+%setup -c
 %endif
 
 %build
 set -euo pipefail
-export PATH=/usr/local/pgsql/bin:$PATH
 export STAGE_ROOT="%{_builddir}/falconfs-stage"
 export FALCONFS_INSTALL_DIR="${STAGE_ROOT}/usr/local/falconfs"
 mkdir -p "${STAGE_ROOT}"
 echo "Using pg_config: $(command -v pg_config)"
 pg_config --pgxs
-./build.sh build falcon
+%if 0%{?release_pkg}
+./build.sh build falcon --comm-plugin=brpc --no-tests
+./build.sh build falcon --comm-plugin=hcom --no-tests
+%else
+./build.sh build falcon --comm-plugin=brpc --no-tests --with-private-test
+./build.sh build falcon --comm-plugin=hcom --no-tests --with-private-test
+%endif
+
+test -f ./falcon/libbrpcplugin.so
+test -f ./falcon/libhcomplugin.so
 
 %install
 set -euo pipefail
-export PATH=/usr/local/pgsql/bin:$PATH
 export STAGE_ROOT="%{_builddir}/falconfs-stage"
 export FALCONFS_INSTALL_DIR="${STAGE_ROOT}/usr/local/falconfs"
 rm -rf "%{buildroot}" "${STAGE_ROOT}"
 mkdir -p "${STAGE_ROOT}"
-./build.sh install falcon
+%if 0%{?release_pkg}
+./build.sh install falcon --comm-plugin=brpc --no-tests
+%else
+./build.sh install falcon --comm-plugin=brpc --no-tests --with-private-test
+%endif
+
+# Keep both communication plugins in RPM so runtime can switch via config.
+install -m 0755 -D ./falcon/libhcomplugin.so \
+    "${STAGE_ROOT}/usr/local/falconfs/falcon_meta/lib/postgresql/libhcomplugin.so"
+
+test -f "${STAGE_ROOT}/usr/local/falconfs/falcon_meta/lib/postgresql/libbrpcplugin.so"
+test -f "${STAGE_ROOT}/usr/local/falconfs/falcon_meta/lib/postgresql/libhcomplugin.so"
 mkdir -p "%{buildroot}"
 cp -a "${STAGE_ROOT}/"* "%{buildroot}/"
 %if 0%{?release_pkg}
@@ -82,34 +117,10 @@ rm -rf "%{buildroot}/usr/local/falconfs/falcon_regress"
 rm -rf "%{buildroot}/usr/local/falconfs/falcon_store"
 rm -rf "%{buildroot}/usr/local/falconfs/private-directory-test"
 %endif
-mkdir -p "%{buildroot}/usr/local/obs"
-if [ -d "/usr/local/obs" ]; then
-    mkdir -p "%{buildroot}/usr/local"
-    cp -a "/usr/local/obs" "%{buildroot}/usr/local/"
-fi
-
-# Remove copied system runtime libraries from private FalconFS lib dirs.
-# Keep only private/non-system dependencies bundled by FalconFS.
-for lib_dir in \
-    "%{buildroot}/usr/local/falconfs/falcon_meta/lib" \
-    "%{buildroot}/usr/local/falconfs/falcon_client/lib" \
-    "%{buildroot}/usr/local/falconfs/private-directory-test/lib"; do
-    if [ -d "${lib_dir}" ]; then
-        find "${lib_dir}" -maxdepth 1 \
-            \( -name 'libc.so*' -o -name 'libm.so*' -o -name 'libpthread.so*' -o \
-               -name 'libdl.so*' -o -name 'librt.so*' -o -name 'libresolv.so*' -o \
-               -name 'libcrypt.so*' -o -name 'ld-linux*.so*' \) \
-            -print -delete
-    fi
-done
-
 mkdir -p "%{buildroot}%{_sysconfdir}/profile.d"
 cat > "%{buildroot}%{_sysconfdir}/profile.d/falconfs.sh" <<'EOF'
 export FALCONFS_INSTALL_DIR=/usr/local/falconfs
-export PATH=/usr/local/pgsql/bin:/usr/local/falconfs/falcon_client/bin:$PATH
-export LD_LIBRARY_PATH=/usr/local/falconfs/falcon_meta/lib:/usr/local/falconfs/falcon_client/lib:/usr/local/obs/lib:$LD_LIBRARY_PATH
-export FALCONFS_WORKSPACE=/var/lib/falconfs
-export PGUSER=falconMeta
+export PATH=/usr/local/falconfs/falcon_client/bin:$PATH
 EOF
 
 # Strip non-standard RPATH/RUNPATH to satisfy rpmbuild checks
@@ -122,8 +133,10 @@ getent passwd falconMeta >/dev/null || \
 exit 0
 
 %post
-/usr/bin/mkdir -p /var/lib/falconfs/data || true
-/usr/bin/chown -R falconMeta:falconMeta /var/lib/falconfs/data || true
+%if 0%{?release_pkg}
+/usr/bin/mkdir -p /usr/local/falconfs/data || true
+/usr/bin/chown -R falconMeta:falconMeta /usr/local/falconfs/data || true
+%endif
 /usr/sbin/usermod -d /home/falconMeta falconMeta || true
 /usr/bin/mkdir -p /home/falconMeta || true
 /usr/bin/chown -R falconMeta:falconMeta /home/falconMeta || true
@@ -141,5 +154,4 @@ exit 0
 %else
 /usr/local/falconfs/
 %endif
-/usr/local/obs/
 %{_sysconfdir}/profile.d/falconfs.sh

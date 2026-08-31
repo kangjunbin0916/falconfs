@@ -20,7 +20,7 @@
 #include "connection_pool/falcon_worker_task.h"
 #include "connection_pool/pg_connection.h"
 #include "connection_pool/falcon_concurrent_queue.h"
-#include "perf_counter/perf_stat.h"
+#include "perf_counter/falcon_per_request_stat.h"
 
 class PGConnectionPool {
   private:
@@ -169,9 +169,8 @@ int PGConnectionPool::BatchDequeueExec(int toDequeue, int queueIndex)
         return 0;
     }
 
-    /* Report inQueueLatency and restart timer for connWait measurement */
     for (auto &job : jobList) {
-        job->stageTimer.EndAndRestart(GetInQueueLatencyData());
+        STAT_CKPT(job->statArrayIndex, CKPT_DEQUEUE);
     }
 
     auto workerTaskPtr = std::make_shared<BatchWorkerTask>(GetFalconConnectionPoolShmemAllocator(), jobList);
@@ -181,9 +180,8 @@ int PGConnectionPool::BatchDequeueExec(int toDequeue, int queueIndex)
 
     PGConnection *conn = GetPGConnection(); // get idle connection, may block
 
-    /* Report connWaitLatency and restart timer for workerWait measurement */
     for (auto &job : jobList) {
-        job->stageTimer.EndAndRestart(GetConnWaitLatencyData());
+        STAT_CKPT(job->statArrayIndex, CKPT_CONN_ACQUIRED);
     }
 
     conn->Exec(workerTaskPtr);
@@ -205,9 +203,8 @@ int PGConnectionPool::SingleDequeueExec(int toDequeue)
         return 0;
     }
 
-    /* Report inQueueLatency and restart timer for connWait measurement */
     for (auto &job : singleJobList) {
-        job->stageTimer.EndAndRestart(GetInQueueLatencyData());
+        STAT_CKPT(job->statArrayIndex, CKPT_DEQUEUE);
     }
 
     for (auto &job : singleJobList) {
@@ -217,8 +214,7 @@ int PGConnectionPool::SingleDequeueExec(int toDequeue)
         }
         PGConnection *conn = GetPGConnection(); // get idle connection, may block
 
-        /* Report connWaitLatency and restart timer for workerWait measurement */
-        job->stageTimer.EndAndRestart(GetConnWaitLatencyData());
+        STAT_CKPT(job->statArrayIndex, CKPT_CONN_ACQUIRED);
 
         conn->Exec(workerTaskPtr);
     }
@@ -285,15 +281,14 @@ void PGConnectionPool::DispatchMetaServiceJob(BaseMetaServiceJob *job)
 
     job->opcodeForE2E = falconSupportType;
 
-    job->e2eTimer.Start();
-
-    /* Start latency timer for inQueue measurement */
-    job->stageTimer.Start();
+    job->statArrayIndex = PerRequestStatAllocIndex();
+    STAT_CKPT(job->statArrayIndex, CKPT_DISPATCH);
 
     while (!supportBatchTaskList[(int)FalconBatchServiceType].jobList.enqueue(job)) {
         std::cout << "DispatchMetaServiceJob: enqueue failed, type = " << (int)FalconBatchServiceType << std::endl;
         std::this_thread::yield();
     }
+    STAT_CKPT(job->statArrayIndex, CKPT_ENQUEUE);
 }
 
 void PGConnectionPool::EnqueueKVCacheJob(BaseKVCacheServiceJob *job)
