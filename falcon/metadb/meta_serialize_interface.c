@@ -10,16 +10,19 @@
 
 #include <unistd.h>
 #include "metadb/meta_serialize_interface_helper.h"
-#include "perf_counter/perf_macros.h"
+#include "perf_counter/falcon_per_request_stat.h"
 #include "utils/error_log.h"
 #include "utils/falcon_shmem_allocator.h"
+#include "utils/snapmgr.h"
+
+static int32_t *g_currentStatIndices = NULL;
+static int32_t g_currentStatIndicesCount = 0;
 
 PG_FUNCTION_INFO_V1(falcon_meta_call_by_serialized_shmem_internal);
 PG_FUNCTION_INFO_V1(falcon_meta_call_by_serialized_data);
 
 static SerializedData FileMetaProcess(FalconSupportMetaService metaService, int count, char *paramBuffer)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
 
     if (count != 1 && !(metaService == MKDIR || metaService == MKDIR_SUB_MKDIR || metaService == MKDIR_SUB_CREATE ||
                         metaService == CREATE || metaService == STAT || metaService == OPEN || metaService == CLOSE ||
@@ -34,12 +37,16 @@ static SerializedData FileMetaProcess(FalconSupportMetaService metaService, int 
     void *data = palloc((sizeof(MetaProcessInfoData) + sizeof(MetaProcessInfoData *)) * count);
     MetaProcessInfoData *infoDataArray = data;
     MetaProcessInfo *infoArray = (MetaProcessInfo *)(infoDataArray + count);
-    PERF_LATENCY_BEGIN(param_decode, perf ? &perf->paramDecodeLatency : NULL);
     if (!SerializedDataMetaParamDecode(metaService, count, &param, infoDataArray))
         FALCON_ELOG_ERROR(ARGUMENT_ERROR, "serialized param is corrupt.");
-    PERF_LATENCY_END(param_decode);
-    for (int i = 0; i < count; i++)
+    for (int i = 0; i < count; i++) {
         infoArray[i] = infoDataArray + i;
+        infoDataArray[i].statArrayIndex = -1;
+    }
+    for (int i = 0; i < count && i < g_currentStatIndicesCount; i++) {
+        infoArray[i]->statArrayIndex = g_currentStatIndices[i];
+        STAT_CKPT(g_currentStatIndices[i], CKPT_PARAM_DECODE);
+    }
 
     switch (metaService) {
     case MKDIR:
@@ -105,37 +112,47 @@ static SerializedData FileMetaProcess(FalconSupportMetaService metaService, int 
 
     SerializedData response;
     SerializedDataInit(&response, NULL, 0, 0, &PgMemoryManager);
-    PERF_LATENCY_BEGIN(response_encode, perf ? &perf->responseEncodeLatency : NULL);
     if (!SerializedDataMetaResponseEncodeWithPerProcessFlatBufferBuilder(metaService, count, infoDataArray, &response))
         FALCON_ELOG_ERROR(ARGUMENT_ERROR, "failed when serializing response.");
-    PERF_LATENCY_END(response_encode);
+    for (int i = 0; i < count && i < g_currentStatIndicesCount; i++) {
+        int32_t si = g_currentStatIndices[i];
+        if (si >= 0 && g_FalconPerRequestStatShmem != NULL)
+            StatCheckpoint(si, g_FalconPerRequestStatShmem->statArray[si].checkpointCount);
+    }
 
     return response;
 }
 
-static SerializedData KVMetaProcess(FalconSupportMetaService metaService, char *paramBuffer)
+static SerializedData KVMetaProcess(FalconSupportMetaService metaService, int count, char *paramBuffer)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
     SerializedData param;
 
     if (!SerializedDataInit(&param, paramBuffer, SD_SIZE_T_MAX, SD_SIZE_T_MAX, NULL))
         FALCON_ELOG_ERROR(ARGUMENT_ERROR, "SerializedDataInit failed.");
-    
-    KvMetaProcessInfoData infoData = {0};
-    PERF_LATENCY_BEGIN(param_decode, perf ? &perf->paramDecodeLatency : NULL);
-    if (!SerializedKvMetaParamDecode(metaService, &param, &infoData))
+
+    void *data = palloc((sizeof(KvMetaProcessInfoData) + sizeof(KvMetaProcessInfo)) * count);
+    KvMetaProcessInfoData *infoDataArray = data;
+    KvMetaProcessInfo *infoArray = (KvMetaProcessInfo *)(infoDataArray + count);
+    if (!SerializedKvMetaParamDecode(metaService, count, &param, infoDataArray))
         FALCON_ELOG_ERROR(ARGUMENT_ERROR, "serialized param is corrupt.");
-    PERF_LATENCY_END(param_decode);
+    for (int i = 0; i < count; i++) {
+        infoArray[i] = infoDataArray + i;
+        infoDataArray[i].statArrayIndex = -1;
+    }
+    for (int i = 0; i < count && i < g_currentStatIndicesCount; i++) {
+        infoArray[i]->statArrayIndex = g_currentStatIndices[i];
+        STAT_CKPT(g_currentStatIndices[i], CKPT_PARAM_DECODE);
+    }
 
     switch (metaService) {
         case KV_PUT:
-            FalconKvmetaPutHandle(&infoData);
+            FalconKvmetaPutHandle(infoArray, count);
             break;
         case KV_GET:
-            FalconKvmetaGetHandle(&infoData);
+            FalconKvmetaGetHandle(infoArray, count);
             break;
         case KV_DEL:
-            FalconKvmetaDelHandle(&infoData);
+            FalconKvmetaDelHandle(infoArray, count);
             break;
         default:
             FALCON_ELOG_ERROR_EXTENDED(ARGUMENT_ERROR, "unexpected metaService: %d", metaService);
@@ -143,17 +160,19 @@ static SerializedData KVMetaProcess(FalconSupportMetaService metaService, char *
 
     SerializedData response;
     SerializedDataInit(&response, NULL, 0, 0, &PgMemoryManager);
-    PERF_LATENCY_BEGIN(response_encode, perf ? &perf->responseEncodeLatency : NULL);
-    if (!SerializedKvMetaResponseEncodeWithPerProcessFlatBufferBuilder(metaService, &infoData, &response))
+    if (!SerializedKvMetaResponseEncodeWithPerProcessFlatBufferBuilder(metaService, count, infoDataArray, &response))
         FALCON_ELOG_ERROR(ARGUMENT_ERROR, "failed when serializing response.");
-    PERF_LATENCY_END(response_encode);
+    for (int i = 0; i < count && i < g_currentStatIndicesCount; i++) {
+        int32_t si = g_currentStatIndices[i];
+        if (si >= 0 && g_FalconPerRequestStatShmem != NULL)
+            StatCheckpoint(si, g_FalconPerRequestStatShmem->statArray[si].checkpointCount);
+    }
 
     return response;
 }
 
 static SerializedData SliceMetaProcess(FalconSupportMetaService metaService, int count, char *paramBuffer)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
     SerializedData param;
 
     if (!SerializedDataInit(&param, paramBuffer, SD_SIZE_T_MAX, SD_SIZE_T_MAX, NULL))
@@ -162,13 +181,16 @@ static SerializedData SliceMetaProcess(FalconSupportMetaService metaService, int
     void *data = palloc((sizeof(SliceProcessInfoData) + sizeof(SliceProcessInfo)) * count);
     SliceProcessInfoData *infoDataArray = data;
     SliceProcessInfo *infoArray = (SliceProcessInfo *)(infoDataArray + count);
-    PERF_LATENCY_BEGIN(param_decode, perf ? &perf->paramDecodeLatency : NULL);
     if (!SerializedSliceParamDecode(metaService, count, &param, infoDataArray))
         FALCON_ELOG_ERROR(ARGUMENT_ERROR, "serialized param is corrupt.");
-    PERF_LATENCY_END(param_decode);
 
     for (int i = 0; i < count; i++) {
         infoArray[i] = infoDataArray + i;
+        infoDataArray[i].statArrayIndex = -1;
+    }
+    for (int i = 0; i < count && i < g_currentStatIndicesCount; i++) {
+        infoArray[i]->statArrayIndex = g_currentStatIndices[i];
+        STAT_CKPT(g_currentStatIndices[i], CKPT_PARAM_DECODE);
     }
 
     switch (metaService) {
@@ -187,36 +209,42 @@ static SerializedData SliceMetaProcess(FalconSupportMetaService metaService, int
 
     SerializedData response;
     SerializedDataInit(&response, NULL, 0, 0, &PgMemoryManager);
-    PERF_LATENCY_BEGIN(response_encode, perf ? &perf->responseEncodeLatency : NULL);
     if (!SerializedSliceResponseEncodeWithPerProcessFlatBufferBuilder(metaService, count, infoDataArray, &response))
         FALCON_ELOG_ERROR(ARGUMENT_ERROR, "failed when serializing response.");
-    PERF_LATENCY_END(response_encode);
+    for (int i = 0; i < count && i < g_currentStatIndicesCount; i++) {
+        int32_t si = g_currentStatIndices[i];
+        if (si >= 0 && g_FalconPerRequestStatShmem != NULL)
+            StatCheckpoint(si, g_FalconPerRequestStatShmem->statArray[si].checkpointCount);
+    }
 
     return response;
 }
 
 static SerializedData SliceIdProcess(char *paramBuffer)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
     SerializedData param;
 
     if (!SerializedDataInit(&param, paramBuffer, SD_SIZE_T_MAX, SD_SIZE_T_MAX, NULL))
         FALCON_ELOG_ERROR(ARGUMENT_ERROR, "SerializedDataInit failed.");
     
     SliceIdProcessInfoData infoData = {0};
-    PERF_LATENCY_BEGIN(param_decode, perf ? &perf->paramDecodeLatency : NULL);
+    infoData.statArrayIndex = -1;
     if (!SerializedSliceIdParamDecode(&param, &infoData))
         FALCON_ELOG_ERROR(ARGUMENT_ERROR, "serialized param is corrupt.");
-    PERF_LATENCY_END(param_decode);
+    if (g_currentStatIndicesCount > 0 && g_currentStatIndices != NULL) {
+        infoData.statArrayIndex = g_currentStatIndices[0];
+        STAT_CKPT(g_currentStatIndices[0], CKPT_PARAM_DECODE);
+    }
 
     FalconFetchSliceIdHandle(&infoData);
 
     SerializedData response;
     SerializedDataInit(&response, NULL, 0, 0, &PgMemoryManager);
-    PERF_LATENCY_BEGIN(response_encode, perf ? &perf->responseEncodeLatency : NULL);
     if (!SerializedSliceIdResponseEncodeWithPerProcessFlatBufferBuilder(&infoData, &response))
         FALCON_ELOG_ERROR(ARGUMENT_ERROR, "failed when serializing response.");
-    PERF_LATENCY_END(response_encode);
+    if (infoData.statArrayIndex >= 0 && g_FalconPerRequestStatShmem != NULL)
+        StatCheckpoint(infoData.statArrayIndex,
+                       g_FalconPerRequestStatShmem->statArray[infoData.statArrayIndex].checkpointCount);
 
     return response;
 }
@@ -228,7 +256,7 @@ static SerializedData MetaProcess(FalconSupportMetaService metaService, int coun
     }
 
     if (metaService >= KV_PUT && metaService <= KV_DEL) {
-        return KVMetaProcess(metaService, paramBuffer);
+        return KVMetaProcess(metaService, count, paramBuffer);
     }
 
     if (metaService >= SLICE_PUT && metaService <= SLICE_DEL) {
@@ -246,11 +274,11 @@ static SerializedData MetaProcess(FalconSupportMetaService metaService, int coun
 
 Datum falcon_meta_call_by_serialized_shmem_internal(PG_FUNCTION_ARGS)
 {
-    FalconPerfLatencyShmem *perf = g_FalconPerfLatencyShmem;
     int32_t type = PG_GETARG_INT32(0);
     int32_t count = PG_GETARG_INT32(1);
     uint64_t paramShmemShift = (uint64_t)PG_GETARG_INT64(2);
     int64_t signature = PG_GETARG_INT64(3);
+    uint64_t statIndicesShift = (uint64_t)PG_GETARG_INT64(4);
 
     // set type to FalconMetaServiceType from the send end.
     FalconMetaServiceType metaService = (FalconMetaServiceType)type;
@@ -259,16 +287,40 @@ Datum falcon_meta_call_by_serialized_shmem_internal(PG_FUNCTION_ARGS)
         FALCON_ELOG_ERROR(ARGUMENT_ERROR, "paramShmemShift is invalid.");
     char *paramBuffer = FALCON_SHMEM_ALLOCATOR_GET_POINTER(allocator, paramShmemShift);
 
-    SerializedData response = MetaProcess(metaService, count, paramBuffer);
+    PushActiveSnapshot(GetTransactionSnapshot());
+    if (statIndicesShift != 0 && statIndicesShift < allocator->pageCount * FALCON_SHMEM_ALLOCATOR_PAGE_SIZE) {
+        g_currentStatIndices = (int32_t *)FALCON_SHMEM_ALLOCATOR_GET_POINTER(allocator, statIndicesShift);
+        g_currentStatIndicesCount = count;
+    } else {
+        g_currentStatIndices = NULL;
+        g_currentStatIndicesCount = 0;
+    }
 
-    PERF_LATENCY_BEGIN(shmem_alloc, perf ? &perf->shmemAllocLatency : NULL);
+    for (int32_t si = 0; si < g_currentStatIndicesCount; si++) {
+        STAT_CKPT(g_currentStatIndices[si], CKPT_PG_ENTRY);
+    }
+
+    int32_t *savedStatIndices = g_currentStatIndices;
+    int32_t savedStatIndicesCount = g_currentStatIndicesCount;
+
+    SerializedData response = MetaProcess(metaService, count, paramBuffer);
+    
+    PopActiveSnapshot();
+    
+    g_currentStatIndices = NULL;
+    g_currentStatIndicesCount = 0;
+    
     uint64_t responseShmemShift = FalconShmemAllocatorMalloc(allocator, response.size);
     if (responseShmemShift == 0)
         FALCON_ELOG_ERROR_EXTENDED(PROGRAM_ERROR, "FalconShmemAllocMalloc failed. Size: %u.", response.size);
+    for (int32_t si = 0; si < savedStatIndicesCount; si++) {
+        int32_t idx = savedStatIndices[si];
+        if (idx >= 0 && g_FalconPerRequestStatShmem != NULL)
+            StatCheckpoint(idx, g_FalconPerRequestStatShmem->statArray[idx].checkpointCount);
+    }
     char *responseBuffer = FALCON_SHMEM_ALLOCATOR_GET_POINTER(allocator, responseShmemShift);
     FALCON_SHMEM_ALLOCATOR_SET_SIGNATURE(responseBuffer, signature);
     memcpy(responseBuffer, response.buffer, response.size);
-    PERF_LATENCY_END(shmem_alloc);
 
     PG_RETURN_INT64(responseShmemShift);
 }
@@ -282,7 +334,13 @@ Datum falcon_meta_call_by_serialized_data(PG_FUNCTION_ARGS)
     FalconMetaServiceType metaService = (FalconMetaServiceType)type;
     char *paramBuffer = VARDATA_ANY(param);
 
+    PushActiveSnapshot(GetTransactionSnapshot());
+    /* This path has no stat indices — ensure MetaProcess sees clean state */
+    g_currentStatIndices = NULL;
+    g_currentStatIndicesCount = 0;
+
     SerializedData response = MetaProcess(metaService, count, paramBuffer);
+    PopActiveSnapshot();
 
     bytea *reply = (bytea *)palloc(VARHDRSZ + response.size);
     memcpy(VARDATA_4B(reply), response.buffer, response.size);

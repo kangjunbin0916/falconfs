@@ -16,6 +16,7 @@
 #include "hcom_comm_adapter/falcon_meta_service.h"
 #include "plugin/falcon_plugin_framework.h"
 #include "plugin/falcon_plugin_loader.h"
+#include "remote_connection_utils/error_code_def.h"
 
 using namespace falcon::meta_service;
 
@@ -32,6 +33,13 @@ static int g_test_failed = 0;
 static int g_test_skipped = 0;
 static bool g_is_cn_node = false;
 static std::atomic<int> g_loop_iteration(0);  // 循环计数器，用于生成唯一标识
+
+static uint64_t ConvertUnixSecondsToPgTimestamp(uint64_t unix_seconds)
+{
+    const uint64_t seconds_diff_between_pg_and_unix = 946684800;
+    const uint64_t usecs_per_sec = 1000000;
+    return (unix_seconds - seconds_diff_between_pg_and_unix) * usecs_per_sec;
+}
 
 struct SyncContext
 {
@@ -870,12 +878,21 @@ static bool TestAttributeOperations()
     TEST_ASSERT(status == 0, "CREATE failed");
     printf("  Created test file: %s\n", file_path.c_str());
 
-    // 2. UTIMENS - 修改时间
-    uint64_t new_atime = 1609459200000000000ULL; // 2021-01-01 00:00:00 UTC in nanoseconds
-    uint64_t new_mtime = 1640995200000000000ULL; // 2022-01-01 00:00:00 UTC in nanoseconds
+    // 2. UTIMENS - 修改时间。元数据层使用 PostgreSQL TimestampTz: 自 2000-01-01 起的微秒。
+    uint64_t new_atime = ConvertUnixSecondsToPgTimestamp(1779073800ULL); // 2026-05-18 11:10:00 CST
+    uint64_t new_mtime = ConvertUnixSecondsToPgTimestamp(1779073860ULL); // 2026-05-18 11:11:00 CST
     status = DoUtimens(file_path, new_atime, new_mtime);
     TEST_ASSERT(status == 0, "UTIMENS failed");
     printf("  UTIMENS succeeded\n");
+
+    StatResponse stat_resp;
+    status = DoStat(file_path, &stat_resp);
+    TEST_ASSERT(status == 0, "STAT after UTIMENS failed");
+    TEST_ASSERT_MSG(
+        stat_resp.st_atim == new_atime, "UTIMENS atime mismatch: expected %lu, got %lu", new_atime, stat_resp.st_atim);
+    TEST_ASSERT_MSG(
+        stat_resp.st_mtim == new_mtime, "UTIMENS mtime mismatch: expected %lu, got %lu", new_mtime, stat_resp.st_mtim);
+    printf("  UTIMENS timestamp verified: atime=%lu, mtime=%lu\n", stat_resp.st_atim, stat_resp.st_mtim);
 
     // 3. CHMOD - 修改权限
     uint64_t new_mode = 0755;
@@ -1886,6 +1903,85 @@ static bool TestConcurrentFileCreation()
     TEST_PASS("Concurrent File Creation");
 }
 
+static bool TestConcurrentSameFileCreation()
+{
+    SKIP_IF_NOT_WORKER("Concurrent Same File Creation");
+    TEST_BEGIN("Concurrent Same File Creation");
+
+    const int THREAD_COUNT = 8;
+    const int ROUND_COUNT = 50;
+    std::atomic<int> round_pass(0);
+    std::atomic<int> round_fail(0);
+
+    for (int round = 0; round < ROUND_COUNT; round++) {
+        std::string file_path = std::string("/concurrent_same_file_") +
+                                std::to_string(g_loop_iteration.load()) +
+                                "_r" + std::to_string(round) + ".txt";
+
+        std::atomic<int> success_count(0);
+        std::atomic<int> exist_count(0);
+        std::atomic<int> error_count(0);
+
+        std::mutex barrier_mtx;
+        std::condition_variable barrier_cv;
+        int ready_count = 0;
+
+        auto create_worker = [&](int thread_id) {
+            {
+                std::unique_lock<std::mutex> lock(barrier_mtx);
+                ready_count++;
+                if (ready_count == THREAD_COUNT) {
+                    barrier_cv.notify_all();
+                } else {
+                    barrier_cv.wait(lock, [&] { return ready_count == THREAD_COUNT; });
+                }
+            }
+
+            CreateResponse create_resp;
+            int status = DoCreate(file_path, &create_resp);
+            if (status == 0) {
+                success_count++;
+            } else if (status == FILE_EXISTS) {
+                exist_count++;
+            } else {
+                error_count++;
+                printf("  [Round %d][Thread %d] Unexpected error: status=%d\n",
+                       round, thread_id, status);
+            }
+        };
+
+        std::vector<std::thread> threads;
+        for (int i = 0; i < THREAD_COUNT; i++) {
+            threads.emplace_back(create_worker, i);
+        }
+        for (auto &t : threads) {
+            t.join();
+        }
+
+        if (success_count.load() == 1 &&
+            exist_count.load() == THREAD_COUNT - 1 &&
+            error_count.load() == 0) {
+            round_pass++;
+        } else {
+            round_fail++;
+            printf("  [Round %d] UNEXPECTED: success=%d, exist=%d, error=%d\n",
+                   round, success_count.load(), exist_count.load(), error_count.load());
+        }
+
+        DoUnlink(file_path);
+    }
+
+    printf("  Concurrent same-file creation: %d/%d rounds passed\n",
+           round_pass.load(), ROUND_COUNT);
+
+    TEST_ASSERT_MSG(round_fail.load() == 0,
+                    "Expected all %d rounds to have exactly 1 success + %d FILE_EXISTS, "
+                    "but %d rounds failed",
+                    ROUND_COUNT, THREAD_COUNT - 1, round_fail.load());
+
+    TEST_PASS("Concurrent Same File Creation");
+}
+
 /*
  * 测试 13: 并发获取Slice ID
  * [Worker-only] 测试多线程并发获取slice ID的正确性和线程安全性
@@ -2282,6 +2378,7 @@ static void RunAllTests()
         // TestAttributeOperations();
         // TestSliceOperations();
         // TestConcurrentFileCreation();  // 并发文件创建测试
+        TestConcurrentSameFileCreation();  // 并发创建同名文件测试
         // TestConcurrentFetchSliceId();  // 并发slice ID获取测试
         // TestKvOperations();
 

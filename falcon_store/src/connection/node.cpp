@@ -23,6 +23,17 @@ int StoreNode::SetNodeConfig(int initNodeId, std::string &clusterView)
     std::cout << "falcon_store nodeId = " << nodeId << std::endl;  
     initStatus = 0;
     int i = 0;
+    int successCount = 0;
+    int totalCount = 0;
+    
+    // Count total nodes first
+    auto tempView = clusterView;
+    for (auto&& rpcEndPoint : tempView | std::views::split(',') | std::views::transform([](auto &&rng) {
+             return std::string(&*rng.begin(), std::ranges::distance(rng));
+         })) {
+        totalCount++;
+    }
+    
     for (auto&& rpcEndPoint : clusterView | std::views::split(',') | std::views::transform([](auto &&rng) {
              return std::string(&*rng.begin(), std::ranges::distance(rng));
          })) { 
@@ -53,10 +64,21 @@ int StoreNode::SetNodeConfig(int initNodeId, std::string &clusterView)
 #endif
         if (connected) {
             nodeMap.emplace(i, std::make_pair(rpcEndPoint, connection));
+            successCount++;
+            FALCON_LOG(LOG_INFO) << "Connected to node " << i << " successfully";
         } else {
-            initStatus = 1;
+            FALCON_LOG(LOG_WARNING) << "Failed to connect to node " << i;
+            // Don't set initStatus=1 immediately, check if we have at least one successful connection
         }
         i++;
+    }
+    
+    // Only fail if we couldn't connect to ANY node (including ourselves)
+    if (successCount == 0) {
+        FALCON_LOG(LOG_ERROR) << "Failed to connect to any node in cluster view";
+        initStatus = 1;
+    } else {
+        FALCON_LOG(LOG_INFO) << "Successfully connected to " << successCount << "/" << totalCount << " nodes";
     }
 
     return initStatus;
@@ -109,13 +131,8 @@ void StoreNode::UpdateNodeConfigByValue(std::unordered_map<int, std::string> &zk
 
 int StoreNode::SetNodeConfig(std::string &rootPath)
 {
-    auto ipPort = GetPodIPPort();
-    if (!ipPort) {
-        FALCON_LOG(LOG_ERROR) << "GetPodIPPort failed: " << ipPort.error();
-        return -1; // 或定义明确的错误码
-    }
-    std::string podIP = ipPort.value_or("127.0.0.1:56039");
-    int ret = FalconCM::GetInstance()->Upload("", podIP, nodeId, rootPath);
+    std::string podIPPort = GetPodIPPort();
+    int ret = FalconCM::GetInstance()->Upload("", podIPPort, nodeId, rootPath);
     if (ret != 0) {
         return ret;
     }
@@ -195,14 +212,17 @@ int StoreNode::GetNodeId() { return nodeId; }
 int StoreNode::GetNodeId(std::string_view ipPort)
 {
     std::shared_lock<std::shared_mutex> slock(nodeMutex);
-    return SplitIp(ipPort)
-        .and_then([this](const auto &metaIp) {
-            auto it = std::find_if(nodeMap.begin(), nodeMap.end(), [&metaIp](const auto &entry) {
-                return SplitIp(entry.second.first) == metaIp;
-            });
-            return it != nodeMap.end() ? std::optional(it->first) : std::nullopt;
-        })
-        .value_or(-1);
+    auto metaIp = SplitIp(ipPort);
+    if (!metaIp.has_value()) {
+        return -1;
+    }
+    auto it = std::find_if(nodeMap.begin(), nodeMap.end(), [&metaIp](const auto &entry) {
+        return SplitIp(entry.second.first) == metaIp;
+    });
+    if (it == nodeMap.end()) {
+        return -1;
+    }
+    return it->first;
 }
 
 bool StoreNode::IsLocal(int otherNodeId)

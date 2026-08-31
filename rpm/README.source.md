@@ -30,16 +30,16 @@ sudo dnf builddep -y rpm/falconfs.source.spec
 - PostgreSQL（含 `pg_config`，路径为 `/usr/local/pgsql/bin/pg_config`）
 - brpc `1.14.1`
 - spdlog `1.12.0`
-- OBS SDK（路径为 `/usr/local/obs`）
 - ZooKeeper（建议 `3.9.x`，用于集群/回归验证）
 
 如果你是按“预编译依赖 + source spec”方案打包，上述组件都应先安装完成。
+
+说明：OBS SDK 已与 RPM 解耦，不会被打包进 `falconfs`/`falconfs-release`。仅在启用 OBS 相关能力时，才需要在运行环境额外准备 `/usr/local/obs`。
 
 快速检查：
 
 ```bash
 test -x /usr/local/pgsql/bin/pg_config
-ls -ld /usr/local/obs /usr/local/obs/include /usr/local/obs/lib
 ldconfig -p | grep -E 'libbrpc|libspdlog' || true
 ```
 
@@ -95,7 +95,6 @@ sudo dnf install -y "$HOME"/rpmbuild/RPMS/*/falconfs-0.1.0-1*.rpm
 
 - `FALCONFS_INSTALL_DIR=/usr/local/falconfs`
 - `PATH` 追加 `/usr/local/pgsql/bin` 与 falcon client bin
-- `LD_LIBRARY_PATH` 追加 falcon/obs 相关 lib 路径
 
 执行以下命令使当前 shell 生效：
 
@@ -106,7 +105,8 @@ source /etc/profile.d/falconfs.sh
 说明：
 
 - 新开终端一般会自动加载 `/etc/profile.d/falconfs.sh`。
-- 当前终端若不 `source`，可能出现 `pg_config` 或动态库路径找不到的问题。
+- 当前终端若不 `source`，可能出现 `pg_config` 找不到的问题。
+- FalconFS 运行时动态库路径在启动脚本内按进程设置，不在 profile 中全局导出。
 
 ### 4.3 本地冒烟（完整包）
 
@@ -116,7 +116,23 @@ mountpoint -q /tmp/falcon_mnt && echo mounted
 /usr/local/falconfs/deploy/falcon_stop.sh
 ```
 
-### 4.4 权限提示（开发机）
+### 4.4 可选日志目录配置
+
+默认情况下日志路径保持历史行为：
+
+- metadata 启动日志：`/usr/local/falconfs/deploy/meta/`
+- client 日志：`/usr/local/falconfs/deploy/client/`
+- 容器 CN/DN `start.log`：`${FALCONFS_INSTALL_DIR}/data/`
+
+如需自定义，可在启动前设置：
+
+```bash
+export FALCON_META_LOG_DIR=/path/to/meta/logs
+export FALCON_CLIENT_LOG_DIR=/path/to/client/logs
+export FALCON_CN_DN_START_LOG_DIR=/path/to/cn-dn-start-logs
+```
+
+### 4.5 权限提示（开发机）
 
 如果当前用户需要直接执行 `/usr/local/falconfs/deploy/falcon_start.sh`，建议确保有 sudo 权限。
 
@@ -133,11 +149,23 @@ sudo chown -R "$USER":"$USER" /usr/local/falconfs
 - `pg_config: command not found`
   - 确认 `/usr/local/pgsql/bin/pg_config` 存在并在 PATH。
 
-- 构建期提示缺少 OBS 相关库
-  - 确认 `/usr/local/obs/lib` 存在，且构建环境可访问。
+- 运行期提示缺少 OBS 相关库
+  - 仅在启用 OBS 相关能力时需要，确认 `/usr/local/obs/lib` 在目标机可访问。
 
 - release 包用于容器部署
   - 建议配合 `tests/regress/docker-compose-release-openeuler.yaml` 做集群启动验证。
+  - 通信插件可通过环境变量切换（默认 `brpc`）：
+
+```bash
+export FALCON_COMM_PLUGIN=hcom
+docker compose -f tests/regress/docker-compose-release-openeuler.yaml up -d
+```
+
+  - 校验容器内生效配置：
+
+```bash
+docker exec falcon-cn-1 grep falcon_communication.plugin_path /usr/local/falconfs/data/metadata/postgresql.conf
+```
 
 - ZooKeeper 集群编号
   - 若手工部署 ZK 集群，`myid` 建议从 `1` 开始（与 compose 中 `zk1/zk2/...` 约定一致）。
